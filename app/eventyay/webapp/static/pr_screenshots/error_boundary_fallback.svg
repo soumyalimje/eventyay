@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="600" viewBox="0 0 1000 600">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <rect x="100" y="80" width="800" height="440" rx="8" ry="8" fill="#f8f9fb" stroke="#e6e9ee"/>
+  <g transform="translate(140,140)">
+    <circle cx="40" cy="40" r="32" fill="#ffdede" stroke="#ff7a7a" />
+    <text x="88" y="52" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#222">An error occurred</text>
+    <text x="0" y="100" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#555">The application encountered an unexpected error. You can reload the page or view details for debugging.</text>
+    <rect x="0" y="130" rx="4" ry="4" width="140" height="36" fill="#2185d0" />
+    <text x="30" y="155" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#fff">Reload</text>
+    <rect x="156" y="130" rx="4" ry="4" width="160" height="36" fill="#f0f0f0" />
+    <text x="186" y="155" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#333">Show details</text>
+    <g transform="translate(0,190)">
+      <rect width="720" height="140" rx="4" ry="4" fill="#fbfbfc" stroke="#e8e8ea" />
+      <text x="12" y="24" font-family="monospace" font-size="12" fill="#333">Error: TypeError: Cannot read properties of undefined (reading 'foo')</text>
+      <text x="12" y="44" font-family="monospace" font-size="12" fill="#666">at SomeComponent (SomeComponent.vue:123)</text>
+      <text x="12" y="64" font-family="monospace" font-size="12" fill="#666">at render (runtime-core.esm-bundler.js:999)</text>
+    </g>
+  </g>
+  <text x="120" y="40" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#888">Preview of ErrorBoundary fallback UI</text>
+</svg>

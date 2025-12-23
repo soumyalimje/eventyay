@@ -59,7 +59,9 @@ export default async function reportError(error, meta = {}) {
       }
     }
 
-    const feedbackUrl = config?.api?.feedback
+  // Allow disabling frontend reporting via injected config (set frontendErrorReporting=false)
+  if (config && config.frontendErrorReporting === false) return
+  const feedbackUrl = config?.api?.feedback
     if (feedbackUrl) {
       // fire-and-forget; do not block UI
       fetch(feedbackUrl, {
