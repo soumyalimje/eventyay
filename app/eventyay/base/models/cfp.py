@@ -1,5 +1,4 @@
 import datetime as dt
-from functools import partial
 
 from django.db import models
 from django.utils.functional import cached_property
@@ -19,7 +18,60 @@ def default_settings():
         'count_length_in': 'chars',
         'show_deadline': True,
         'hide_after_deadline': False,
+        'cfp_enable_gravatar': True,
     }
+
+
+# Canonical lists of built-in CFP field keys, grouped by target.
+# Every other module should import these instead of hard-coding field names.
+BUILTIN_SESSION_FIELDS = (
+    'title', 'submission_type', 'abstract', 'description', 'notes', 'track',
+    'duration', 'slot_count', 'content_locale', 'image', 'slides', 'session_videos',
+    'do_not_record',
+)
+BUILTIN_SPEAKER_FIELDS = (
+    'fullname', 'biography', 'avatar', 'avatar_source',
+    'avatar_license', 'availabilities', 'additional_speaker', 'social_links',
+)
+BUILTIN_FIELD_KEYS = {
+    'session': BUILTIN_SESSION_FIELDS,
+    'speaker': BUILTIN_SPEAKER_FIELDS,
+    'reviewer': (),
+}
+
+
+def normalize_field_order(order, config_key):
+    """Return *order* with any missing built-in fields inserted at their
+    canonical positions.
+
+    The canonical position of a missing built-in is determined by finding
+    the last present built-in with a lower canonical index and inserting
+    immediately after it.  If no preceding built-in is present the missing
+    field is inserted at the beginning of the list.
+
+    This handles three cases correctly:
+    - Config has no built-ins at all (newly created custom-only config).
+    - Config has some built-ins but is missing others (e.g. a new built-in
+      was added to the platform after the config was saved).
+    - Config is already complete — returned unchanged.
+    """
+    builtin = list(BUILTIN_FIELD_KEYS.get(config_key, ()))
+    if not builtin:
+        return order
+    builtin_set = set(builtin)
+    missing = [f for f in builtin if f not in order]
+    if not missing:
+        return order
+    result = list(order)
+    for field in missing:
+        canonical_idx = builtin.index(field)
+        # Insert after the last built-in in result with a lower canonical index.
+        insert_after = -1  # -1 → insert at position 0
+        for i, item in enumerate(result):
+            if item in builtin_set and builtin.index(item) < canonical_idx:
+                insert_after = i
+        result.insert(insert_after + 1, field)
+    return result
 
 
 def default_fields():
@@ -28,33 +80,46 @@ def default_fields():
             'visibility': 'required',
             'min_length': None,
             'max_length': None,
+            'public': True,
+        },
+        'submission_type': {
+            'visibility': 'required',
+            'public': True,
         },
         'abstract': {
             'visibility': 'required',
             'min_length': None,
             'max_length': None,
+            'public': True,
         },
         'description': {
             'visibility': 'optional',
             'min_length': None,
             'max_length': None,
+            'public': True,
         },
         'biography': {
             'visibility': 'required',
             'min_length': None,
             'max_length': None,
+            'public': True,
         },
-        'avatar': {'visibility': 'optional'},
-        'avatar_source': {'visibility': 'optional'},
-        'avatar_license': {'visibility': 'optional'},
-        'availabilities': {'visibility': 'do_not_ask'},
-        'notes': {'visibility': 'optional'},
-        'do_not_record': {'visibility': 'optional'},
-        'image': {'visibility': 'optional'},
-        'track': {'visibility': 'do_not_ask'},
-        'duration': {'visibility': 'do_not_ask'},
-        'content_locale': {'visibility': 'required'},
-        'additional_speaker': {'visibility': 'optional'},
+        'avatar': {'visibility': 'optional', 'public': True},
+        'avatar_source': {'visibility': 'optional', 'public': False},
+        'avatar_license': {'visibility': 'optional', 'public': False},
+        'availabilities': {'visibility': 'do_not_ask', 'public': False},
+        'notes': {'visibility': 'optional', 'public': False},
+        'do_not_record': {'visibility': 'optional', 'public': False},
+        'image': {'visibility': 'optional', 'public': True},
+        'slides': {'visibility': 'optional', 'max_count': 1, 'public': True},
+        'session_videos': {'visibility': 'do_not_ask', 'public': False},
+        'track': {'visibility': 'do_not_ask', 'public': True},
+        'duration': {'visibility': 'do_not_ask', 'public': True},
+        'slot_count': {'visibility': 'optional', 'public': False},
+        'content_locale': {'visibility': 'required', 'public': True},
+        'additional_speaker': {'visibility': 'optional', 'public': False},
+        'social_links': {'visibility': 'do_not_ask', 'public': True},
+        'fullname': {'visibility': 'required', 'public': True},
     }
 
 
@@ -65,22 +130,43 @@ def field_helper(cls):
     def is_field_required(self, field):
         return self.fields.get(field, default_fields()[field])['visibility'] == 'required'
 
+    def is_field_public(self, field):
+        if field in {'title', 'submission_type', 'track', 'duration', 'fullname'}:
+            return True
+        return self.fields.get(field, default_fields()[field]).get(
+            'public', default_fields()[field].get('public', False)
+        )
+
+    cls.is_field_requested = is_field_requested
+    cls.is_field_required = is_field_required
+    cls.is_field_public = is_field_public
+
     for field in default_fields().keys():
         # Create wrapper functions with clean docstrings to avoid RST formatting issues
         def make_request_getter(field_name):
             def getter(self):
                 return is_field_requested(self, field_name)
-            getter.__doc__ = f"Check if {field_name} field is requested."
+
+            getter.__doc__ = f'Check if {field_name} field is requested.'
             return getter
-        
+
         def make_require_getter(field_name):
             def getter(self):
                 return is_field_required(self, field_name)
-            getter.__doc__ = f"Check if {field_name} field is required."
+
+            getter.__doc__ = f'Check if {field_name} field is required.'
             return getter
-        
+
+        def make_public_getter(field_name):
+            def getter(self):
+                return is_field_public(self, field_name)
+
+            getter.__doc__ = f'Check if {field_name} field is public.'
+            return getter
+
         setattr(cls, f'request_{field}', property(make_request_getter(field)))
         setattr(cls, f'require_{field}', property(make_require_getter(field)))
+        setattr(cls, f'public_{field}', property(make_public_getter(field)))
     return cls
 
 
@@ -106,6 +192,11 @@ class CfP(PretalxModel):
         on_delete=models.PROTECT,
         related_name='+',
         verbose_name=_('Default session type'),
+        null=True,
+        blank=True,
+        help_text=_(
+            'The default session type for new submissions. Leave empty to show no pre-selected type in the CFP form.'
+        ),
     )
     deadline = models.DateTimeField(
         null=True,
@@ -118,6 +209,7 @@ class CfP(PretalxModel):
 
     class urls(EventUrls):
         """URL patterns for public CfP (Call for Proposals) views."""
+
         base = '{self.event.orga_urls.cfp}'
         editor = '{base}flow/'
         questions = '{base}questions/'
@@ -136,6 +228,9 @@ class CfP(PretalxModel):
     def __str__(self) -> str:
         """Help with debugging."""
         return f'CfP(event={self.event.slug})'
+
+    def is_resource_public(self, resource) -> bool:
+        return resource.kind != 'slides' or self.public_slides
 
     def copy_data_from(self, other_cfp, skip_attributes=None):
         # default_type gets set by event.copy_data_from
@@ -171,3 +266,8 @@ class CfP(PretalxModel):
         if self.deadline:
             deadlines.append(self.deadline)
         return max(deadlines) if deadlines else None
+
+    @property
+    def enable_gravatar(self) -> bool:
+        """Check if Gravatar is enabled for this event's CfP."""
+        return self.settings.get('cfp_enable_gravatar', True)

@@ -2,6 +2,7 @@ import rules
 from django.db.models import Count, Exists, OuterRef, Q, Subquery
 
 from .person import is_only_reviewer, is_reviewer
+from .tracks import apply_track_limit, get_allowed_tracks
 
 
 @rules.predicate
@@ -38,19 +39,156 @@ orga_or_reviewer_can_change_submission = orga_can_change_submissions | (is_revie
 @rules.predicate
 def is_cfp_open(user, obj):
     event = getattr(obj, 'event', None)
-    return event and event.is_public and event.cfp.is_open
+    return bool(event and event.talks_published and hasattr(event, 'cfp') and event.cfp.is_open)
+
+
+def _normalize_featured_visibility(raw, default='never'):
+    if isinstance(raw, bool):
+        return 'always' if raw else 'never'
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in ('never', 'after_schedule', 'always'):
+            return normalized
+        # Migrate legacy value saved before rename.
+        if normalized == 'pre_schedule':
+            return 'after_schedule'
+    return default
+
+
+def _show_featured_visibility_setting(event, flag_key, fallback_key=None):
+    """Normalized value for org featured visibility (never / after_schedule / always)."""
+    from eventyay.base.models.event import default_feature_flags
+
+    defaults = default_feature_flags()
+    flags = event.feature_flags
+    if not isinstance(flags, dict):
+        flags = {}
+    if flag_key in flags and flags[flag_key] is not None:
+        raw = flags[flag_key]
+    elif fallback_key and fallback_key in flags and flags[fallback_key] is not None:
+        raw = flags[fallback_key]
+    else:
+        raw = defaults.get(flag_key, 'never')
+    return _normalize_featured_visibility(raw, defaults.get(flag_key, 'never'))
+
+
+def _show_featured_setting(event):
+    """Normalized value for org setting ``show_featured`` (featured sessions)."""
+    return _show_featured_visibility_setting(event, 'show_featured')
+
+
+def _show_featured_speakers_setting(event):
+    """Normalized value for org setting ``show_featured_speakers`` (featured speakers)."""
+    return _show_featured_visibility_setting(event, 'show_featured_speakers', fallback_key='show_featured')
+
+
+def show_featured_always(event):
+    """Whether org setting shows the featured page even before a schedule exists."""
+    return _show_featured_setting(event) == 'always'
+
+
+def featured_submissions_for_event(event):
+    """Public featured submissions that may appear before a schedule is released."""
+    from eventyay.base.models import SubmissionStates
+
+    return (
+        event.submissions.filter(is_featured=True)
+        .exclude(state__in=SubmissionStates.terminal_states)
+        .select_related('event', 'event__organizer', 'submission_type')
+        .prefetch_related('speakers')
+        .order_by('title')
+    )
+
+
+def event_has_featured_submissions(event):
+    return featured_submissions_for_event(event).exists()
+
+
+def _event_has_published_schedule(event):
+    """True once at least one schedule version has been published (``published`` is set)."""
+    return event.current_schedule is not None
+
+
+def are_featured_exports_available(event):
+    """Public calendar/file exports require the same release as the main agenda."""
+    return bool(
+        event
+        and event.talks_published
+        and event.get_feature_flag('show_schedule')
+        and event.current_schedule
+    )
+
+
+def event_has_featured_speakers(event):
+    from eventyay.base.models import SpeakerProfile
+
+    return SpeakerProfile.objects.filter(event=event, is_featured=True).exists()
+
+
+def schedule_widget_featured_cache_key_part(event):
+    """Vary schedule JSON cache when featured rules, popularity, or release state change."""
+    popularity_enabled = bool(event.get_feature_flag('session_popularity_enabled'))
+    return (
+        f'sess={_show_featured_setting(event)}|'
+        f'spk={_show_featured_speakers_setting(event)}|'
+        f'rel={int(_event_has_published_schedule(event))}|'
+        f'pop={int(popularity_enabled)}|'
+        f'popshow={int(event.session_popularity_show_on_schedule())}'
+    )
+
+
+def _after_schedule_featured_sessions_visible(event):
+    if _event_has_published_schedule(event):
+        return event.talks_published
+    return event_has_featured_submissions(event)
+
+
+def _featured_public_visible(event, setting_fn, after_schedule_fn):
+    show = setting_fn(event)
+    if show == 'never':
+        return False
+    if show == 'always':
+        return True
+    return after_schedule_fn(event)
 
 
 @rules.predicate
 def are_featured_submissions_visible(user, event):
-    from eventyay.talk_rules.agenda import is_agenda_visible
+    """Whether org "show featured sessions" and schedule state allow public featured content.
 
-    show_featured = event.get_feature_flag('show_featured')
-    if not event.is_public or show_featured == 'never':
+    This predicate does **not** grant orga-only access; use ``list_featured`` (which ORs
+    ``orga_can_change_submissions``) for API/orga rules. Public pages and nav must use this
+    predicate so "Never" is respected for organizers viewing the public site.
+
+    For ``after_schedule``, the featured page is available once a schedule version is
+    published (and talks are published), or earlier when featured submissions exist as a
+    preview before the schedule is released.
+    """
+    return _featured_public_visible(event, _show_featured_setting, _after_schedule_featured_sessions_visible)
+
+
+def can_use_featured_exports(user, event):
+    """Whether public featured export URLs are allowed for this user and event."""
+    return are_featured_submissions_visible(user, event) and are_featured_exports_available(event)
+
+
+@rules.predicate
+def are_featured_speakers_visible(user, event):
+    """Whether public pages may show speakers marked as featured.
+
+    Unlike :func:`are_featured_submissions_visible`, this does not require ``talks_published``
+    or a published schedule. For ``after_schedule``, featured speakers appear once organisers
+    mark at least one speaker as featured.
+    """
+    event_obj = getattr(event, 'event', event)
+    if not event_obj:
         return False
-    if show_featured == 'always':
-        return True
-    return (not is_agenda_visible(user, event)) or not event.current_schedule
+    return _featured_public_visible(event_obj, _show_featured_speakers_setting, event_has_featured_speakers)
+
+
+def include_public_featured_speaker_metadata(user, event):
+    """Whether schedule JSON should expose ``is_featured`` / ``featured_position``."""
+    return are_featured_speakers_visible(user, event)
 
 
 @rules.predicate
@@ -116,7 +254,11 @@ def can_be_edited(user, obj):
 def can_request_speakers(user, submission):
     from eventyay.base.models import SubmissionStates
 
-    return submission.state != SubmissionStates.DRAFT and submission.event.cfp.request_additional_speaker
+    return (
+        submission.state != SubmissionStates.DRAFT
+        and hasattr(submission.event, 'cfp')
+        and submission.event.cfp.request_additional_speaker
+    )
 
 
 @rules.predicate
@@ -157,18 +299,45 @@ def can_be_reviewed(user, obj):
     return bool(state and phase)
 
 
+def _reviewer_teams_for_event(user, event):
+    return user.teams.filter(
+        Q(all_events=True) | Q(limit_events=event),
+        organizer=event.organizer,
+        is_reviewer=True,
+    )
+
+
+def _submission_allowed_for_track_limits(submission, event, user):
+    allowed = get_allowed_tracks(event, user, reviewers_only=True)
+    if allowed is None:
+        return True
+    if not submission.track_id:
+        return False
+    return submission.track_id in {track.pk for track in allowed}
+
+
 @rules.predicate
 def has_reviewer_access(user, obj):
+    from eventyay.base.models import Submission
+
     obj = getattr(obj, 'submission', obj)
-    if not obj or not obj.event or not obj.event.active_review_phase:
+    if not isinstance(obj, Submission):
         return False
-    if obj.event.active_review_phase.proposal_visibility == 'all':
-        return obj.event.teams.filter(
-            Q(limit_tracks__isnull=True) | Q(limit_tracks__in=[obj.track]),
-            members__in=[user],
-            is_reviewer=True,
-        ).exists()
-    return user in obj.assigned_reviewers.all()
+    if not obj.event or not obj.event.active_review_phase:
+        return False
+
+    if obj.assigned_reviewers.filter(pk=user.pk).exists():
+        return _submission_allowed_for_track_limits(obj, obj.event, user)
+
+    phase = obj.event.active_review_phase
+    if phase.proposal_visibility != 'all':
+        return False
+
+    teams = _reviewer_teams_for_event(user, obj.event)
+    if not teams.exists():
+        return False
+
+    return teams.filter(Q(limit_tracks__isnull=True) | Q(limit_tracks=obj.track)).exists()
 
 
 def questions_for_user(request, event, user):
@@ -179,24 +348,30 @@ def questions_for_user(request, event, user):
     from eventyay.common.permissions import is_admin_mode_active
     from eventyay.talk_rules.orga import can_view_speaker_names
 
-    if user.has_perm('base.update_talkquestion', event) or is_admin_mode_active(request):
-        # Organizers with edit permissions can see everything
-        return event.talkquestions(manager='all_objects').all()
+    eventpermset = getattr(request, 'eventpermset', set())
+    has_eventperm = 'can_change_event_settings' in eventpermset or 'can_change_submissions' in eventpermset
+
+    if (
+        user.has_perm('base.update_talkquestion', event)
+        or user.has_perm('base.orga_list_talkquestion', event)
+        or is_admin_mode_active(request)
+        or has_eventperm
+    ):
+        # Organizers and team members with appropriate permissions can see everything
+        return event.talkquestions(manager='all_objects').filter(is_imported=False)
+
     if not user.is_anonymous and is_only_reviewer(user, event) and can_view_speaker_names(user, event):
         return event.talkquestions(manager='all_objects').filter(
             Q(is_visible_to_reviewers=True) | Q(target=TalkQuestionTarget.REVIEWER),
             active=True,
+            is_imported=False,
         )
-    if user.has_perm('base.orga_list_talkquestion', event):
-        # Other team members can either view all active talkquestions
-        # or only talkquestions open to reviewers
-        return event.talkquestions(manager='all_objects').all()
 
     # Now we are left with anonymous users or users with very limited permissions.
     # They can see all public (non-reviewer) talkquestions if they are already publicly
     # visible in the schedule. Otherwise, nothing.
     if user.has_perm('base.list_talkquestion', event):
-        return event.talkquestions.all().filter(is_public=True)
+        return event.talkquestions.all().filter(is_public=True, is_imported=False)
     return event.talkquestions.none()
 
 
@@ -206,48 +381,67 @@ def annotate_assigned(queryset, event, user):
 
 
 def get_reviewer_tracks(event, user):
-    teams = event.teams.filter(members__in=[user], limit_tracks__isnull=False).prefetch_related(
-        'limit_tracks', 'limit_tracks__event'
-    )
-    tracks = set()
-    for team in teams:
-        tracks.update(team.limit_tracks.filter(event=event))
-    return tracks
+    """Backward-compatible helper returning a set; empty set means unlimited."""
+    allowed = get_allowed_tracks(event, user, reviewers_only=True)
+    if allowed is None:
+        return set()
+    return allowed
 
 
 def limit_for_reviewers(queryset, event, user, reviewer_tracks=None, add_assignments=False):
     if not (phase := event.active_review_phase):
-        queryset = event.submissions.none()
+        return event.submissions.none()
     queryset = queryset.exclude(speakers__in=[user])
-    if phase and phase.proposal_visibility == 'assigned':
-        queryset = annotate_assigned(queryset, event, user)
-        return queryset.filter(is_assigned__gte=1)
-    if add_assignments:
-        queryset = annotate_assigned(queryset, event, user)
     if reviewer_tracks is None:
-        reviewer_tracks = get_reviewer_tracks(event, user)
-    if reviewer_tracks:
-        return queryset.filter(track__in=reviewer_tracks)
+        allowed = get_allowed_tracks(event, user, reviewers_only=True)
+    else:
+        allowed = reviewer_tracks if reviewer_tracks else None
+    if add_assignments or phase.proposal_visibility == 'assigned':
+        queryset = annotate_assigned(queryset, event, user)
+    if phase.proposal_visibility == 'assigned':
+        queryset = queryset.filter(is_assigned__gte=1)
+    if allowed is not None:
+        queryset = queryset.filter(track__in=allowed) if allowed else queryset.none()
     return queryset
 
 
 def submissions_for_user(event, user):
+    from eventyay.base.models import Submission
+    from eventyay.talk_rules.agenda import can_view_wip_schedule
+
     if not user.is_anonymous:
         if is_only_reviewer(user, event):
             return limit_for_reviewers(event.submissions.all(), event, user)
         if user.has_perm('base.orga_list_submission', event):
-            return event.submissions.all()
+            queryset = event.submissions.all()
+            return apply_track_limit(queryset, event, user)
 
     # Fall through: both anon users and users without permissions
     # get here, e.g. speakers or attendees.
+    wip = event.wip_schedule
+    if not user.is_anonymous and wip and can_view_wip_schedule(user, event):
+        return Submission.objects.filter(
+            pk__in=wip.talks.filter(submission__isnull=False).values_list('submission_id', flat=True)
+        )
+
     if user.has_perm('base.list_schedule', event):
-        return event.current_schedule.slots
+        schedule = event.current_schedule
+        if not schedule:
+            return event.submissions.none()
+        return event.submissions.filter(
+            pk__in=schedule.talks.filter(
+                is_visible=True,
+                submission__isnull=False,
+            ).values_list('submission_id', flat=True)
+        )
     return event.submissions.none()
 
 
 @rules.predicate
 def is_wip(user, obj):
     schedule = getattr(obj, 'schedule', None)
+    if schedule is None and hasattr(obj, 'version') and hasattr(obj, 'event'):
+        schedule = obj
     if schedule is None and hasattr(obj, 'current_schedule'):
         schedule = obj.current_schedule
     if schedule is None:

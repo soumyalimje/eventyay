@@ -1,12 +1,11 @@
 import logging
-from configparser import RawConfigParser
-from typing import cast
 from urllib.parse import urljoin
 
 from django.conf import settings
 from django.utils.module_loading import import_string
 
 from eventyay.common.text.phrases import CALL_FOR_SPEAKER_LOGIN_BTN_LABELS
+from eventyay.eventyay_common.permissions import get_cached_event_dashboard_access
 from eventyay.orga.signals import html_head, nav_event, nav_event_settings, nav_global
 
 SessionStore = import_string(f'{settings.SESSION_ENGINE}.SessionStore')
@@ -27,16 +26,18 @@ def orga_events(request):
     """Add data to all template contexts."""
     context = {'settings': settings}
 
-    # Extract site specific values from settings.CONFIG.items('site') and add them to the context
-    # This is a bit of a hack, but it's the only way to get the site specific values into the context
-    # rather than using the settings object directly in the template
-    config = cast(RawConfigParser, settings.TALK_CONFIG)
-    site_config = dict(config.items('site'))
-    context['site_config'] = site_config
+    # Extract site specific values from individual settings attributes and add them to the context
+    # so that templates can use simple context variables instead of accessing the settings object
+    # directly.
+    context['site_name'] = settings.INSTANCE_NAME
     context['base_path'] = settings.BASE_PATH
-    context['tickets_common'] = urljoin(settings.BASE_PATH, '/common')
+    context['common_path'] = urljoin(settings.BASE_PATH, '/common')
+    context['tickets_common'] = context['common_path']
+    context['tickets_path'] = urljoin(settings.BASE_PATH, '/control')
+    context['talks_path'] = urljoin(settings.BASE_PATH, '/orga/event')
+    context['admin_path'] = urljoin(settings.BASE_PATH, '/admin')
     # Login button label
-    key = site_config.get('call_for_speaker_login_button_label', 'default')
+    key = settings.CALL_FOR_SPEAKER_LOGIN_BUTTON_LABEL
     button_label = CALL_FOR_SPEAKER_LOGIN_BTN_LABELS.get(key)
     if not button_label:
         logger.warning('%s does not exist in CALL_FOR_SPEAKER_LOGIN_BTN_LABELS', key)
@@ -46,16 +47,26 @@ def orga_events(request):
     if not request.path_info.startswith('/orga/'):
         return {
             'login_button_label': button_label,
+            'site_name': settings.INSTANCE_NAME,
         }
 
     if not getattr(request, 'user', None) or not request.user.is_authenticated:
         return context
+
+    context['staff_session'] = request.user.has_active_staff_session(request.session.session_key)
 
     if not getattr(request, 'event', None):
         context['nav_global'] = [
             entry for entry in collect_signal(nav_global, {'sender': None, 'request': request}) if entry
         ]
         return context
+
+    event = request.event
+    access = get_cached_event_dashboard_access(
+        request, request.user, event.organizer, event
+    )
+    context['has_ticket_access'] = access['has_ticket_access']
+    context['has_video_access'] = access['has_video_access']
 
     _nav_event = []
     for _, response in nav_event.send_robust(request.event, request=request):

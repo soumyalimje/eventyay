@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 import random
@@ -5,7 +6,7 @@ from datetime import datetime
 from urllib.parse import urlencode, urljoin, urlparse
 
 import aiohttp
-import pytz
+from zoneinfo import ZoneInfo
 from channels.db import database_sync_to_async
 from django.conf import settings
 from django.db import models, transaction
@@ -16,15 +17,20 @@ from django.utils.html import escape
 from lxml import etree
 from yarl import URL
 
-from eventyay.base.models import BBBServer, BBBCall
+from eventyay.base.models import BBBCall, BBBServer
+
 
 logger = logging.getLogger(__name__)
+
+
+class BBBServerUnavailable(Exception):
+    pass
 
 
 def get_url(operation, params, base_url, secret):
     encoded = urlencode(params)
     payload = operation + encoded + secret
-    checksum = hashlib.sha1(payload.encode()).hexdigest()
+    checksum = hashlib.sha256(payload.encode()).hexdigest()
     return urljoin(
         base_url, "api/" + operation + "?" + encoded + "&checksum=" + checksum
     )
@@ -33,6 +39,24 @@ def get_url(operation, params, base_url, secret):
 def escape_name(name):
     # Some things break BBB apparently…
     return name.replace(":", "")
+
+
+def get_absolute_presentation_url(presentation):
+    """Return a BBB-downloadable absolute URL for an initial presentation."""
+    presentation = presentation.strip()
+    if not presentation:
+        return ""
+    return urljoin(settings.SITE_URL, presentation)
+
+
+def get_presentation_xml(presentation):
+    """Build BBB's initial-presentation XML with an absolute document URL."""
+    presentation = get_absolute_presentation_url(presentation)
+    return (
+        '<modules><module name="presentation"><document url="{}" /></module></modules>'.format(
+            escape(presentation)
+        )
+    )
 
 
 def choose_server(event, room=None, prefer_server=None):
@@ -90,13 +114,23 @@ def choose_server(event, room=None, prefer_server=None):
         return server
 
 
+def choose_server_or_raise(event, room=None, prefer_server=None, call_id=None):
+    server = choose_server(event=event, room=room, prefer_server=prefer_server)
+    if server is None:
+        context = f"room={room.pk}" if room else f"call={call_id}"
+        message = f"No active BBB server available for event {event.pk} ({context})."
+        logger.warning(message)
+        raise BBBServerUnavailable(message)
+    return server
+
+
 @database_sync_to_async
 @transaction.atomic
 def get_create_params_for_call_id(call_id, record, user):
     try:
         call = BBBCall.objects.get(id=call_id, invited_members__in=[user])
         if not call.server.active:
-            call.server = choose_server(event=call.event)
+            call.server = choose_server_or_raise(event=call.event, call_id=call.id)
             call.save(update_fields=["server"])
     except BBBCall.DoesNotExist:
         return None, None
@@ -131,7 +165,7 @@ def get_create_params_for_room(
     try:
         call = BBBCall.objects.get(room=room)
         if not call.server.active:
-            call.server = choose_server(event=room.event, room=room)
+            call.server = choose_server_or_raise(event=room.event, room=room)
             call.save(update_fields=["server"])
         if call.guest_policy != guest_policy:
             call.guest_policy = guest_policy
@@ -143,7 +177,7 @@ def get_create_params_for_room(
         call = BBBCall.objects.create(
             room=room,
             event=room.event,
-            server=choose_server(
+            server=choose_server_or_raise(
                 event=room.event, room=room, prefer_server=prefer_server
             ),
             voice_bridge=voice_bridge,
@@ -158,6 +192,7 @@ def get_create_params_for_room(
         "attendeePW": call.attendee_pw,
         "moderatorPW": call.moderator_pw,
         "record": "true" if record else "false",
+        "allowRequestsWithoutSession": "true",
         "meta_Source": "eventyay",
         "meta_Event": room.event_id,
         "meta_Room": str(room.id),
@@ -248,12 +283,8 @@ class BBBService:
         create_url = get_url("create", create_params, server.url, server.secret)
 
         presentation = config.get("presentation", None)
-        if presentation:
-            xml = "<modules>"
-            xml += '<module name="presentation"><document url="{}" /></module>'.format(
-                escape(presentation)
-            )
-            xml += "</modules>"
+        if presentation and presentation.strip():
+            xml = get_presentation_xml(presentation)
             req = await self._post(create_url, xml)
         else:
             req = await self._get(create_url)
@@ -269,6 +300,7 @@ class BBBService:
         scheme = (
             "http://" if settings.DEBUG else "https://"
         )  # TODO: better determinator?
+        domain = self.event.domain or settings.SITE_NETLOC
         return get_url(
             "join",
             {
@@ -288,7 +320,7 @@ class BBBService:
                     else "false"
                 ),
                 "userdata-bbb_custom_style_url": scheme
-                + self.event.domain
+                + domain
                 + reverse("live:css.bbb"),
                 "userdata-bbb_show_public_chat_on_login": "false",
                 # "userdata-bbb_mirror_own_webcam": "true",  unfortunately mirrors for everyone, which breaks things
@@ -302,8 +334,7 @@ class BBBService:
                 "userdata-bbb_skip_video_preview": (
                     "true" if config.get("auto_camera", False) else "false"
                 ),
-                # For some reason, bbb_auto_swap_layout does what you expect from bbb_hide_presentation
-                "userdata-bbb_auto_swap_layout": (
+                "userdata-bbb_hide_presentation_on_join": (
                     "true" if config.get("hide_presentation", False) else "false"
                 ),
             },
@@ -329,6 +360,7 @@ class BBBService:
         scheme = (
             "http://" if settings.DEBUG else "https://"
         )  # TODO: better determinator?
+        domain = self.event.domain or settings.SITE_NETLOC
         return get_url(
             "join",
             {
@@ -339,7 +371,7 @@ class BBBService:
                 "password": create_params["moderatorPW"],
                 "joinViaHtml5": "true",
                 "userdata-bbb_custom_style_url": scheme
-                + self.event.domain
+                + domain
                 + reverse("live:css.bbb"),
                 "userdata-bbb_show_public_chat_on_login": "false",
                 # "userdata-bbb_mirror_own_webcam": "true",  unfortunately mirrors for everyone, which breaks things
@@ -363,21 +395,39 @@ class BBBService:
 
     async def get_recordings_for_room(self, room):
         recordings = []
-        for server in await self._get_possible_servers():
-            try:
-                call = await get_call_for_room(room)
-                recordings_url = get_url(
-                    "getRecordings",
-                    {"meetingID": call.meeting_id, "state": "any"},
-                    server.url,
-                    server.secret,
-                )
-                root = await self._get(recordings_url, timeout=10)
-                if root is False:
-                    return []
+        call = await get_call_for_room(room)
+        if not call:
+            return recordings
 
-                tz = pytz.timezone(self.event.timezone)
-                for rec in root.xpath("recordings/recording"):
+        successful_request = False
+        servers = await self._get_possible_servers()
+        recording_urls = [
+            get_url(
+                "getRecordings",
+                {"meetingID": call.meeting_id, "state": "any"},
+                server.url,
+                server.secret,
+            )
+            for server in servers
+        ]
+        responses = await asyncio.gather(
+            *(self._get(url, timeout=10) for url in recording_urls)
+        )
+        for server, recordings_url, root in zip(servers, recording_urls, responses):
+            try:
+                if root is False:
+                    continue
+
+                server_recordings = []
+                tz = ZoneInfo(self.event.timezone)
+                recordings_nodes = root.xpath("recordings")
+                if not recordings_nodes:
+                    logger.error(
+                        "BBB recordings response from server %s has no recordings container",
+                        server,
+                    )
+                    continue
+                for rec in recordings_nodes[0].xpath("recording"):
                     url_presentation = url_screenshare = url_video = url_notes = None
                     for f in rec.xpath("playback/format"):
                         if f.xpath("type")[0].text == "presentation":
@@ -403,14 +453,14 @@ class BBBService:
                             and not url_notes
                         ):
                             continue
-                    recordings.append(
+                    server_recordings.append(
                         {
                             "start": (
                                 # BBB outputs timestamps in server time, not UTC :( Let's assume the BBB server time
                                 # is the same as ours…
                                 datetime.fromtimestamp(
                                     int(rec.xpath("startTime")[0].text) / 1000,
-                                    pytz.timezone(settings.TIME_ZONE),
+                                    ZoneInfo(settings.TIME_ZONE),
                                 )
                             )
                             .astimezone(tz)
@@ -418,7 +468,7 @@ class BBBService:
                             "end": (
                                 datetime.fromtimestamp(
                                     int(rec.xpath("endTime")[0].text) / 1000,
-                                    pytz.timezone(settings.TIME_ZONE),
+                                    ZoneInfo(settings.TIME_ZONE),
                                 )
                             )
                             .astimezone(tz)
@@ -431,6 +481,8 @@ class BBBService:
                             "url_notes": url_notes,
                         }
                     )
+                recordings.extend(server_recordings)
+                successful_request = True
             except Exception:
-                logger.exception(f"Could not fetch recordings from server {server}")
-        return recordings
+                logger.exception("Could not fetch recordings from server %s", server)
+        return recordings if successful_request else None

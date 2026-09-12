@@ -6,6 +6,7 @@ from collections import OrderedDict
 import requests
 from celery.exceptions import MaxRetriesExceededError
 from django.db.models import Exists, OuterRef, Q
+from django.conf import settings
 from django.dispatch import receiver
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import pgettext_lazy
@@ -17,6 +18,7 @@ from eventyay.api.signals import register_webhook_events
 from eventyay.base.models import LogEntry
 from eventyay.base.services.tasks import ProfiledTask, TransactionAwareTask
 from eventyay.celery_app import app
+from eventyay.consts import SizeKey
 
 logger = logging.getLogger(__name__)
 _ALL_EVENTS = None
@@ -265,12 +267,22 @@ def notify_webhooks(logentry_ids: list):
     _org, _at, webhooks = None, None, None
     for logentry in qs:
         if not logentry.organizer:
-            break  # We need to know the organizer
+            logger.debug(
+                'Skipping webhook notification for log entry %d: no organizer',
+                logentry.id,
+            )
+            continue  # We need to know the organizer, skip this entry
 
         notification_type = logentry.webhook_type
 
         if not notification_type:
-            break  # Ignore, no webhooks for this event type
+            logger.debug(
+                'Skipping webhook notification for log entry %d: '
+                'no matching webhook event type for %s',
+                logentry.id,
+                logentry.action_type,
+            )
+            continue  # Ignore, no webhooks for this event type
 
         if _org != logentry.organizer or _at != logentry.action_type or webhooks is None:
             _org = logentry.organizer
@@ -320,7 +332,7 @@ def send_webhook(self, logentry_id: int, action_type: str, webhook_id: int):
                     execution_time=time.time() - t,
                     return_code=resp.status_code,
                     payload=json.dumps(payload),
-                    response_body=resp.text[: 1024 * 1024],
+                    response_body=resp.text[: settings.MAX_SIZE_CONFIG[SizeKey.RESPONSE_SIZE_WEBHOOK]],
                     success=200 <= resp.status_code <= 299,
                 )
                 if resp.status_code == 410:
@@ -339,7 +351,7 @@ def send_webhook(self, logentry_id: int, action_type: str, webhook_id: int):
                     execution_time=time.time() - t,
                     return_code=0,
                     payload=json.dumps(payload),
-                    response_body=str(e)[: 1024 * 1024],
+                    response_body=str(e)[: settings.MAX_SIZE_CONFIG[SizeKey.RESPONSE_SIZE_WEBHOOK]],
                 )
                 raise self.retry(
                     countdown=2 ** (self.request.retries * 2)

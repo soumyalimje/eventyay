@@ -1,4 +1,5 @@
 import logging
+from collections import OrderedDict
 from itertools import chain
 
 from django import forms
@@ -70,7 +71,7 @@ class ContactForm(forms.Form):
             )
 
         if event.settings.order_phone_asked:
-            self.fields['phone'].required = True
+            self.fields['phone'].required = event.settings.order_phone_required and not self.all_optional
             self.fields['phone'].help_text = event.settings.checkout_phone_helptext
             with language(get_babel_locale()):
                 default_country = guess_country(event)
@@ -111,6 +112,28 @@ class ContactForm(forms.Form):
             for key, value in response.items():
                 # We need to be this explicit, since OrderedDict.update does not retain ordering
                 self.fields[key] = value
+
+        system_question_order = event.settings.system_question_order or {}
+        customer_positions = []
+        if 'email' in self.fields:
+            customer_positions.append((system_question_order.get('order_email', 0), 'email'))
+            if 'email_repeat' in self.fields:
+                customer_positions.append((system_question_order.get('order_email', 0), 'email_repeat'))
+        if 'phone' in self.fields:
+            customer_positions.append((system_question_order.get('order_phone', 1), 'phone'))
+
+        customer_positions.sort(key=lambda x: x[0])
+
+        new_fields = OrderedDict()
+        for pos, name in customer_positions:
+            new_fields[name] = self.fields[name]
+
+        for name in self.fields:
+            if name not in new_fields:
+                new_fields[name] = self.fields[name]
+
+        self.fields = new_fields
+
         if self.all_optional:
             for k, v in self.fields.items():
                 v.required = False

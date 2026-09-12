@@ -8,8 +8,13 @@ from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import pgettext_lazy
 
-from eventyay.base.models import TaxRule
+from eventyay.base.models import Question, TaxRule
 from eventyay.base.services.cart import update_tax_rates
+from eventyay.base.services.system_questions import (
+    get_system_question_asked_required,
+    get_system_question_base_states,
+    get_system_question_product_overrides,
+)
 from eventyay.presale.checkoutflowstep.template_flow_step import TemplateFlowStep
 from eventyay.presale.forms.checkout import (
     ContactForm,
@@ -25,6 +30,25 @@ from eventyay.presale.signals import (
 from eventyay.presale.views import CartMixin, get_cart_is_free
 from eventyay.presale.views.cart import get_or_create_cart_id
 from eventyay.presale.views.questions import QuestionsViewMixin
+
+
+def question_is_visible_for_stored_answers(parentid, qvals, question_cache, answ):
+    if parentid not in question_cache:
+        return False
+    parentq = question_cache[parentid]
+    if parentq.dependency_question_id and not question_is_visible_for_stored_answers(
+        parentq.dependency_question_id, parentq.dependency_values, question_cache, answ
+    ):
+        return False
+    if parentid not in answ:
+        if parentq.type == Question.TYPE_BOOLEAN:
+            return 'False' in qvals
+        return False
+    return (
+        ('True' in qvals and answ[parentid].answer == 'True')
+        or ('False' in qvals and answ[parentid].answer == 'False')
+        or (any(qval in [o.identifier for o in answ[parentid].options.all()] for qval in qvals))
+    )
 
 
 class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
@@ -246,25 +270,15 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
                 messages.warning(request, _('Please enter your name.'))
                 return False
 
+        base_states = get_system_question_base_states(self.request.event)
+        product_overrides = get_system_question_product_overrides(self.request.event)
+
         for cp in self._positions_for_questions:
             answ = {aw.question_id: aw for aw in cp.answerlist}
             question_cache = {q.pk: q for q in cp.product.questions_to_ask}
 
             def question_is_visible(parentid, qvals):
-                if parentid not in question_cache:
-                    return False
-                parentq = question_cache[parentid]
-                if parentq.dependency_question_id and not question_is_visible(
-                    parentq.dependency_question_id, parentq.dependency_values
-                ):
-                    return False
-                if parentid not in answ:
-                    return False
-                return (
-                    ('True' in qvals and answ[parentid].answer == 'True')
-                    or ('False' in qvals and answ[parentid].answer == 'False')
-                    or (any(qval in [o.identifier for o in answ[parentid].options.all()] for qval in qvals))
-                )
+                return question_is_visible_for_stored_answers(parentid, qvals, question_cache, answ)
 
             def question_is_required(q):
                 return q.required and (
@@ -279,9 +293,46 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
                             _('Please fill in answers to all required questions.'),
                         )
                     return False
+
+            _, attendee_name_required = get_system_question_asked_required(
+                self.request.event,
+                'attendee_name_parts',
+                cp.product,
+                base_states=base_states,
+                product_overrides=product_overrides,
+            )
+            _, attendee_email_required = get_system_question_asked_required(
+                self.request.event,
+                'attendee_email',
+                cp.product,
+                base_states=base_states,
+                product_overrides=product_overrides,
+            )
+            _, attendee_company_required = get_system_question_asked_required(
+                self.request.event,
+                'company',
+                cp.product,
+                base_states=base_states,
+                product_overrides=product_overrides,
+            )
+            _, attendee_job_title_required = get_system_question_asked_required(
+                self.request.event,
+                'job_title',
+                cp.product,
+                base_states=base_states,
+                product_overrides=product_overrides,
+            )
+            _, attendee_address_required = get_system_question_asked_required(
+                self.request.event,
+                'street',
+                cp.product,
+                base_states=base_states,
+                product_overrides=product_overrides,
+            )
+
             if (
                 cp.product.admission
-                and self.request.event.settings.get('attendee_names_required', as_type=bool)
+                and attendee_name_required
                 and not cp.attendee_name_parts
             ):
                 if warn:
@@ -289,24 +340,32 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
                 return False
             if (
                 cp.product.admission
-                and self.request.event.settings.get('attendee_emails_required', as_type=bool)
-                and cp.attendee_email is None
+                and attendee_email_required
+                and not cp.attendee_email
             ):
                 if warn:
                     messages.warning(request, _('Please fill in answers to all required questions.'))
                 return False
             if (
                 cp.product.admission
-                and self.request.event.settings.get('attendee_company_required', as_type=bool)
-                and cp.company is None
+                and attendee_company_required
+                and not cp.company
             ):
                 if warn:
                     messages.warning(request, _('Please fill in answers to all required questions.'))
                 return False
             if (
                 cp.product.admission
-                and self.request.event.settings.get('attendee_attendees_required', as_type=bool)
-                and (cp.street is None or cp.city is None or cp.country is None)
+                and attendee_job_title_required
+                and not cp.job_title
+            ):
+                if warn:
+                    messages.warning(request, _('Please fill in answers to all required questions.'))
+                return False
+            if (
+                cp.product.admission
+                and attendee_address_required
+                and (not cp.street or not cp.city or not cp.country)
             ):
                 if warn:
                     messages.warning(request, _('Please fill in answers to all required questions.'))

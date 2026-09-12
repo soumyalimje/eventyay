@@ -18,90 +18,32 @@ import sys
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
-
-sys.path.insert(0, os.path.abspath('../app'))
-
-import django
+# The eventyay project should be installed to virtual env (default behavior of `uv`)
 
 # Set minimal config file for documentation builds
-os.environ.setdefault('EVENTYAY_CONFIG_FILE', os.path.join(os.path.dirname(__file__), 'eventyay-docs.cfg'))
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'eventyay.config.settings')
-os.environ.setdefault('DATABASE_URL', 'sqlite:///:memory:')
-os.environ.setdefault('REDIS_URL', 'redis://localhost:6379/0')
+# Use 'testing' environment to turn off rich logging.
+os.environ.setdefault('EVY_RUNNING_ENVIRONMENT', 'testing')
+# Tell the application settings module to use in-memory infrastructure while
+# autodoc imports Django modules.
+os.environ.setdefault('EVY_DOCS_BUILD', '1')
 
-# Configure minimal logging before Django loads to prevent rich handler errors
-import logging
-logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
-
-# Patch urlman to handle documentation builds gracefully
-try:
-    import urlman
-    original_urls_getattribute = urlman.Urls.__getattribute__
-    
-    def patched_getattribute(self, name):
-        try:
-            return original_urls_getattribute(self, name)
-        except Exception:
-            # During docs build, return a placeholder for missing attributes
-            if name in ('__wrapped__', '__name__'):
-                return self.__class__.__name__
-            raise
-    
-    urlman.Urls.__getattribute__ = patched_getattribute
-except Exception:
-    # urlman not available or patching failed, continue anyway
-    pass
+import django
 
 # Configure Django and override LOGGING settings for documentation builds
 # This must be done AFTER django.setup() to avoid triggering early settings initialization
 try:
     django.setup()
-    
-    # Override Django logging configuration after setup to use simple console logging
-    # This prevents complex handlers (like 'rich') from being used during docs build
-    import logging.config
-    
-    SIMPLE_LOGGING = {
-        'version': 1,
-        'disable_existing_loggers': False,
-        'formatters': {
-            'simple': {
-                'format': '[{levelname}] {message}',
-                'style': '{',
-            },
-        },
-        'handlers': {
-            'console': {
-                'class': 'logging.StreamHandler',
-                'formatter': 'simple',
-                'level': 'WARNING',
-            },
-        },
-        'loggers': {
-            'django': {
-                'handlers': ['console'],
-                'level': 'WARNING',
-                'propagate': False,
-            },
-        },
-        'root': {
-            'handlers': ['console'],
-            'level': 'WARNING',
-        },
-    }
-    
-    # Reconfigure logging after Django setup
-    logging.config.dictConfig(SIMPLE_LOGGING)
-    
 except Exception as e:
     # Documentation build can continue even if Django setup fails
-    print(f"Warning: Django setup failed: {e}")
-
+    print(f"Warning: Django setup failed: {e}", file=sys.stderr)
 
 try:
-    import enchant  # noqa: F401
+    import enchant
+
+    enchant.Dict('en_US')
     HAS_PYENCHANT = True
-except ImportError:
+except Exception:
     HAS_PYENCHANT = False
 
 # -- General configuration ------------------------------------------------
@@ -114,6 +56,7 @@ except ImportError:
 # ones.
 extensions = [
     'sphinx.ext.autodoc',
+    'sphinx.ext.napoleon',
     'sphinx.ext.doctest',
     'sphinx.ext.coverage',
     'sphinxcontrib.httpdomain',
@@ -131,6 +74,7 @@ autodoc_default_options = {
     'undoc-members': False,
     'show-inheritance': True,
 }
+autodoc_typehints = 'none'
 
 # Don't fail the build on autodoc import errors
 autodoc_warningiserror = False
@@ -148,8 +92,8 @@ source_suffix = '.rst'
 master_doc = 'index'
 
 # General information about the project.
-project = 'Ticket Component'
-copyright = '2025 Apache 2.0 License by contributors'
+project = 'Eventyay'
+copyright = '2026 Apache 2.0 License by contributors'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -181,6 +125,12 @@ exclude_patterns = [
     '_build',
     '.venv',
     'venv',
+    # These sources are included by unified replacement pages. Excluding the
+    # originals prevents their labels from being parsed a second time.
+    'admin/config.rst',
+    'development/unified_architecture.rst',
+    'talk/user/sessions.rst',
+    'user/events/create.rst',
 ]
 
 # The reST default role (used for this markup: `text`) to use for all
@@ -421,13 +371,7 @@ if HAS_PYENCHANT:
     spelling_show_suggestions = True
 
     # List of filter classes to be added to the tokenizer that produces words to be checked.
-    # Note: spelling_filters is read by sphinxcontrib.spelling extension
-    try:
-        from checkin_filter import CheckinFilter
-        spelling_filters = [CheckinFilter]
-    except ImportError:
-        # checkin_filter module not available, skip custom filters
-        spelling_filters = []
+    spelling_filters = ['checkin_filter.CheckinFilter']
 
 
 def autodoc_skip_member(app, what, name, obj, skip, options):
@@ -444,7 +388,14 @@ def autodoc_skip_member(app, what, name, obj, skip, options):
     # Also skip any attribute ending with _urls
     if name.endswith('_urls'):
         return True
-    return skip
+
+    # Avoid evaluating QuerySets during introspection (repr() can hit the DB).
+    try:
+        from django.db.models.query import QuerySet as DjangoQuerySet
+        if isinstance(obj, DjangoQuerySet):
+            return True
+    except ImportError:
+        return skip
 
 
 def setup(app):

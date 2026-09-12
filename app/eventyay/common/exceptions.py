@@ -3,7 +3,6 @@ from django.utils.functional import cached_property
 from django.utils.log import AdminEmailHandler
 from django.views.debug import ExceptionReporter
 
-
 class SendMailException(Exception):
     pass
 
@@ -56,7 +55,7 @@ The error was {exception} at {location}.
             return ''
         if self.request.user.is_anonymous:
             return 'an anonymous user'
-        return f'{self.request.user.name} <{self.request.user.email}>'
+        return f'{self.request.user.fullname} <{self.request.user.email}>'
 
     def get_tldr(self):
         if not self.request:

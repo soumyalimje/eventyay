@@ -1,0 +1,64 @@
+/* Shared mobile styles for component nav */
+
+.navigation-button a.header-nav.btn,
+#event-nav .navigation .navigation-button a.header-nav.btn {
+  border-radius: 0;
+}
+
+@media (max-width: 767px) {
+  /* Fix: allow sidebar menu items to expand on mobile */
+  .sidebar .nav > li {
+    min-height: 41px;
+    height: auto;
+  }
+  .sidebar .nav > li > a {
+    min-height: 41px;
+    height: auto;
+  }
+  body:not(.sidebar-minimized) .sidebar .nav > li > a.arrow {
+    display: block;
+    position: absolute;
+    right: 0;
+    top: 0;
+  }
+  body:not(.sidebar-minimized) .sidebar .nav-second-level.collapse {
+    display: none;
+  }
+  body:not(.sidebar-minimized) .sidebar .nav-second-level.collapse.in,
+  body:not(.sidebar-minimized) .sidebar .nav-second-level.collapse.show {
+    display: block;
+  }
+  body:not(.sidebar-minimized) .sidebar .nav > li > a.has-children {
+    margin-right: 40px;
+  }
+
+  #event-nav .navigation .navigation-button,
+  .navigation-button {
+    flex: 1 0 100%;
+    display: flex;
+    flex-wrap: nowrap;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-top: 10px;
+  }
+
+  /* Show the event nav (Home / Tickets / Talks / Videos) above the page
+     title on mobile, matching the shared event header layout. */
+  #event-nav .navigation .navigation-button,
+  .header-nav .navigation .navigation-button {
+    order: -1;
+    margin-bottom: 10px;
+  }
+
+  #event-nav .navigation .navigation-button a.header-nav.btn,
+  .navigation-button a.header-nav.btn {
+    flex: 1 1 0;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 13px;
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+}

@@ -1,8 +1,10 @@
+import base64
 import inspect
+import io
 import logging
 import os
 import secrets
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
 from email import policy
@@ -10,7 +12,9 @@ from email.parser import BytesParser
 from itertools import groupby
 from pathlib import Path
 from smtplib import SMTPResponseException
-from typing import Iterable
+from zoneinfo import ZoneInfo
+
+import qrcode
 
 from css_inline import inline as inline_css
 from django.conf import settings
@@ -20,8 +24,8 @@ from django.core.mail.message import EmailMessage
 from django.db.models import Count
 from django.dispatch import receiver
 from django.template.loader import get_template
+from django.utils.html import escape
 from django.utils.timezone import now as djnow
-from django.utils.translation import get_language
 from django.utils.translation import gettext_lazy as _
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Attachment, Bcc, Mail
@@ -32,18 +36,33 @@ from eventyay.base.i18n import (
     LazyExpiresDate,
     LazyNumber,
 )
+from eventyay.base.meetup import is_meetup_event
 from eventyay.base.models import Event
 from eventyay.base.settings import PERSON_NAME_SCHEMES
 from eventyay.base.signals import (
     register_html_mail_renderers,
     register_mail_placeholders,
 )
-from eventyay.mail.signals import talk_register_mail_placeholders
-from eventyay.base.templatetags.rich_text import markdown_compile_email
+from eventyay.base.templatetags.rich_text import compile_email_body, markdown_compile_email
+from eventyay.helpers.i18n import is_rtl
 
-from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+
+def _get_test_email_data(from_addr, to_addrs=None, reply_to=None):
+    to_addrs = to_addrs or [from_addr]
+    if isinstance(to_addrs, str):
+        to_addrs = [to_addrs]
+
+    subject = _('Eventyay test email')
+    body = _('This is a test email sent from Eventyay. If you received this email, your email settings are correct.')
+
+    headers = {}
+    if reply_to:
+        headers['Reply-To'] = reply_to
+
+    return to_addrs, subject, body, headers
 
 
 class SendGridEmail:
@@ -52,13 +71,18 @@ class SendGridEmail:
     def __init__(self, api_key):
         self.api_key = api_key
 
-    def test(self, from_addr):
+    def test(self, from_addr, to_addrs=None, reply_to=None):
+        to_addrs, subject, body, headers = _get_test_email_data(from_addr, to_addrs, reply_to)
+
         message = Mail(
             from_email=from_addr,
-            to_emails='testdummy@eventyay.com',
-            subject='Eventyay test email',
-            html_content='Eventyay test email',
+            to_emails=to_addrs,
+            subject=subject,
+            html_content=body,
         )
+        if headers.get('Reply-To'):
+            message.reply_to = headers['Reply-To']
+
         sg = SendGridAPIClient(self.api_key)
         sg.send(message)
 
@@ -79,6 +103,7 @@ class SendGridEmail:
     def send_messages(self, emails):
         for email in emails:
             html_content = None
+            plain_text_content = None
             try:
                 message_context = email.message().as_bytes(linesep='\r\n')
                 msg = BytesParser(policy=policy.default).parsebytes(message_context)
@@ -87,15 +112,21 @@ class SendGridEmail:
                     content_disposition = str(part.get('Content-Disposition'))
 
                     if content_type == 'text/html' and 'attachment' not in content_disposition:
-                        html_content = part.get_payload(decode=True).decode(part.get_content_charset())
-                        break  # Found the HTML content, no need to continue
-            except Exception as e:
-                logger.error('Error happened when trying to parse mail template: %s' % e)
-                html_content = email.body
+                        html_content = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8')
+                    elif content_type == 'text/plain' and 'attachment' not in content_disposition:
+                        plain_text_content = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8')
+            except UnicodeDecodeError:
+                logger.exception('Error happened when trying to parse mail template')
+                plain_text_content = email.body
+
+            if html_content is None and plain_text_content is None:
+                plain_text_content = email.body
+
             message = Mail(
                 from_email=email.from_email,
                 to_emails=email.to,
                 subject=email.subject,
+                plain_text_content=plain_text_content,
                 html_content=html_content,
             )
             sg = SendGridAPIClient(self.api_key)
@@ -112,20 +143,17 @@ class SendGridEmail:
 
 
 class CustomSMTPBackend(EmailBackend):
-    def test(self, from_addr):
-        try:
-            self.open()
-            self.connection.ehlo_or_helo_if_needed()
-            (code, resp) = self.connection.mail(from_addr, [])
-            if code != 250:
-                logger.warn('Error testing mail settings, code %d, resp: %s' % (code, resp))
-                raise SMTPResponseException(code, resp)
-            (code, resp) = self.connection.rcpt('test@eventyay.com')
-            if (code != 250) and (code != 251):
-                logger.warn('Error testing mail settings, code %d, resp: %s' % (code, resp))
-                raise SMTPResponseException(code, resp)
-        finally:
-            self.close()
+    def test(self, from_addr, to_addrs=None, reply_to=None):
+        to_addrs, subject, body, headers = _get_test_email_data(from_addr, to_addrs, reply_to)
+
+        message = EmailMessage(
+            subject=subject,
+            body=body,
+            from_email=from_addr,
+            to=to_addrs,
+            headers=headers,
+        )
+        self.send_messages([message])
 
 
 class FileSavedEmailBackend(_FileBasedEmailBackend):
@@ -170,13 +198,28 @@ class FileSavedEmailBackend(_FileBasedEmailBackend):
         logger.info('Wrote %d email(s) to %s.', n, subdir.relative_to(Path.cwd()))
         return n
 
+    def test(self, from_addr, to_addrs=None, reply_to=None):
+        to_addrs, subject, body, headers = _get_test_email_data(from_addr, to_addrs, reply_to)
+
+        message = EmailMessage(
+            subject=subject,
+            body=body,
+            from_email=from_addr,
+            to=to_addrs,
+            headers=headers,
+        )
+        self.send_messages([message])
+
     def _get_filename(self):
         """Return a unique file name with .eml extension."""
         if self._fname is None:
             subdir = self.get_subdir_path()
             # We use local time, because this backend is only for development and testing.
             now = datetime.now()
-            file_name = f'{now:%Y%m%d-%H%M%S}-{abs(id(self))}.eml'
+            # Compact format: timestamp with milliseconds + random suffix
+            milliseconds = now.microsecond // 1000
+            random_suffix = secrets.token_hex(2)  # 4 characters
+            file_name = f'{now:%H%M%S}{milliseconds:03d}-{random_suffix}.eml'
             self._fname = str(subdir / file_name)
         return self._fname
 
@@ -252,14 +295,14 @@ class TemplateBasedMailRenderer(BaseHTMLMailRenderer):
         raise NotImplementedError()
 
     def render(self, plain_body: str, plain_signature: str, subject: str, order, position) -> str:
-        body_md = markdown_compile_email(plain_body)
+        body_md = compile_email_body(plain_body)
         htmlctx = {
             'site': settings.INSTANCE_NAME,
             'site_url': settings.SITE_URL,
             'body': body_md,
             'subject': str(subject),
             'color': settings.EVENTYAY_PRIMARY_COLOR,
-            'rtl': get_language() in settings.LANGUAGES_RTL or get_language().split('-')[0] in settings.LANGUAGES_RTL,
+            'rtl': is_rtl(),  # Uses current language automatically
         }
         if self.organizer:
             htmlctx['organizer'] = self.organizer
@@ -344,6 +387,16 @@ class BaseMailTextPlaceholder:
         """
         raise NotImplementedError()
 
+    @property
+    def is_visible(self):
+        """Whether this placeholder is shown in the placeholder help drawer."""
+        return True
+
+    @property
+    def explanation(self):
+        """Short description shown in the placeholder help drawer."""
+        return ''
+
     def render(self, context):
         """
         This method is called to generate the actual text that is being
@@ -362,11 +415,13 @@ class BaseMailTextPlaceholder:
 
 
 class SimpleFunctionalMailTextPlaceholder(BaseMailTextPlaceholder):
-    def __init__(self, identifier, args, func, sample):
+    def __init__(self, identifier, args, func, sample, explanation=None, is_visible=True):
         self._identifier = identifier
         self._args = args
         self._func = func
         self._sample = sample
+        self._explanation = explanation or ''
+        self._is_visible = is_visible
 
     @property
     def identifier(self):
@@ -375,6 +430,14 @@ class SimpleFunctionalMailTextPlaceholder(BaseMailTextPlaceholder):
     @property
     def required_context(self):
         return self._args
+
+    @property
+    def is_visible(self):
+        return self._is_visible
+
+    @property
+    def explanation(self):
+        return self._explanation
 
     def render(self, context):
         return self._func(**{k: context[k] for k in self._args})
@@ -401,6 +464,8 @@ def get_available_placeholders(event: Event, base_parameters: Iterable[str]) -> 
 
 
 def get_email_context(**kwargs):
+    from django_scopes.exceptions import ScopeError
+
     from eventyay.base.models import InvoiceAddress
 
     event = kwargs['event']
@@ -421,9 +486,12 @@ def get_email_context(**kwargs):
             try:
                 if all(rp in kwargs for rp in v.required_context):
                     ctx[v.identifier] = v.render(kwargs)
-            except (KeyError, AttributeError, TypeError, ValueError) as e:
-                logger.warning("Skipping placeholder %s due to error: %s", v.identifier, e)
-    logger.info('Email context: %s', ctx)
+            except (KeyError, AttributeError, TypeError, ValueError, ScopeError) as e:
+                # ScopeError must not abort the whole context: later placeholders
+                # (e.g. order_qr / ticket_qr) would otherwise never resolve.
+                logger.warning('Skipping placeholder %s due to error: %s', v.identifier, e)
+    # Log keys only: QR placeholders embed ticket secrets as data-URI images.
+    logger.info('Email context keys: %s', sorted(ctx.keys()))
     return ctx
 
 
@@ -470,7 +538,86 @@ def get_best_name(position_or_address, parts=False):
 
 def generate_sample_video_url():
     sample_token = secrets.token_urlsafe(16)
-    return '{}/#token={}'.format(settings.SITE_URL, sample_token)
+    return f'{settings.SITE_URL}/#token={sample_token}'
+
+
+def render_qr_code_img(payload: str, *, alt: str, size: int = 160) -> str:
+    """Return an HTML ``<img>`` tag with a PNG QR code as a data URI."""
+    image = qrcode.make(payload)
+    buffer = io.BytesIO()
+    image.save(buffer, format='PNG')
+    data_uri = f'data:image/png;base64,{base64.b64encode(buffer.getvalue()).decode("ascii")}'
+    return (
+        f'<img src="{data_uri}" alt="{escape(alt)}" '
+        f'width="{int(size)}" height="{int(size)}">'
+    )
+
+
+def render_ticket_qr_html(position) -> str:
+    return render_qr_code_img(position.ticket_qrcode_content, alt=str(_('Ticket QR code')))
+
+
+def render_order_qr_html(order) -> str:
+    """
+    Render check-in QR codes for all printable tickets on an order.
+
+    Used in order-scoped emails where there is no single position context.
+    Uses inline markup so HTML sanitizers keep it inside Tiptap placeholder chips.
+    """
+    from django_scopes import scopes_disabled
+
+    parts = []
+    # Never depend on request scope: mail may run outside organizer scope.
+    with scopes_disabled():
+        positions = list(
+            order.all_positions.select_related('product', 'variation')
+            .filter(canceled=False)
+            .order_by('positionid')
+        )
+        for position in positions:
+            if not position.generate_ticket:
+                continue
+            label = position.attendee_name or str(position.product.name)
+            parts.append(f'<strong>{escape(label)}</strong><br>{render_ticket_qr_html(position)}')
+    return '<br>'.join(parts)
+
+
+def get_combined_ticket_output_identifier(event: Event) -> str:
+    """Return an enabled combined ticket-output identifier for download links."""
+    from eventyay.base.signals import register_ticket_outputs
+
+    enabled_ids = []
+    for _receiver, response in register_ticket_outputs.send(event):
+        provider = response(event)
+        if not getattr(provider, 'is_enabled', False):
+            continue
+        if provider.identifier == 'pdf':
+            return 'pdf'
+        enabled_ids.append(provider.identifier)
+    return enabled_ids[0] if enabled_ids else 'pdf'
+
+
+def download_tickets_button_label(output: str) -> str:
+    if output == 'pdf':
+        return str(_('Download tickets (PDF)'))
+    return str(_('Download tickets'))
+
+
+def render_download_tickets_pdf_button(event: Event, order) -> str:
+    from eventyay.multidomain.urlreverse import build_absolute_uri
+
+    output = get_combined_ticket_output_identifier(event)
+    url = build_absolute_uri(
+        event,
+        'presale:event.order.download.combined',
+        kwargs={
+            'order': order.code,
+            'secret': order.secret,
+            'output': output,
+        },
+    )
+    label = escape(download_tickets_button_label(output))
+    return f'<a href="{escape(url)}" class="button">{label}</a>'
 
 
 @receiver(register_mail_placeholders, dispatch_uid='pretixbase_register_mail_placeholders')
@@ -481,12 +628,35 @@ def base_placeholders(sender: Event, **kwargs):
     )
     def render_video_join_link(event: Event, order) -> str:
         url = build_join_video_url(event, order)
-        # TODO: Make the label translatable.
-        return f'<a href="{url}" class="button">Join online event</a>'
+        return f'<a href="{url}" class="button">{_("Join online event")}</a>'
+
+    def sample_ticket_qr(event=None):
+        return render_qr_code_img(
+            '{"event":"DEMO","ticket":"sample-secret","lead":"ABCDEF"}',
+            alt=str(_('Ticket QR code')),
+        )
+
+    def sample_download_pdf(event):
+        return (
+            f'<a href="{escape(build_absolute_uri(event, "presale:event.index"))}" class="button">'
+            f'{escape(download_tickets_button_label("pdf"))}</a>'
+        )
+
     ph = [
+        # `{event}` is the historical tickets placeholder; `{event_name}` is the
+        # talk/Tiptap alias so both resolve to the event title in order emails.
         SimpleFunctionalMailTextPlaceholder('event', ['event'], lambda event: event.name, lambda event: event.name),
         SimpleFunctionalMailTextPlaceholder(
+            'event_name', ['event'], lambda event: event.name, lambda event: event.name
+        ),
+        SimpleFunctionalMailTextPlaceholder(
             'event',
+            ['event_or_subevent'],
+            lambda event_or_subevent: event_or_subevent.name,
+            lambda event_or_subevent: event_or_subevent.name,
+        ),
+        SimpleFunctionalMailTextPlaceholder(
+            'event_name',
             ['event_or_subevent'],
             lambda event_or_subevent: event_or_subevent.name,
             lambda event_or_subevent: event_or_subevent.name,
@@ -785,8 +955,39 @@ def base_placeholders(sender: Event, **kwargs):
             get_best_name,
             _('John Doe'),
         ),
+        # Order-level fallback first; position-level wins when both are present so
+        # buyer/order emails still resolve {ticket_qr} without a position context.
+        SimpleFunctionalMailTextPlaceholder(
+            'ticket_qr',
+            ['order'],
+            lambda order: render_order_qr_html(order),
+            sample_ticket_qr,
+        ),
+        SimpleFunctionalMailTextPlaceholder(
+            'ticket_qr',
+            ['position'],
+            lambda position: render_ticket_qr_html(position),
+            sample_ticket_qr,
+        ),
+        SimpleFunctionalMailTextPlaceholder(
+            'order_qr',
+            ['order'],
+            lambda order: render_order_qr_html(order),
+            sample_ticket_qr,
+        ),
+        SimpleFunctionalMailTextPlaceholder(
+            'download_tickets_pdf',
+            ['order', 'event'],
+            lambda order, event: render_download_tickets_pdf_button(event, order),
+            sample_download_pdf,
+        ),
     ]
-    if 'pretix_venueless' in sender.get_plugins():
+    if (
+        sender.settings.venueless_url
+        and sender.settings.venueless_issuer
+        and sender.settings.venueless_audience
+        and sender.settings.venueless_secret
+    ):
         ph.append(
             SimpleFunctionalMailTextPlaceholder(
                 'join_online_event',
@@ -796,14 +997,14 @@ def base_placeholders(sender: Event, **kwargs):
             ),
         )
     else:
-        logger.info('pretix_venueless plugin not found, skipping join_online_event placeholder')
+        logger.info('Video configuration missing, skipping join_online_event placeholder')
     name_scheme = PERSON_NAME_SCHEMES[sender.settings.name_scheme]
     for f, l, w in name_scheme['fields']:
         if f == 'full_name':
             continue
         ph.append(
             SimpleFunctionalMailTextPlaceholder(
-                'attendee_name_%s' % f,
+                f'attendee_name_{f}',
                 ['position'],
                 lambda position, f=f: position.attendee_name_parts.get(f, ''),
                 name_scheme['sample'][f],
@@ -811,7 +1012,7 @@ def base_placeholders(sender: Event, **kwargs):
         )
         ph.append(
             SimpleFunctionalMailTextPlaceholder(
-                'name_%s' % f,
+                f'name_{f}',
                 ['position_or_address'],
                 lambda position_or_address, f=f: get_best_name(position_or_address, parts=True).get(f, ''),
                 name_scheme['sample'][f],
@@ -820,7 +1021,44 @@ def base_placeholders(sender: Event, **kwargs):
 
     for k, v in sender.meta_data.items():
         ph.append(
-            SimpleFunctionalMailTextPlaceholder('meta_%s' % k, ['event'], lambda event, k=k: event.meta_data[k], v)
+            SimpleFunctionalMailTextPlaceholder(f'meta_{k}', ['event'], lambda event, k=k: event.meta_data[k], v)
         )
 
     return ph
+
+
+@receiver(register_mail_placeholders, dispatch_uid='pretixbase_register_meetup_mail_placeholders')
+def meetup_placeholders(sender: Event, **kwargs):
+    """Placeholders only available for meetup events."""
+    from eventyay.multidomain.urlreverse import build_absolute_uri
+
+    if not is_meetup_event(sender):
+        return []
+    return [
+        SimpleFunctionalMailTextPlaceholder(
+            'organizer',
+            ['event'],
+            lambda event: event.organizer.name,
+            lambda event: event.organizer.name,
+        ),
+        SimpleFunctionalMailTextPlaceholder(
+            'event_url',
+            ['event'],
+            lambda event: build_absolute_uri(
+                event,
+                'presale:event.index',
+                kwargs={
+                    'event': event.slug,
+                    'organizer': event.organizer.slug,
+                },
+            ),
+            lambda event: build_absolute_uri(
+                event,
+                'presale:event.index',
+                kwargs={
+                    'event': event.slug,
+                    'organizer': event.organizer.slug,
+                },
+            ),
+        ),
+    ]

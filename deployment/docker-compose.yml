@@ -4,16 +4,18 @@ services:
   web:
     image: eventyay/eventyay-next:${TAG}
     container_name: eventyay-next-web
-    command: gunicorn eventyay.config.wsgi:application --bind 0.0.0.0:8000
+    command: gunicorn eventyay.config.wsgi:application --bind 0.0.0.0:8000 --worker-class gthread --workers 2 --threads 4 --timeout 60 --graceful-timeout 30 --max-requests 1000 --max-requests-jitter 100 --no-control-socket
     volumes:
-      - ./data/static:/home/app/web/eventyay/static.dist
-      - ./data/data:/home/app/web/eventyay/data
+      - ${DATA_DIR:-./data}/static:/home/app/web/eventyay/static.dist
+      - ${DATA_DIR:-./data}/data:/home/app/web/eventyay/data
     ports:
       - 8000:8000
     expose:
       - 8000
     env_file:
       - ./.env
+    environment:
+      - MAX_CONCURRENT_REQUESTS=4
     depends_on:
       - db
       - redis
@@ -21,9 +23,14 @@ services:
   websocket:
     image: eventyay/eventyay-next:${TAG}
     container_name: eventyay-next-websocket
-    entrypoint: daphne -b 0.0.0.0 -p 8001 eventyay.config.asgi:application
+    entrypoint: daphne -b 0.0.0.0 -p 8001 --proxy-headers --verbosity 0 eventyay.config.asgi:application
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     volumes:
-      - ./data/data:/home/app/web/eventyay/data
+      - ${DATA_DIR:-./data}/static:/home/app/web/eventyay/static.dist
+      - ${DATA_DIR:-./data}/data:/home/app/web/eventyay/data
     ports:
       - 8001:8001
     expose:
@@ -32,6 +39,7 @@ services:
       - ./.env
     environment:
       - MPLCONFIGDIR=/tmp/matplotlib
+      - MALLOC_ARENA_MAX=2
     depends_on:
       - db
       - redis
@@ -39,10 +47,41 @@ services:
   worker:
     image: eventyay/eventyay-next:${TAG}
     container_name: eventyay-next-worker
-    entrypoint: celery -A eventyay worker -l info
+    entrypoint: celery -A eventyay worker -l info -Q default,notifications
     volumes:
-      - ./data/static:/home/app/web/eventyay/static.dist
-      - ./data/data:/home/app/web/eventyay/data
+      - ${DATA_DIR:-./data}/static:/home/app/web/eventyay/static.dist
+      - ${DATA_DIR:-./data}/data:/home/app/web/eventyay/data
+    env_file:
+      - ./.env
+    environment:
+      - MPLCONFIGDIR=/tmp/matplotlib
+    depends_on:
+      - db
+      - redis
+
+  worker-heavy:
+    # Required in production: processes longrunning/background queues (badges, exports, imports).
+    image: eventyay/eventyay-next:${TAG}
+    container_name: eventyay-next-worker-heavy
+    entrypoint: celery -A eventyay worker -l info -Q longrunning,background -c 1 --prefetch-multiplier=1 --max-tasks-per-child=200
+    volumes:
+      - ${DATA_DIR:-./data}/static:/home/app/web/eventyay/static.dist
+      - ${DATA_DIR:-./data}/data:/home/app/web/eventyay/data
+    env_file:
+      - ./.env
+    environment:
+      - MPLCONFIGDIR=/tmp/matplotlib
+    depends_on:
+      - db
+      - redis
+
+  beat:
+    image: eventyay/eventyay-next:${TAG}
+    container_name: eventyay-next-beat
+    entrypoint: celery -A eventyay beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    volumes:
+      - ${DATA_DIR:-./data}/static:/home/app/web/eventyay/static.dist
+      - ${DATA_DIR:-./data}/data:/home/app/web/eventyay/data
     env_file:
       - ./.env
     environment:
@@ -55,7 +94,7 @@ services:
     image: postgres:15
     container_name: eventyay-next-db
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data/
+      - ${DATA_DIR:-./data}/postgres:/var/lib/postgresql/data/
     env_file:
       - ./.env
 
@@ -79,8 +118,7 @@ services:
       WATCHTOWER_NOTIFICATIONS_HOSTNAME: ${WATCHTOWER_NOTIFICATIONS_HOSTNAME}
       WATCHTOWER_POLL_INTERVAL: 600
       WATCHTOWER_NOTIFICATION_URL: ${WATCHTOWER_NOTIFICATION_URL}
-    command: watchtower eventyay-next-web eventyay-next-websocket eventyay-next-worker --cleanup
+    command: watchtower eventyay-next-watchtower eventyay-next-web eventyay-next-websocket eventyay-next-worker eventyay-next-worker-heavy eventyay-next-beat --cleanup
 
 volumes:
   rd:
-

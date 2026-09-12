@@ -1,23 +1,22 @@
 import copy
 import datetime as dt
+import hashlib
+import logging
 import os
 import string
 import uuid
 from collections import OrderedDict, defaultdict
 from contextlib import suppress
-from urllib.parse import urlparse
 from datetime import datetime, time, timedelta
 from operator import attrgetter
-from typing import List
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import icalendar
 import jwt
-import logging
 from dateutil.relativedelta import relativedelta
 from django.conf import settings
-from django.core.exceptions import MultipleObjectsReturned, ValidationError
+from django.core.exceptions import MultipleObjectsReturned, SuspiciousFileOperation, ValidationError
 from django.core.files import File
 from django.core.files.storage import default_storage
 from django.core.mail import get_connection
@@ -27,7 +26,7 @@ from django.core.validators import (
     MinValueValidator,
     RegexValidator,
 )
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Exists, OuterRef, Prefetch, Q, Subquery, Value
 from django.template.defaultfilters import date as _date
 from django.urls import reverse
@@ -40,39 +39,56 @@ from django.utils.translation import gettext
 from django.utils.translation import gettext_lazy as _
 from django_scopes import ScopedManager, scope, scopes_disabled
 from i18nfield.fields import I18nCharField, I18nTextField
+from redis.exceptions import RedisError
 from rules.contrib.models import RulesModelBase, RulesModelMixin
 
 from eventyay.base.models.base import LoggedModel
 from eventyay.base.models.fields import MultiStringField
 from eventyay.base.models.mixins import FileCleanupMixin, TimestampedModel
+from eventyay.base.plugins import get_all_plugins
 from eventyay.base.reldate import RelativeDateWrapper
 from eventyay.base.settings import GlobalSettingsObject
 from eventyay.base.validators import EventSlugBanlistValidator
 from eventyay.common.language import LANGUAGE_NAMES
-from eventyay.common.plugins import get_all_plugins
-from eventyay.common.text.path import path_with_hash
+from eventyay.common.text.path import path_with_hash, resolve_media_path as _resolve_media_path
 from eventyay.common.text.phrases import phrases
-from eventyay.common.urls import EventUrls
+from eventyay.common.urls import EventUrls, is_http_url
 from eventyay.consts import TIMEZONE_CHOICES
-from eventyay.core.permissions import MAX_PERMISSIONS_IF_SILENCED, SYSTEM_ROLES, Permission
+from eventyay.core.permissions import (
+    MAX_PERMISSIONS_IF_SILENCED,
+    ORGANIZER_ROLES,
+    SYSTEM_ROLES,
+    Permission,
+    default_grants,
+    default_roles,
+    normalize_permission_value,
+    traits_match_required,
+)
 from eventyay.core.utils.json import CustomJSONEncoder
+from eventyay.eventyay_common.video.permissions import (
+    VIDEO_TRAIT_ROLE_MAP,
+    resolve_attendee_trait_grant,
+)
 from eventyay.helpers.database import GroupConcat
 from eventyay.helpers.daterange import daterange
+from eventyay.helpers.http import smtp_reachable
 from eventyay.helpers.json import safe_string
-from eventyay.helpers.thumb import get_thumbnail
+from eventyay.helpers.thumb import ThumbnailError, get_thumbnail
 from eventyay.talk_rules.event import (
     can_change_event_settings,
     can_create_events,
     has_any_permission,
+    has_talk_permission,
     is_event_visible,
 )
 
 from ..settings import settings_hierarkey
 from .auth import User
 from .mixins import OrderedModel, PretalxModel
-from .organizer import Organizer, OrganizerBillingModel, Team
+from .organizer import Organizer, Team
 from .roomquestion import RoomQuestion
 from .systemlog import SystemLog
+
 
 TALK_HOSTNAME = settings.TALK_HOSTNAME
 logger = logging.getLogger(__name__)
@@ -86,97 +102,15 @@ def event_logo_path(instance, filename):
     return path_with_hash(filename, base_path=f'{instance.slug}/img/')
 
 
-def default_roles():
-    attendee = [
-        Permission.EVENT_VIEW,
-        Permission.EVENT_EXHIBITION_CONTACT,
-        Permission.EVENT_CHAT_DIRECT,
-    ]
-    viewer = attendee + [Permission.ROOM_VIEW, Permission.ROOM_CHAT_READ]
-    participant = viewer + [
-        Permission.ROOM_CHAT_JOIN,
-        Permission.ROOM_CHAT_SEND,
-        Permission.ROOM_QUESTION_READ,
-        Permission.ROOM_QUESTION_ASK,
-        Permission.ROOM_QUESTION_VOTE,
-        Permission.ROOM_POLL_READ,
-        Permission.ROOM_POLL_VOTE,
-        Permission.ROOM_ROULETTE_JOIN,
-        Permission.ROOM_BBB_JOIN,
-        Permission.ROOM_JANUSCALL_JOIN,
-        Permission.ROOM_ZOOM_JOIN,
-    ]
-    room_creator = [Permission.EVENT_ROOMS_CREATE_CHAT]
-    room_owner = participant + [
-        Permission.ROOM_INVITE,
-        Permission.ROOM_DELETE,
-    ]
-    speaker = participant + [
-        Permission.ROOM_BBB_MODERATE,
-        Permission.ROOM_JANUSCALL_MODERATE,
-        Permission.ROOM_POLL_EARLY_RESULTS,
-    ]
-    moderator = speaker + [
-        Permission.ROOM_VIEWERS,
-        Permission.ROOM_CHAT_MODERATE,
-        Permission.ROOM_ANNOUNCE,
-        Permission.ROOM_BBB_RECORDINGS,
-        Permission.ROOM_QUESTION_MODERATE,
-        Permission.ROOM_POLL_EARLY_RESULTS,
-        Permission.ROOM_POLL_MANAGE,
-        Permission.EVENT_ANNOUNCE,
-    ]
-    admin = (
-        moderator
-        + room_creator
-        + [
-            Permission.EVENT_UPDATE,
-            Permission.ROOM_DELETE,
-            Permission.ROOM_UPDATE,
-            Permission.EVENT_ROOMS_CREATE_BBB,
-            Permission.EVENT_ROOMS_CREATE_STAGE,
-            Permission.EVENT_ROOMS_CREATE_EXHIBITION,
-            Permission.EVENT_ROOMS_CREATE_POSTER,
-            Permission.EVENT_USERS_LIST,
-            Permission.EVENT_USERS_MANAGE,
-            Permission.EVENT_GRAPHS,
-            Permission.EVENT_CONNECTIONS_UNLIMITED,
-        ]
-    )
-    apiuser = admin + [Permission.EVENT_API, Permission.EVENT_SECRETS]
-    scheduleuser = [Permission.EVENT_API]
-    return {
-        'attendee': attendee,
-        'viewer': viewer,
-        'participant': participant,
-        'room_creator': room_creator,
-        'room_owner': room_owner,
-        'speaker': speaker,
-        'moderator': moderator,
-        'admin': admin,
-        'apiuser': apiuser,
-        'scheduleuser': scheduleuser,
-    }
-
-
-def default_grants():
-    return {
-        'attendee': ['attendee'],
-        'admin': ['admin'],
-        'scheduleuser': ['schedule-update'],
-    }
-
-
 FEATURE_FLAGS = [
     'schedule-control',
-    'iframe-player',
     'roulette',
     'muxdata',
     'page.landing',
     'zoom',
     'janus',
+    'jitsi',
     'polls',
-    'poster',
     'conftool',
     'cross-origin-isolation',
 ]
@@ -185,17 +119,22 @@ FEATURE_FLAGS = [
 def default_feature_flags():
     return {
         'show_schedule': True,
-        'show_featured': 'pre_schedule',
+        'show_featured': 'never',
+        'show_featured_speakers': 'never',
         'show_widget_if_not_public': False,
+        'session_popularity_enabled': False,
+        'session_popularity_show_on_schedule': True,
         'export_html_on_release': False,
         'use_tracks': True,
-        'use_feedback': True,
+        'use_feedback': False,
         'use_submission_comments': True,
         'present_multiple_times': False,
         'submission_public_review': True,
         'chat-moderation': True,
         'polls': True,
         'schedule-control': True,
+        'etherpad_enabled': False,
+        'etherpad_auto_generate': False,
     }
 
 
@@ -205,8 +144,8 @@ def default_display_settings():
         'imprint_url': None,
         'header_pattern': '',
         'html_export_url': '',
-        'meta_noindex': False,
         'texts': {'agenda_session_above': '', 'agenda_session_below': ''},
+        'etherpad_public': False,
     }
 
 
@@ -317,6 +256,8 @@ class EventMixin:
         setting. Times are not shown.
         """
         tz = tz or ZoneInfo(key=self.settings.timezone)
+        if isinstance(tz, str):
+            tz = ZoneInfo(key=tz)
         if (not self.settings.show_date_to and not force_show_end) or not self.date_to:
             return _date(self.date_from.astimezone(tz), 'DATE_FORMAT')
         return daterange(self.date_from.astimezone(tz), self.date_to.astimezone(tz))
@@ -514,6 +455,7 @@ class EventMixin:
 # - We want to avoid the `objects = ScopedManager()` (we may use it later, after the making "enext" stable enough).
 # - We don't want to inherit the LogMixin (already have LoggedModel).
 @settings_hierarkey.add(parent_field='organizer', cache_namespace='event')
+
 class Event(
     EventMixin, LoggedModel, TimestampedModel, FileCleanupMixin, RulesModelMixin, models.Model, metaclass=RulesModelBase
 ):
@@ -525,6 +467,8 @@ class Event(
     :type organizer: eventyay.base.models.organizer.Organizer
     :param testmode: This event is in test mode
     :type testmode: bool
+    :param private_testmode: This event hides tickets from non-organizers
+    :type private_testmode: bool
     :param name: This event's full title
     :type name: str
     :param slug: A short, alphanumeric, all-lowercase name for use in URLs. The slug has to
@@ -535,13 +479,13 @@ class Event(
     :param currency: The currency of all prices and payments of this event
     :type currency: str
     :param date_from: The datetime this event starts
-    :type date_from: datetime
+    :type date_from: datetime.datetime
     :param date_to: The datetime this event ends
-    :type date_to: datetime
+    :type date_to: datetime.datetime
     :param presale_start: No tickets will be sold before this date.
-    :type presale_start: datetime
+    :type presale_start: datetime.datetime
     :param presale_end: No tickets will be sold after this date.
-    :type presale_end: datetime
+    :type presale_end: datetime.datetime
     :param location: venue
     :type location: str
     :param plugins: A comma-separated list of plugin names that are active for this
@@ -558,6 +502,7 @@ class Event(
     CURRENCY_CHOICES = [(c.alpha_3, c.alpha_3 + ' - ' + c.name) for c in settings.CURRENCIES]
     organizer = models.ForeignKey(Organizer, related_name='events', on_delete=models.PROTECT)
     testmode = models.BooleanField(default=False)
+    private_testmode = models.BooleanField(default=False)
     name = I18nCharField(
         max_length=200,
         verbose_name=_('Event name'),
@@ -584,6 +529,10 @@ class Event(
         verbose_name=_('Short form'),
     )
     live = models.BooleanField(default=False, verbose_name=_('Shop is live'))
+    startpage_visible = models.BooleanField(default=True, verbose_name=_('Visible on start page'))
+    startpage_featured = models.BooleanField(default=False, verbose_name=_('Featured on start page'))
+    tickets_published = models.BooleanField(default=False, verbose_name=_('Tickets are published'))
+    talks_published = models.BooleanField(default=False, verbose_name=_('Talk pages are published'))
     currency = models.CharField(
         max_length=10,
         verbose_name=_('Event currency'),
@@ -661,6 +610,13 @@ class Event(
         help_text=_('Create Video platform for Event.'),
         default=False,
     )
+    banned_users = models.ManyToManyField(
+        'User',
+        related_name='banned_events',
+        blank=True,
+        verbose_name=_('Banned users'),
+        help_text=_('Users who are banned from submitting feedback or interacting with this event.'),
+    )
 
     # Fields for talk
     timezone = models.CharField(
@@ -671,8 +627,11 @@ class Event(
     )
     email = models.EmailField(
         verbose_name=_('Organizer email address'),
-        help_text=_('Will be used as Reply-To in emails.'),
-        default='org@mail.com',
+        help_text=_("Enter an organizer email address for event-related emails. "
+                    "If set, this address will be used as the Reply-To when the platform sender address is used. "
+                    "If left empty, no Reply-To will be added automatically and replies will go to the sender address (platform default if not customized)."),
+        blank=True,
+        null=True,
     )
     custom_domain = models.URLField(
         verbose_name=_('Custom domain'),
@@ -729,24 +688,7 @@ class Event(
         choices=settings.LANGUAGES,
         verbose_name=_('Default language'),
     )
-    landing_page_text = I18nTextField(
-        verbose_name=_('Landing page text'),
-        help_text=_(
-            'This text will be shown on the landing page, alongside with links to the CfP and schedule, if appropriate.'
-        )
-        + ' '
-        + phrases.base.use_markdown,
-        null=True,
-        blank=True,
-    )
-    featured_sessions_text = I18nTextField(
-        verbose_name=_('Featured sessions text'),
-        help_text=_('This text will be shown at the top of the featured sessions page instead of the default text.')
-        + ' '
-        + phrases.base.use_markdown,
-        null=True,
-        blank=True,
-    )
+
     # Virtual platform fields
     config = models.JSONField(null=True, blank=True)
     roles = models.JSONField(null=True, blank=True, default=default_roles, encoder=CustomJSONEncoder)
@@ -783,7 +725,6 @@ class Event(
         reset = '{base}reset'
         submit = '{base}submit/'
         user = '{base}me/'
-        user_delete = '{base}me/delete'
         user_submissions = '{user}submissions/'
         user_mails = '{user}mails/'
         schedule = '{base}schedule/'
@@ -807,7 +748,7 @@ class Event(
         """URL patterns for organizer/admin panel views of this event."""
 
         base_path = settings.BASE_PATH
-        base = '{base_path}/orga/event/{self.slug}/'
+        base = '{base_path}/orga/event/{self.organizer.slug}/{self.slug}/'
         login = '{base}login/'
         live = '{base}live'
         delete = '{base}delete'
@@ -817,11 +758,13 @@ class Event(
         mail = '{base}mails/'
         compose_mails = '{mail}compose'
         compose_mails_sessions = '{compose_mails}/sessions/'
+        compose_mails_sessions_recipients = '{compose_mails}/sessions/recipients'
         compose_mails_teams = '{compose_mails}/teams/'
         send_drafts_reminder = '{compose_mails}/reminders'
         mail_templates = '{mail}templates/'
         new_template = '{mail_templates}new/'
         outbox = '{mail}outbox/'
+        drafts = '{mail}drafts/'
         sent_mails = '{mail}sent'
         send_outbox = '{outbox}send'
         purge_outbox = '{outbox}purge'
@@ -829,7 +772,6 @@ class Event(
         tags = '{submissions}tags/'
         new_tag = '{tags}new/'
         submission_cards = '{base}submissions/cards/'
-        stats = '{base}submissions/statistics/'
         submission_feed = '{base}submissions/feed/'
         new_submission = '{submissions}new'
         feedback = '{submissions}feedback/'
@@ -837,16 +779,20 @@ class Event(
         speakers = '{base}speakers/'
         settings = edit_settings = '{base}settings/'
         review_settings = '{settings}review/'
+        feedback_settings = '{settings}feedback/'
         mail_settings = edit_mail_settings = '{settings}mail'
         widget_settings = '{settings}widget'
+        import_export_settings = '{settings}import-export/'
+        import_export_schedule_export_trigger = '{import_export_settings}schedule/export/trigger'
+        import_export_schedule_export_download = '{import_export_settings}schedule/export/download'
         team_settings = '{settings}team/'
         new_team = '{settings}team/new'
         room_settings = '{schedule}rooms/'
         new_room = '{room_settings}new/'
         schedule = '{base}schedule/'
-        schedule_export = '{schedule}export/'
-        schedule_export_trigger = '{schedule_export}trigger'
-        schedule_export_download = '{schedule_export}download'
+        schedule_export = '{import_export_settings}?export_target=session#tab-export'
+        schedule_export_trigger = '{import_export_schedule_export_trigger}'
+        schedule_export_download = '{import_export_schedule_export_download}'
         release_schedule = '{schedule}release'
         reset_schedule = '{schedule}reset'
         toggle_schedule = '{schedule}toggle'
@@ -862,7 +808,7 @@ class Event(
         """URL patterns for API endpoints related to this event."""
 
         base_path = settings.TALK_BASE_PATH
-        base = '{base_path}/api/events/{self.slug}/'
+        base = '{base_path}/api/v1/events/{self.slug}/'
         submissions = '{base}submissions/'
         slots = '{base}slots/'
         talks = '{base}talks/'
@@ -870,7 +816,7 @@ class Event(
         speakers = '{base}speakers/'
         reviews = '{base}reviews/'
         rooms = '{base}rooms/'
-        questions = '{base}questions/'
+        questions = '{base}talkquestions/'
         question_options = '{base}question-options/'
         answers = '{base}answers/'
         tags = '{base}tags/'
@@ -902,6 +848,7 @@ class Event(
         # The permission names change when we move the code to a different app.
         rules_permissions = {
             'orga_access': has_any_permission,
+            'talk_orga_access': has_talk_permission,
             'view': is_event_visible | has_any_permission,
             'update': can_change_event_settings,
             'create': can_create_events,
@@ -922,20 +869,47 @@ class Event(
         self.settings.event_list_type = 'calendar'
         self.settings.invoice_email_attachment = True
         self.settings.name_scheme = 'given_family'
+        self.settings.ticket_download = True
+        self.settings.private_testmode_tickets = False
+        self.settings.private_testmode_talks = False
 
     @property
     def social_image(self):
         from eventyay.multidomain.urlreverse import build_absolute_uri
 
         img = None
-        logo_file = self.settings.get('logo_image', as_type=str, default='')[7:]
-        og_file = self.settings.get('og_image', as_type=str, default='')[7:]
+        og_file = self.settings.get('og_image', as_type=str, default=None)
         if og_file:
-            img = get_thumbnail(og_file, '1200').thumb.url
-        elif logo_file:
-            img = get_thumbnail(logo_file, '5000x120').thumb.url
+            if is_http_url(og_file):
+                return og_file
+            
+            og_path = _resolve_media_path(og_file)
+            if og_path:
+                try:
+                    img = get_thumbnail(og_path, '1200').thumb.url
+                except (OSError, SuspiciousFileOperation, ThumbnailError) as exc:
+                    logger.warning('Failed to load og_image thumbnail for %s: %s', og_path, exc)
+
+        if not img:
+            if self.visible_logo_url:
+                img = self.visible_logo_url
+            elif self.visible_header_image_url:
+                img = self.visible_header_image_url
+
         if img:
+            if is_http_url(img):
+                return img
+            if urlparse(img).scheme:
+                return None
             return urljoin(build_absolute_uri(self, 'presale:event.index'), img)
+
+    @property
+    def social_image_signature(self):
+        og_image = self.settings.get('og_image', as_type=str, default='') or ''
+        image_source = og_image or self.visible_logo_url or self.visible_header_image_url or ''
+        if not image_source:
+            return ''
+        return hashlib.sha1(image_source.encode('utf-8')).hexdigest()[:12]
 
     def _seats(self, ignore_voucher=None):
         from .seating import Seat
@@ -973,15 +947,46 @@ class Event(
 
     def save(self, *args, **kwargs):
         was_created = not bool(self.pk)
+        locales_changed = False
+        
+        # Check if locales have changed by comparing locale_array directly
+        if not was_created:
+            try:
+                old_instance = self.__class__.objects.get(pk=self.pk)
+                # Compute locales directly from locale_array to avoid cached_property issues
+                old_locales = set(code for code in old_instance.locale_array.split(',') if code)
+                new_locales = set(code for code in self.locale_array.split(',') if code)
+                if old_locales != new_locales:
+                    locales_changed = True
+            except self.__class__.DoesNotExist:
+                pass
+        
         if self.date_from and not self.date_to:
             self.date_to = self.date_from + timedelta(hours=24)
 
         obj = super().save(*args, **kwargs)
         self.cache.clear()
+        
+        # Clear cached_property for locales and related properties to ensure fresh calculation
+        if 'locales' in self.__dict__:
+            del self.__dict__['locales']
+        if 'content_locales' in self.__dict__:
+            del self.__dict__['content_locales']
 
         if was_created:
             self.build_initial_data()
+        elif locales_changed:
+            # Backfill all existing mail templates with new locales
+            self._backfill_all_mail_template_locales()
+        
         return obj
+
+    def _backfill_all_mail_template_locales(self):
+        """Backfill all existing mail templates with newly added locales."""
+        with scope(event=self):
+            for template in self.mail_templates.all():
+                if template.role:
+                    self._ensure_mail_template_locales(template, template.role)
 
     def get_plugins(self):
         """
@@ -1011,18 +1016,17 @@ class Event(
         this event, so you don't have to prefix your cache keys. In addition, the cache
         is being cleared every time the event or one of its related objects change.
         """
-        # FIXME: This "cache" module is missing.
         from eventyay.base.cache import ObjectRelatedCache
 
         return ObjectRelatedCache(self)
 
-    def lock(self):
+    def lock(self, blocking=False, blocking_timeout=None):
         """
         Returns a contextmanager that can be used to lock an event for bookings.
         """
         from eventyay.base.services import locking
 
-        return locking.LockManager(self)
+        return locking.LockManager(self, blocking=blocking, blocking_timeout=blocking_timeout)
 
     def __getstate__(self):
         """
@@ -1047,12 +1051,24 @@ class Event(
         or by returning a custom one based on the event's settings.
         """
         from eventyay.base.email import CustomSMTPBackend, SendGridEmail
+        from eventyay.base.gmail.resolver import get_gmail_mail_backend
 
         gs = GlobalSettingsObject()
 
         if self.settings.smtp_use_custom or force_custom:
+            if self.settings.email_vendor == 'gmail_api':
+                backend = get_gmail_mail_backend(event=self, timeout=timeout, force_custom=force_custom)
+                if backend:
+                    return backend
             if self.settings.email_vendor == 'sendgrid':
                 return SendGridEmail(api_key=self.settings.send_grid_api_key)
+            if not force_custom and not smtp_reachable(self.settings.smtp_host, self.settings.smtp_port, timeout=timeout):
+                logger.warning(
+                    'Event SMTP %s:%s is not reachable, falling back to system email backend',
+                    self.settings.smtp_host,
+                    self.settings.smtp_port,
+                )
+                return get_connection(fail_silently=False, timeout=timeout)
             return CustomSMTPBackend(
                 host=self.settings.smtp_host,
                 port=self.settings.smtp_port,
@@ -1064,21 +1080,30 @@ class Event(
                 timeout=timeout,
             )
         elif gs.settings.email_vendor is not None:
+            if gs.settings.email_vendor == 'gmail_api':
+                backend = get_gmail_mail_backend(timeout=timeout)
+                if backend:
+                    return backend
             if gs.settings.email_vendor == 'sendgrid':
                 return SendGridEmail(api_key=gs.settings.send_grid_api_key)
-            else:
-                return CustomSMTPBackend(
-                    host=gs.settings.smtp_host,
-                    port=gs.settings.smtp_port,
-                    username=gs.settings.smtp_username,
-                    password=gs.settings.smtp_password,
-                    use_tls=gs.settings.smtp_use_tls,
-                    use_ssl=gs.settings.smtp_use_ssl,
-                    fail_silently=False,
-                    timeout=timeout,
+            if not smtp_reachable(gs.settings.smtp_host, gs.settings.smtp_port, timeout=timeout):
+                logger.warning(
+                    'Global SMTP %s:%s is not reachable, falling back to system email backend',
+                    gs.settings.smtp_host,
+                    gs.settings.smtp_port,
                 )
-        else:
-            return get_connection(fail_silently=False)
+                return get_connection(fail_silently=False, timeout=timeout)
+            return CustomSMTPBackend(
+                host=gs.settings.smtp_host,
+                port=gs.settings.smtp_port,
+                username=gs.settings.smtp_username,
+                password=gs.settings.smtp_password,
+                use_tls=gs.settings.smtp_use_tls,
+                use_ssl=gs.settings.smtp_use_ssl,
+                fail_silently=False,
+                timeout=timeout,
+            )
+        return get_connection(fail_silently=False, timeout=timeout)
 
     @property
     def payment_term_last(self):
@@ -1094,7 +1119,7 @@ class Event(
             tz,
         )
 
-    def copy_data_from(self, other):
+    def copy_data_from(self, other, clone_options=None):
         from ..signals import event_copy_data
         from . import (
             Product,
@@ -1106,203 +1131,368 @@ class Event(
             Quota,
         )
 
-        self.plugins = other.plugins
-        self.is_public = other.is_public
+        clone_options = clone_options or {}
+        clone_common = clone_options.get('clone_common_data', True)
+        clone_settings = clone_options.get('clone_settings', True)
+        clone_design_texts = clone_options.get('clone_design_texts', True)
+        clone_email_settings = clone_options.get('clone_email_settings', True)
+        
+        clone_ticketing = clone_options.get('clone_ticketing_data', True)
+        clone_products = clone_options.get('clone_products', True)
+        clone_questions = clone_options.get('clone_questions', True)
+        clone_checkin_lists = clone_options.get('clone_checkin_lists', True)
+        clone_payment_settings = clone_options.get('clone_payment_settings', True)
+        
+        clone_talks = clone_options.get('clone_talk_data', True)
+        clone_cfp = clone_options.get('clone_cfp', True)
+        clone_session_types_tracks = clone_options.get('clone_session_types_tracks', True)
+        clone_review_settings = clone_options.get('clone_review_settings', True)
+
+        if clone_common and clone_settings:
+            self.plugins = other.plugins
+            self.is_public = other.is_public
+            self.location = other.location
+            self.geo_lat = other.geo_lat
+            self.geo_lon = other.geo_lon
+            self.currency = other.currency
+            
+            for extra_link in other.extra_links.all():
+                extra_link.pk = None
+                extra_link.event = self
+                extra_link.save()
+                extra_link.log_action('eventyay.object.cloned')
+
         if other.date_admission:
             self.date_admission = self.date_from + (other.date_admission - other.date_from)
         self.testmode = other.testmode
+        self.private_testmode = other.private_testmode
+        self.tickets_published = other.tickets_published
+        self.talks_published = other.talks_published
         self.save()
         self.log_action('eventyay.object.cloned', data={'source': other.slug, 'source_id': other.pk})
 
         tax_map = {}
-        for t in other.tax_rules.all():
-            tax_map[t.pk] = t
-            t.pk = None
-            t.event = self
-            t.save()
-            t.log_action('eventyay.object.cloned')
+        if clone_ticketing and clone_products:
+            for t in other.tax_rules.all():
+                tax_map[t.pk] = t
+                t.pk = None
+                t.event = self
+                t.save()
+                t.log_action('eventyay.object.cloned')
 
         category_map = {}
-        for c in ProductCategory.objects.filter(event=other):
-            category_map[c.pk] = c
-            c.pk = None
-            c.event = self
-            c.save()
-            c.log_action('eventyay.object.cloned')
-
         product_meta_properties_map = {}
-        for imp in other.product_meta_properties.all():
-            product_meta_properties_map[imp.pk] = imp
-            imp.pk = None
-            imp.event = self
-            imp.save()
-            imp.log_action('eventyay.object.cloned')
-
         product_map = {}
         variation_map = {}
-        for i in Product.objects.filter(event=other).prefetch_related('variations'):
-            vars = list(i.variations.all())
-            product_map[i.pk] = i
-            i.pk = None
-            i.event = self
-            if i.picture:
-                i.picture.save(i.picture.name, i.picture)
-            if i.category_id:
-                i.category = category_map[i.category_id]
-            if i.tax_rule_id:
-                i.tax_rule = tax_map[i.tax_rule_id]
-            i.save()
-            i.log_action('eventyay.object.cloned')
-            for v in vars:
-                variation_map[v.pk] = v
-                v.pk = None
-                v.product = i
-                v.save()
-
-        for imv in ProductMetaValue.objects.filter(product__event=other).prefetch_related('product', 'property'):
-            imv.pk = None
-            imv.property = product_meta_properties_map[imv.property.pk]
-            imv.product = product_map[imv.product.pk]
-            imv.save()
-
-        for ia in ProductAddOn.objects.filter(base_product__event=other).prefetch_related(
-            'base_product', 'addon_category'
-        ):
-            ia.pk = None
-            ia.base_product = product_map[ia.base_product.pk]
-            ia.addon_category = category_map[ia.addon_category.pk]
-            ia.save()
-
-        for ia in ProductBundle.objects.filter(base_product__event=other).prefetch_related(
-            'base_product', 'bundled_product', 'bundled_variation'
-        ):
-            ia.pk = None
-            ia.base_product = product_map[ia.base_product.pk]
-            ia.bundled_product = product_map[ia.bundled_product.pk]
-            if ia.bundled_variation:
-                ia.bundled_variation = variation_map[ia.bundled_variation.pk]
-            ia.save()
-
-        for q in Quota.objects.filter(event=other, subevent__isnull=True).prefetch_related('products', 'variations'):
-            products = list(q.products.all())
-            vars = list(q.variations.all())
-            oldid = q.pk
-            q.pk = None
-            q.event = self
-            q.closed = False
-            q.save()
-            q.log_action('eventyay.object.cloned')
-            for i in products:
-                if i.pk in product_map:
-                    q.products.add(product_map[i.pk])
-            for v in vars:
-                q.variations.add(variation_map[v.pk])
-            self.products.filter(hidden_if_available_id=oldid).update(hidden_if_available=q)
-
         question_map = {}
-        for q in Question.objects.filter(event=other).prefetch_related('products', 'options'):
-            products = list(q.products.all())
-            opts = list(q.options.all())
-            question_map[q.pk] = q
-            q.pk = None
-            q.event = self
-            q.save()
-            q.log_action('eventyay.object.cloned')
-
-            for i in products:
-                q.products.add(product_map[i.pk])
-            for o in opts:
-                o.pk = None
-                o.question = q
-                o.save()
-
-        for q in self.questions.filter(dependency_question__isnull=False):
-            q.dependency_question = question_map[q.dependency_question_id]
-            q.save(update_fields=['dependency_question'])
-
-        def _walk_rules(rules):
-            if isinstance(rules, dict):
-                for k, v in rules.items():
-                    if k == 'lookup':
-                        if v[0] == 'product':
-                            v[1] = str(product_map.get(int(v[1]), 0).pk) if int(v[1]) in product_map else '0'
-                        elif v[0] == 'variation':
-                            v[1] = str(variation_map.get(int(v[1]), 0).pk) if int(v[1]) in variation_map else '0'
-                    else:
-                        _walk_rules(v)
-            elif isinstance(rules, list):
-                for i in rules:
-                    _walk_rules(i)
-
         checkin_list_map = {}
-        for cl in other.checkin_lists.filter(subevent__isnull=True).prefetch_related('limit_products'):
-            products = list(cl.limit_products.all())
-            checkin_list_map[cl.pk] = cl
-            cl.pk = None
-            cl.event = self
-            rules = cl.rules
-            _walk_rules(rules)
-            cl.rules = rules
-            cl.save()
-            cl.log_action('eventyay.object.cloned')
-            for i in products:
-                cl.limit_products.add(product_map[i.pk])
+        
+        if clone_ticketing:
+            if clone_products:
+                for c in ProductCategory.objects.filter(event=other):
+                    category_map[c.pk] = c
+                    c.pk = None
+                    c.event = self
+                    c.save()
+                    c.log_action('eventyay.object.cloned')
+    
+                for imp in other.product_meta_properties.all():
+                    product_meta_properties_map[imp.pk] = imp
+                    imp.pk = None
+                    imp.event = self
+                    imp.save()
+                    imp.log_action('eventyay.object.cloned')
+    
+                for i in Product.objects.filter(event=other).prefetch_related('variations'):
+                    vars = list(i.variations.all())
+                    product_map[i.pk] = i
+                    i.pk = None
+                    i.event = self
+                    if i.picture:
+                        i.picture.save(i.picture.name, i.picture)
+                    if i.category_id:
+                        i.category = category_map.get(i.category_id)
+                    if i.tax_rule_id:
+                        i.tax_rule = tax_map.get(i.tax_rule_id)
+                    i.save()
+                    i.log_action('eventyay.object.cloned')
+                    for v in vars:
+                        variation_map[v.pk] = v
+                        v.pk = None
+                        v.product = i
+                        v.save()
+    
+                for imv in ProductMetaValue.objects.filter(product__event=other).prefetch_related('product', 'property'):
+                    imv.pk = None
+                    imv.property = product_meta_properties_map.get(imv.property.pk)
+                    imv.product = product_map.get(imv.product.pk)
+                    imv.save()
+    
+                for ia in ProductAddOn.objects.filter(base_product__event=other).prefetch_related(
+                    'base_product', 'addon_category'
+                ):
+                    ia.pk = None
+                    ia.base_product = product_map.get(ia.base_product.pk)
+                    ia.addon_category = category_map.get(ia.addon_category.pk)
+                    ia.save()
+    
+                for ia in ProductBundle.objects.filter(base_product__event=other).prefetch_related(
+                    'base_product', 'bundled_product', 'bundled_variation'
+                ):
+                    ia.pk = None
+                    ia.base_product = product_map.get(ia.base_product.pk)
+                    ia.bundled_product = product_map.get(ia.bundled_product.pk)
+                    if ia.bundled_variation:
+                        ia.bundled_variation = variation_map.get(ia.bundled_variation.pk)
+                    ia.save()
+    
+                for q in Quota.objects.filter(event=other, subevent__isnull=True).prefetch_related('products', 'variations'):
+                    products = list(q.products.all())
+                    vars = list(q.variations.all())
+                    oldid = q.pk
+                    q.pk = None
+                    q.event = self
+                    q.closed = False
+                    q.save()
+                    q.log_action('eventyay.object.cloned')
+                    for i in products:
+                        if i.pk in product_map:
+                            q.products.add(product_map[i.pk])
+                    for v in vars:
+                        if v.pk in variation_map:
+                            q.variations.add(variation_map[v.pk])
+                    self.products.filter(hidden_if_available_id=oldid).update(hidden_if_available=q)
 
-        if other.seating_plan:
-            if other.seating_plan.organizer_id == self.organizer_id:
-                self.seating_plan = other.seating_plan
-            else:
-                self.organizer.seating_plans.create(name=other.seating_plan.name, layout=other.seating_plan.layout)
-            self.save()
+            if clone_questions:
+                for q in Question.objects.filter(event=other).prefetch_related('products', 'options'):
+                    products = list(q.products.all())
+                    opts = list(q.options.all())
+                    question_map[q.pk] = q
+                    q.pk = None
+                    q.event = self
+                    q.save()
+                    q.log_action('eventyay.object.cloned')
+    
+                    for i in products:
+                        if i.pk in product_map:
+                            q.products.add(product_map[i.pk])
+                    for o in opts:
+                        o.pk = None
+                        o.question = q
+                        o.save()
+    
+                for q in self.questions.filter(dependency_question__isnull=False):
+                    q.dependency_question = question_map[q.dependency_question_id]
+                    q.save(update_fields=['dependency_question'])
 
-        for m in other.seat_category_mappings.filter(subevent__isnull=True):
-            m.pk = None
-            m.event = self
-            m.product = product_map[m.product_id]
-            m.save()
+            def _walk_rules(rules):
+                if isinstance(rules, dict):
+                    for k, v in rules.items():
+                        if k == 'lookup':
+                            if v[0] == 'product':
+                                v[1] = str(product_map.get(int(v[1]), 0).pk) if int(v[1]) in product_map else '0'
+                            elif v[0] == 'variation':
+                                v[1] = str(variation_map.get(int(v[1]), 0).pk) if int(v[1]) in variation_map else '0'
+                        else:
+                            _walk_rules(v)
+                elif isinstance(rules, list):
+                    for i in rules:
+                        _walk_rules(i)
 
-        for s in other.seats.filter(subevent__isnull=True):
-            s.pk = None
-            s.event = self
-            if s.product_id:
-                s.product = product_map[s.product_id]
-            s.save()
+            if clone_checkin_lists:
+                for cl in other.checkin_lists.filter(subevent__isnull=True).prefetch_related('limit_products'):
+                    products = list(cl.limit_products.all())
+                    checkin_list_map[cl.pk] = cl
+                    cl.pk = None
+                    cl.event = self
+                    rules = cl.rules
+                    _walk_rules(rules)
+                    cl.rules = rules
+                    cl.save()
+                    cl.log_action('eventyay.object.cloned')
+                    for i in products:
+                        if i.pk in product_map:
+                            cl.limit_products.add(product_map[i.pk])
+    
+                if other.seating_plan:
+                    if other.seating_plan.organizer_id == self.organizer_id:
+                        self.seating_plan = other.seating_plan
+                    else:
+                        self.organizer.seating_plans.create(name=other.seating_plan.name, layout=other.seating_plan.layout)
+                    self.save()
+
+            for m in other.seat_category_mappings.filter(subevent__isnull=True):
+                m.pk = None
+                m.event = self
+                if m.product_id in product_map:
+                    m.product = product_map[m.product_id]
+                    m.save()
+
+            for s in other.seats.filter(subevent__isnull=True):
+                s.pk = None
+                s.event = self
+                if s.product_id:
+                    s.product = product_map.get(s.product_id)
+                s.save()
 
         skip_settings = (
             'ticket_secrets_eventyay_sig1_pubkey',
             'ticket_secrets_eventyay_sig1_privkey',
+            'frontpage_text',
         )
-        for s in other.settings._objects.all():
-            if s.key in skip_settings:
-                continue
+        def is_email_key(k):
+            return k.startswith('mail_') or k.startswith('smtp_')
+            
+        def is_design_key(k):
+            return k in (
+                'primary_color', 'theme_color_success', 'theme_color_danger', 'theme_color_background', 'theme_round_borders',
+                'hover_button_color', 'video_navigation_background_color', 'video_sidebar_text_color', 'video_sidebar_hover_color',
+                'primary_font', 'header_background_color', 'header_text_color', 'navigation_text_color', 'menu_text_scroll_over_color',
+                'logo_image', 'logo_image_large', 'event_logo_image', 'event_preview_image', 'og_image',
+                'banner_text', 'banner_text_bottom', 'header_pattern', 'logo_show_title',
+                'menu_label_tickets', 'menu_label_join_video'
+            )
 
-            s.object = self
-            s.pk = None
-            if s.value.startswith('file://'):
-                fi = default_storage.open(s.value[7:], 'rb')
-                nonce = get_random_string(length=8)
-                # TODO: make sure pub is always correct
-                fname = 'pub/%s/%s/%s.%s.%s' % (
-                    self.organizer.slug,
-                    self.slug,
-                    s.key,
-                    nonce,
-                    s.value.split('.')[-1],
-                )
-                newname = default_storage.save(fname, fi)
-                s.value = 'file://' + newname
-                s.save()
-            elif s.key == 'tax_rate_default':
-                try:
-                    if int(s.value) in tax_map:
-                        s.value = tax_map.get(int(s.value)).pk
-                        s.save()
-                except ValueError:
-                    pass
-            else:
-                s.save()
+        def is_payment_key(k):
+            return k.startswith('payment_') or k.startswith('invoice_')
 
-        self.settings.flush()
+        if clone_common or clone_payment_settings:
+            for s in other.settings._objects.all():
+                if s.key in skip_settings:
+                    continue
+                if is_email_key(s.key) and not (clone_common and clone_email_settings):
+                    continue
+                if is_design_key(s.key) and not (clone_common and clone_design_texts):
+                    continue
+                if is_payment_key(s.key) and not clone_payment_settings:
+                    continue
+                if not is_email_key(s.key) and not is_design_key(s.key) and not is_payment_key(s.key) and not (clone_common and clone_settings):
+                    continue
+
+                s.object = self
+                s.pk = None
+                if s.value.startswith('file://'):
+                    fi = default_storage.open(s.value[7:], 'rb')
+                    nonce = get_random_string(length=8)
+                    # TODO: make sure pub is always correct
+                    fname = 'pub/%s/%s/%s.%s.%s' % (
+                        self.organizer.slug,
+                        self.slug,
+                        s.key,
+                        nonce,
+                        s.value.split('.')[-1],
+                    )
+                    newname = default_storage.save(fname, fi)
+                    s.value = 'file://' + newname
+                    s.save()
+                elif s.key == 'tax_rate_default':
+                    try:
+                        if int(s.value) in tax_map:
+                            s.value = tax_map.get(int(s.value)).pk
+                            s.save()
+                    except ValueError:
+                        pass
+                else:
+                    s.save()
+
+            self.settings.flush()
+            
+        if clone_talks:
+            from eventyay.base.models.type import SubmissionType
+            from eventyay.base.models.track import Track
+            from eventyay.base.models.question import TalkQuestion
+            from eventyay.base.models.access_code import SubmitterAccessCode
+            
+            if hasattr(self, 'cfp') and getattr(self.cfp, 'default_type_id', None):
+                self.cfp.default_type = None
+                self.cfp.save(update_fields=['default_type'])
+            
+            if clone_session_types_tracks:
+                SubmissionType.objects.filter(event=self).delete()
+                submission_type_map = {}
+                for st in other.submission_types.all():
+                    submission_type_map[st.pk] = st
+                    st.pk = None
+                    st.event = self
+                    st.save()
+                    st.log_action('eventyay.object.cloned')
+    
+                track_map = {}
+                for tr in other.tracks.all():
+                    track_map[tr.pk] = tr
+                    tr.pk = None
+                    tr.event = self
+                    tr.save()
+                    tr.log_action('eventyay.object.cloned')
+                
+                talk_question_map = {}
+                talk_question_deps = {}
+                for tq in other.talkquestions.prefetch_related('options', 'tracks', 'submission_types'):
+                    tq_tracks = list(tq.tracks.all())
+                    tq_submission_types = list(tq.submission_types.all())
+                    tq_options = list(tq.options.all())
+                    old_dep_id = tq.dependency_question_id
+                    
+                    talk_question_map[tq.pk] = tq
+                    tq.pk = None
+                    tq.event = self
+                    tq.dependency_question = None
+                    tq.save()
+                    tq.log_action('eventyay.object.cloned')
+                    
+                    if old_dep_id:
+                        talk_question_deps[tq] = old_dep_id
+                    
+                    for o in tq_options:
+                        o.pk = None
+                        o.question = tq
+                        o.save()
+                    for tr in tq_tracks:
+                        tq.tracks.add(track_map[tr.pk])
+                    for st in tq_submission_types:
+                        tq.submission_types.add(submission_type_map[st.pk])
+                        
+                for tq, old_dep_id in talk_question_deps.items():
+                    tq.dependency_question = talk_question_map.get(old_dep_id)
+                    if tq.dependency_question:
+                        tq.save(update_fields=['dependency_question'])
+                
+                if hasattr(self, 'cfp') and hasattr(other, 'cfp') and getattr(other.cfp, 'default_type_id', None):
+                    self.cfp.default_type = submission_type_map.get(other.cfp.default_type_id)
+                    self.cfp.save(update_fields=['default_type'])
+                    
+                for ac in other.submitter_access_codes.all():
+                    ac.pk = None
+                    ac.event = self
+                    if ac.track_id:
+                        ac.track = track_map.get(ac.track_id)
+                    if ac.submission_type_id:
+                        ac.submission_type = submission_type_map.get(ac.submission_type_id)
+                    ac.save()
+                    ac.log_action('eventyay.object.cloned')
+
+            if clone_review_settings:
+                from eventyay.base.models import ReviewPhase, ReviewScoreCategory, ReviewScore
+
+                self.review_phases.all().delete()
+                for rp in other.review_phases.all():
+                    rp.pk = None
+                    rp.event = self
+                    rp.save()
+                    rp.log_action('eventyay.object.cloned')
+
+                self.score_categories.all().delete()
+                for sc in other.score_categories.prefetch_related('scores'):
+                    scores = list(sc.scores.all())
+                    sc.pk = None
+                    sc.event = self
+                    sc.save()
+                    sc.log_action('eventyay.object.cloned')
+                    for score in scores:
+                        score.pk = None
+                        score.category = sc
+                        score.save()
+        
         event_copy_data.send(
             sender=self,
             other=other,
@@ -1312,12 +1502,13 @@ class Event(
             variation_map=variation_map,
             question_map=question_map,
             checkin_list_map=checkin_list_map,
+            clone_options=clone_options,
         )
 
     def decode_token(self, token, allow_raise=False):
         exc = None
         tried_any = False
-        for jwt_config in self.config.get('JWT_secrets', []):
+        for jwt_config in (self.config or {}).get('JWT_secrets', []):
             tried_any = True
             secret = jwt_config['secret']
             audience = jwt_config['audience']
@@ -1354,45 +1545,164 @@ class Event(
                         raise
                 except jwt.exceptions.InvalidTokenError as e:
                     exc = e
-        if exc and allow_raise:
-            raise exc
+        if allow_raise:
+            if exc:
+                raise exc
+            raise jwt.exceptions.InvalidTokenError('No JWT secrets configured')
+
+    def _get_trait_grants_with_defaults(self):
+        base_trait_grants = self.trait_grants if self.trait_grants is not None else default_grants()
+        slug = getattr(self, 'slug', None) or getattr(self, 'id', None)
+        if not slug:
+            return base_trait_grants
+        augmented = dict(base_trait_grants)
+        augmented['attendee'] = resolve_attendee_trait_grant(
+            self, augmented.get('attendee', ['attendee'])
+        )
+        for role, trait_name in VIDEO_TRAIT_ROLE_MAP.items():
+            augmented.setdefault(role, [f'eventyay-video-event-{slug}-{trait_name.replace("_", "-")}'])
+        return augmented
+
+    def _get_default_roles(self):
+        """Return ``default_roles()``, cached on this Event for its instance lifetime."""
+        cached = getattr(self, '_cached_default_roles', None)
+        if cached is None:
+            cached = default_roles()
+            self._cached_default_roles = cached
+        return cached
+
+    def _permissions_for_role(self, role_name, event_roles=None):
+        """
+        Resolve a role's permission list.
+
+        Prefer the event's stored ``roles`` JSON, then ``default_roles()`` (includes
+        ``admin`` / attendee stacks), then ``SYSTEM_ROLES`` for built-in video roles.
+        Using only ``SYSTEM_ROLES`` as fallback wrongly drops ``admin`` because that
+        role is not defined there.
+        """
+        if event_roles is None:
+            event_roles = self.roles if self.roles is not None else {}
+        if role_name in event_roles and event_roles[role_name] is not None:
+            return event_roles[role_name]
+        defaults = self._get_default_roles()
+        if role_name in defaults:
+            return defaults[role_name]
+        return SYSTEM_ROLES.get(role_name, [])
 
     def has_permission_implicit(
         self,
         *,
         traits,
-        permissions: List[Permission],
+        permissions: list[Permission],
         room=None,
         allow_empty_traits=True,
     ):
-        # Ensure trait_grants and roles are not None - use defaults if missing
-        event_trait_grants = self.trait_grants if self.trait_grants is not None else default_grants()
-        event_roles = self.roles if self.roles is not None else default_roles()
+        event_trait_grants = self._get_trait_grants_with_defaults()
+        event_roles = self.roles if self.roles is not None else self._get_default_roles()
+
+        if traits is None:
+            traits = []
+
+        admin_mode_active = 'admin' in traits
+        if admin_mode_active:
+            for role_name in ORGANIZER_ROLES:
+                role_permissions = self._permissions_for_role(role_name, event_roles)
+                role_permissions_str = [normalize_permission_value(rp) for rp in role_permissions]
+                if any(normalize_permission_value(p) in role_permissions_str for p in permissions):
+                    return True
+
+        attendee_traits = event_trait_grants.get('attendee', ['attendee'])
+        if traits_match_required(traits, attendee_traits) and (attendee_traits or allow_empty_traits):
+            role_permissions = self._permissions_for_role('attendee', event_roles)
+            role_permissions_str = [normalize_permission_value(rp) for rp in role_permissions]
+            role_permissions_str.append(normalize_permission_value(Permission.EVENT_CHAT_DIRECT))
+            if any(normalize_permission_value(p) in role_permissions_str for p in permissions):
+                return True
+
+        for role, required_traits in event_trait_grants.items():
+            if role == 'attendee':
+                continue
+            if role in ORGANIZER_ROLES:
+                if not required_traits or not traits_match_required(traits, required_traits):
+                    continue
+            else:
+                if not (traits_match_required(traits, required_traits) and (required_traits or allow_empty_traits)):
+                    continue
+            role_permissions = self._permissions_for_role(role, event_roles)
+            role_permissions_str = [normalize_permission_value(rp) for rp in role_permissions]
+            if any(normalize_permission_value(p) in role_permissions_str for p in permissions):
+                return True
+
+        if room:
+            room_trait_grants = room.trait_grants if room.trait_grants is not None else {}
+            for role, required_traits in room_trait_grants.items():
+                if role in ORGANIZER_ROLES:
+                    if not required_traits or not traits_match_required(traits, required_traits):
+                        continue
+                else:
+                    if not (traits_match_required(traits, required_traits) and (required_traits or allow_empty_traits)):
+                        continue
+                role_permissions = self._permissions_for_role(role, event_roles)
+                role_permissions_str = [normalize_permission_value(rp) for rp in role_permissions]
+                if any(normalize_permission_value(p) in role_permissions_str for p in permissions):
+                    return True
+
+        # Return False if no permission was granted
+        return False
+
+    def has_organizer_role_implicit(self, *, traits, room=None):
+        event_trait_grants = self._get_trait_grants_with_defaults()
+
+        if traits is None:
+            traits = []
+
+        if 'admin' in traits:
+            return True
 
         for role, required_traits in event_trait_grants.items():
             if (
-                isinstance(required_traits, list)
-                and all(any(x in traits for x in (r if isinstance(r, list) else [r])) for r in required_traits)
-                and (required_traits or allow_empty_traits)
+                role in ORGANIZER_ROLES
+                and traits_match_required(traits, required_traits)
+                and required_traits
             ):
-                role_permissions = event_roles.get(role, SYSTEM_ROLES.get(role, []))
-                if any(p in role_permissions or p.value in role_permissions for p in permissions):
-                    return True
+                return True
 
         if room:
             room_trait_grants = room.trait_grants if room.trait_grants is not None else {}
             for role, required_traits in room_trait_grants.items():
                 if (
-                    isinstance(required_traits, list)
-                    and all(any(x in traits for x in (r if isinstance(r, list) else [r])) for r in required_traits)
-                    and (required_traits or allow_empty_traits)
+                    role in ORGANIZER_ROLES
+                    and traits_match_required(traits, required_traits)
+                    and required_traits
                 ):
-                    role_permissions = event_roles.get(role, SYSTEM_ROLES.get(role, []))
-                    if any(p in role_permissions or p.value in role_permissions for p in permissions):
-                        return True
+                    return True
 
-        # Return False if no permission was granted
         return False
+
+    def has_organizer_role(self, *, user, room=None):
+        if user.is_banned:  # pragma: no cover
+            return False
+
+        if self.has_organizer_role_implicit(
+            traits=user.traits or [],
+            room=room,
+        ):
+            return True
+
+        return bool(ORGANIZER_ROLES.intersection(user.get_role_grants(room)))
+
+    async def has_organizer_role_async(self, *, user, room=None):
+        if user.is_banned:  # pragma: no cover
+            return False
+
+        if self.has_organizer_role_implicit(
+            traits=user.traits or [],
+            room=room,
+        ):
+            return True
+
+        roles = await user.get_role_grants_async(room)
+        return bool(ORGANIZER_ROLES.intersection(roles))
 
     def has_permission(self, *, user, permission: Permission, room=None):
         """
@@ -1410,7 +1720,7 @@ class Event(
             return False
 
         if self.has_permission_implicit(
-            traits=user.traits,
+            traits=user.traits or [],
             permissions=permission,
             room=room,
             allow_empty_traits=user.type == User.UserType.PERSON,
@@ -1418,10 +1728,13 @@ class Event(
             return True
 
         roles = user.get_role_grants(room)
-        event_roles = self.roles if self.roles is not None else default_roles()
+        event_roles = self.roles if self.roles is not None else self._get_default_roles()
         for r in roles:
-            if any(p.value in event_roles.get(r, SYSTEM_ROLES.get(r, [])) for p in permission):
+            role_perms = self._permissions_for_role(r, event_roles)
+            role_perms_str = [normalize_permission_value(rp) for rp in role_perms]
+            if any(normalize_permission_value(p) in role_perms_str for p in permission):
                 return True
+        return False
 
     async def has_permission_async(self, *, user, permission: Permission, room=None):
         """
@@ -1439,7 +1752,7 @@ class Event(
             return False
 
         if self.has_permission_implicit(
-            traits=user.traits,
+            traits=user.traits or [],
             permissions=permission,
             room=room,
             allow_empty_traits=user.type == User.UserType.PERSON,
@@ -1447,10 +1760,13 @@ class Event(
             return True
 
         roles = await user.get_role_grants_async(room)
-        event_roles = self.roles if self.roles is not None else default_roles()
+        event_roles = self.roles if self.roles is not None else self._get_default_roles()
         for r in roles:
-            if any(p.value in event_roles.get(r, SYSTEM_ROLES.get(r, [])) for p in permission):
+            role_perms = self._permissions_for_role(r, event_roles)
+            role_perms_str = [normalize_permission_value(rp) for rp in role_perms]
+            if any(normalize_permission_value(p) in role_perms_str for p in permission):
                 return True
+        return False
 
     def get_all_permissions(self, user):
         result = defaultdict(set)
@@ -1460,31 +1776,46 @@ class Event(
         allow_empty_traits = user.type == User.UserType.PERSON
 
         # Ensure trait_grants and roles are not None
-        event_trait_grants = self.trait_grants if self.trait_grants is not None else default_grants()
-        event_roles = self.roles if self.roles is not None else default_roles()
+        event_trait_grants = self._get_trait_grants_with_defaults()
+        event_roles = self.roles if self.roles is not None else self._get_default_roles()
+
+        user_traits = user.traits or []
 
         for role, required_traits in event_trait_grants.items():
-            if (
-                isinstance(required_traits, list)
-                and all(any(x in user.traits for x in (r if isinstance(r, list) else [r])) for r in required_traits)
-                and (required_traits or allow_empty_traits)
-            ):
-                result[self].update(event_roles.get(role, SYSTEM_ROLES.get(role, [])))
+            if role in ORGANIZER_ROLES:
+                if not required_traits or not traits_match_required(user_traits, required_traits):
+                    continue
+            else:
+                if not (traits_match_required(user_traits, required_traits) and (required_traits or allow_empty_traits)):
+                    continue
+            result[self].update(self._permissions_for_role(role, event_roles))
 
-        # Removed user.world_grants loop (attribute not present on unified User model)
+        # Admin mode in the ticket/talk system is represented by the ``admin`` trait on the video side.
+        # When admin mode is ON, the user has the ``admin`` trait and should retain full access.
+        admin_mode_active = 'admin' in user_traits
+
+        if admin_mode_active:
+            # Grant all video manager permissions when admin mode is active
+            for role_name in ORGANIZER_ROLES:
+                result[self].update(self._permissions_for_role(role_name, event_roles))
+
+        attendee_traits = event_trait_grants.get('attendee', ['attendee'])
+        if traits_match_required(user_traits, attendee_traits) and (attendee_traits or allow_empty_traits):
+            result[self].add(Permission.EVENT_CHAT_DIRECT)
 
         for room in self.rooms.all():
             room_trait_grants = room.trait_grants if room.trait_grants is not None else {}
             for role, required_traits in room_trait_grants.items():
-                if (
-                    isinstance(required_traits, list)
-                    and all(any(x in user.traits for x in (r if isinstance(r, list) else [r])) for r in required_traits)
-                    and (required_traits or allow_empty_traits)
-                ):
-                    result[room].update(event_roles.get(role, SYSTEM_ROLES.get(role, [])))
+                if role in ORGANIZER_ROLES:
+                    if not required_traits or not traits_match_required(user_traits, required_traits):
+                        continue
+                else:
+                    if not (traits_match_required(user_traits, required_traits) and (required_traits or allow_empty_traits)):
+                        continue
+                result[room].update(self._permissions_for_role(role, event_roles))
 
         for grant in user.room_grants.select_related('room'):
-            result[grant.room].update(event_roles.get(grant.role, SYSTEM_ROLES.get(grant.role, [])))
+            result[grant.room].update(self._permissions_for_role(grant.role, event_roles))
         if user.is_silenced:
             for key in result.keys():
                 result[key] &= MAX_PERMISSIONS_IF_SILENCED
@@ -1493,18 +1824,13 @@ class Event(
 
     def clear_data(self):
         """
-        Clears all personal information. It generally leaves structure such as rooms and exhibitors intact, but to make
-        sure all personal data is scrubbed, it also clears all uploaded files, which includes things like exhibitor
-        logos.
+        Clears all personal information. It generally leaves structure such as rooms intact, but to make
+        sure all personal data is scrubbed, it also clears all uploaded files.
         """
         from eventyay.base.models import (
             ChatEvent,
-            ContactRequest,
-            ExhibitorStaff,
-            ExhibitorView,
             Membership,
             Poll,
-            PosterPresenter,
             Reaction,
             RoomView,
         )
@@ -1516,10 +1842,6 @@ class Event(
         self.bbb_calls.all().delete()
         ChatEvent.objects.filter(channel__event=self).delete()
         Membership.objects.filter(channel__event=self).delete()
-        ExhibitorStaff.objects.filter(exhibitor__event=self).delete()
-        PosterPresenter.objects.filter(poster__event=self).delete()
-        ContactRequest.objects.filter(exhibitor__event=self).delete()
-        ExhibitorView.objects.filter(exhibitor__event=self).delete()
         Reaction.objects.filter(room__event=self).delete()
         RoomView.objects.filter(room__event=self).delete()
         EventView.objects.filter(event=self).delete()
@@ -1539,7 +1861,6 @@ class Event(
 
         if self.pk == old.pk:
             raise ValueError('Illegal attempt to clone into same event')
-
         def clone_stored_files(*, inst=None, attrs=None, struct=None, url=None):
             if inst and attrs:
                 for a in attrs:
@@ -1597,60 +1918,39 @@ class Event(
         self.external_auth_url = old.external_auth_url
         self.save()
 
-        room_map = {}
         for r in old.rooms.all():
             try:
                 has_channel = r.channel
             except Exception:
                 has_channel = False
 
-            old_id = r.pk
             r.pk = None
             r.event = self
             r.module_config = clone_stored_files(struct=r.module_config)
             r.save()
-            room_map[old_id] = r
             if has_channel:
                 Channel.objects.create(room=r, event=self)
-        for r in old.rooms.prefetch_related('exhibitors', 'exhibitors__links', 'exhibitors__social_media_links'):
-            for ex in r.exhibitors.all():
-                old_links = list(ex.links.all())
-                old_smlinks = list(ex.social_media_links.all())
-
-                ex.pk = None
-                ex.event = self
-                ex.room = room_map[ex.room_id]
-                if ex.highlighted_room_id:
-                    ex.highlighted_room = room_map[ex.highlighted_room_id]
-                clone_stored_files(inst=ex, attrs=['logo', 'banner_list', 'banner_detail'])
-                ex.text_content = clone_stored_files(struct=ex.text_content)
-                ex.save()
-
-                for link in old_smlinks:
-                    link.pk = None
-                    link.exhibitor = ex
-                    link.save()
-
-                for link in old_links:
-                    link.pk = None
-                    clone_stored_files(inst=link, attrs=['url'])
-                    link.exhibitor = ex
-                    link.save()
 
     def get_payment_providers(self, cached=False) -> dict:
         """
         Returns a dictionary of initialized payment providers mapped by their identifiers.
         """
         from ..signals import register_payment_providers
+        from ..meetup import is_meetup_event
 
         if not cached or not hasattr(self, '_cached_payment_providers'):
             responses = register_payment_providers.send(self)
             providers = {}
+            is_meetup = is_meetup_event(self)
             for receiver, response in responses:
                 if not isinstance(response, list):
                     response = [response]
                 for p in response:
                     pp = p(self)
+                    if is_meetup and pp.identifier == 'stripe_settings':
+                        continue
+                    if not is_meetup and pp.identifier == 'stripe' and p.__module__ == 'eventyay.base.payment':
+                        continue
                     providers[pp.identifier] = pp
 
             self._cached_payment_providers = OrderedDict(
@@ -1809,6 +2109,127 @@ class Event(
         return result
 
     @property
+    def talks_testmode(self):
+        return self.settings.get('talks_testmode', False, as_type=bool)
+
+    @property
+    def private_testmode_tickets_enabled(self):
+        return self.private_testmode and self.settings.get('private_testmode_tickets', True, as_type=bool)
+
+    @property
+    def private_testmode_talks_enabled(self):
+        return self.private_testmode and self.settings.get('private_testmode_talks', False, as_type=bool)
+
+    def _component_presale_status(self, *, published: bool, private_testmode_enabled: bool, testmode: bool):
+        if private_testmode_enabled:
+            text = _('live (private test mode)') if self.live else _('in private test mode')
+        elif self.live and testmode:
+            text = _('live and in test mode')
+        elif self.live and published:
+            text = _('live')
+        elif testmode:
+            text = _('in test mode')
+        else:
+            text = _('not yet public')
+
+        is_live = bool(self.live and (published or private_testmode_enabled or testmode))
+        is_plain_live = bool(self.live and published and not private_testmode_enabled and not testmode)
+        return {
+            'class': 'live' if is_live else 'off',
+            'icon': 'fa-check-circle' if is_plain_live else ('fa-warning' if is_live else 'fa-times-circle'),
+            'is_live': is_live,
+            'text': text,
+            'text_class': 'text-success' if is_live else 'text-danger',
+        }
+
+    @property
+    def ticket_component_presale_status(self):
+        return self._component_presale_status(
+            published=self.tickets_published,
+            private_testmode_enabled=self.private_testmode_tickets_enabled,
+            testmode=self.testmode,
+        )
+
+    @property
+    def talk_component_presale_status(self):
+        return self._component_presale_status(
+            published=self.talks_published,
+            private_testmode_enabled=self.private_testmode_talks_enabled,
+            testmode=self.talks_testmode,
+        )
+
+    @property
+    def organiser(self):
+        """British spelling alias used throughout Talk code and tests."""
+        return self.organizer
+
+    @organiser.setter
+    def organiser(self, value):
+        self.organizer = value
+
+    @property
+    def has_component_testmode(self):
+        return bool(self.testmode or self.talks_testmode)
+
+    @staticmethod
+    def exclude_talks_testmode(qs):
+        """Exclude events whose talks component is in test mode.
+
+        Django's ``.exclude(related__a=x, related__b=y)`` splits into two
+        independent EXISTS checks, so events with a ``talks_testmode`` row
+        (even False) plus any other setting value ``True`` are wrongly dropped.
+        Use a same-row NOT EXISTS instead.
+        """
+        return qs.exclude(
+            Exists(
+                Event_SettingsStore.objects.filter(
+                    object_id=OuterRef('pk'),
+                    key='talks_testmode',
+                    value='True',
+                )
+            )
+        )
+
+    def user_can_view_tickets(self, user=None, request=None):
+        private_tickets = self.private_testmode_tickets_enabled
+        if not self.tickets_published and not private_tickets:
+            return False
+        if not private_tickets:
+            return True
+        if not user or not getattr(user, 'is_authenticated', False):
+            return False
+        if getattr(user, 'is_administrator', False):
+            return True
+        return user.has_event_permission(self.organizer, self, request=request)
+
+    def contact_form_recipient_email(self):
+        return self.settings.contact_mail or self.email or ''
+
+    def show_contact_form(self):
+        if not self.contact_form_recipient_email():
+            return False
+        if not self.settings._objects.filter(key='contact_form_enabled').exists():
+            return True
+        raw = self.settings.get('contact_form_enabled', as_type=str)
+        if raw in ('False', 'false', '0'):
+            return False
+        if raw in ('True', 'true', '1'):
+            return True
+        return True
+
+    def user_can_view_talks(self, user=None, request=None):
+        private_talks = self.private_testmode_talks_enabled
+        if not self.talks_published and not private_talks:
+            return False
+        if not private_talks:
+            return True
+        if not user or not getattr(user, 'is_authenticated', False):
+            return False
+        if getattr(user, 'is_administrator', False):
+            return True
+        return user.has_event_permission(self.organizer, self, request=request)
+
+    @property
     def has_paid_things(self):
         from .product import Product, ProductVariation
 
@@ -1819,25 +2240,23 @@ class Event(
 
     @property
     def talk_schedule_url(self):
-        return self.urls.schedule.full
+        return self.urls.schedule
 
     @property
     def talk_session_url(self):
-        return self.urls.talks.full
+        return self.urls.talks
 
     @property
     def talk_speaker_url(self):
-        return self.urls.speakers.full
+        return self.urls.speakers
 
     @property
     def talk_dashboard_url(self):
-        url = urljoin(TALK_HOSTNAME, f'orga/event/{self.slug}')
-        return url
+        return reverse('orga:event.dashboard', kwargs={'organizer': self.organizer.slug, 'event': self.slug})
 
     @property
     def talk_settings_url(self):
-        url = urljoin(TALK_HOSTNAME, f'orga/event/{self.slug}/settings')
-        return url
+        return reverse('orga:settings.event.view', kwargs={'organizer': self.organizer.slug, 'event': self.slug})
 
     @cached_property
     def live_issues(self):
@@ -1848,7 +2267,7 @@ class Event(
         if self.has_paid_things and not self.has_payment_provider:
             issues.append(_('You have configured at least one paid product but have not enabled any payment methods.'))
 
-        if not self.quotas.exists():
+        if self.products.exists() and not self.quotas.exists():
             issues.append(_('You need to configure at least one quota to sell anything.'))
 
         if self.organizer.has_unpaid_invoice():
@@ -1873,26 +2292,39 @@ class Event(
                     )
                 )
 
-        gs = GlobalSettingsObject()
-        if gs.settings.get('billing_validation', 'True') == 'True':
-            billing_obj = OrganizerBillingModel.objects.filter(organizer=self.organizer).first()
-            if not billing_obj or not billing_obj.stripe_payment_method_id:
-                url = reverse(
-                    'control:organizer.settings.billing',
-                    kwargs={'organizer': self.organizer.slug},
-                )
-                issue = format_html(
-                    '<a href="{}#tab-0-1-open">{}</a>',
-                    url,
-                    gettext('You need to fill the billing information.'),
-                )
-                issues.append(issue)
+        issues.extend(self.billing_issues())
 
         responses = event_live_issues.send(self)
         for receiver, response in sorted(responses, key=lambda r: str(r[0])):
             if response:
                 issues.append(response)
 
+        return issues
+
+    def billing_issues(self):
+        from django.utils.translation import gettext
+
+        from eventyay.base.models.organizer import OrganizerBillingModel
+        from eventyay.base.settings import GlobalSettingsObject
+
+        issues = []
+        gs = GlobalSettingsObject()
+        billing_validation_enabled = gs.settings.get('billing_validation', as_type=bool, default=True)
+        if not billing_validation_enabled:
+            return issues
+
+        billing_obj = OrganizerBillingModel.objects.filter(organizer=self.organizer).first()
+        if not billing_obj or not billing_obj.stripe_payment_method_id:
+            url = reverse(
+                'eventyay_common:organizer.billing',
+                kwargs={'organizer': self.organizer.slug},
+            )
+            issue = format_html(
+                '<a href="{}#tab-0-1-open">{}</a>',
+                url,
+                gettext('You need to fill the billing information.'),
+            )
+            issues.append(issue)
         return issues
 
     def get_users_with_any_permission(self):
@@ -1930,12 +2362,142 @@ class Event(
     def allow_delete(self):
         return not self.orders.exists() and not self.invoices.exists()
 
+    @scopes_disabled()
     def delete_sub_objects(self):
+        from django.core.exceptions import ObjectDoesNotExist
+
+        from eventyay.base.models.auth import EventGrant, RoomGrant, ShortToken, User
+        from eventyay.base.models.feedback import Feedback
+        from eventyay.base.models.log import ActivityLog, LogEntry
+        from eventyay.base.models.mail import QueuedMail
+        from eventyay.base.models.question import Answer, AnswerOption
+        from eventyay.base.models.resource import Resource
+        from eventyay.base.models.slot import TalkSlot
+        from eventyay.base.models.storage_model import StoredFile
+        from eventyay.base.models.systemlog import SystemLog
+
         self.cartposition_set.filter(addon_to__isnull=False).delete()
         self.cartposition_set.all().delete()
+        self.queued_mails.all().delete()
+
+        answers = Answer.objects.filter(question__event=self)
+        for answer in answers.only('pk', 'answer_file').iterator():
+            answer._delete_files()
+        answers.delete()
+        AnswerOption.objects.filter(question__event=self).delete()
+
+        TalkSlot.objects.filter(schedule__event=self).delete()
+        Feedback.objects.filter(talk__event=self).delete()
+
+        resources = Resource.objects.filter(submission__event=self)
+        for resource in resources.only('pk', 'resource').iterator():
+            resource._delete_files()
+        resources.delete()
+
+        for domain in self.domains.all().iterator():
+            domain.delete()
+
+        for stored_file in StoredFile.objects.filter(event=self).iterator():
+            stored_file.full_delete()
+
+        self.bbbserver_set.update(event_exclusive=None)
+        self.janusserver_set.update(event_exclusive=None)
+        self.jitsiserver_set.update(event_exclusive=None)
+        self.turnserver_set.update(event_exclusive=None)
+
         self.vouchers.all().delete()
         self.products.all().delete()
         self.subevents.all().delete()
+        self.talkquestions.all().delete()
+        self.submissions.all().delete()
+        self.rooms.all().delete()
+        self.tracks.all().delete()
+        self.tags.all().delete()
+        self.schedules.all().delete()
+        mail_templates = self.mail_templates.all()
+        QueuedMail.objects.filter(template__in=mail_templates).update(template=None)
+        mail_templates.delete()
+        ActivityLog.objects.filter(event=self).delete()
+        LogEntry.all.filter(event=self).update(event=None)
+        SystemLog.objects.filter(event=self).update(event=None)
+        EventGrant.objects.filter(event=self).delete()
+        RoomGrant.objects.filter(event=self).delete()
+        ShortToken.objects.filter(event=self).delete()
+        User.objects.filter(event=self).delete()
+        EventView.objects.filter(event=self).delete()
+        self.audits.all().delete()
+        self.meta_values.all().delete()
+        self.extra_links.all().delete()
+        self.planned_usages.all().delete()
+        self.requiredaction_set.all().delete()
+        self.settings.flush()
+        try:
+            cfp = self.cfp
+        except ObjectDoesNotExist:
+            cfp = None
+        if cfp is not None and cfp.pk is not None:
+            cfp.delete()
+        self.submitter_access_codes.all().delete()
+        self.submission_types.all().delete()
+
+    @scopes_disabled()
+    @transaction.atomic
+    def delete_talk_data(self):
+        from django.core.exceptions import ObjectDoesNotExist
+
+        from eventyay.base.models.mail import QueuedMail
+        from eventyay.base.models.profile import SpeakerProfile
+        from eventyay.base.models.feedback import Feedback
+        from eventyay.base.models.question import Answer, AnswerOption
+        from eventyay.base.models.resource import Resource
+        from eventyay.base.models.slot import TalkSlot
+
+        answers = Answer.objects.filter(question__event=self)
+        for answer in answers.only('pk', 'answer_file').iterator():
+            try:
+                answer._delete_files()
+            except Exception:
+                logger.error("Failed to delete files for Answer %s", answer.pk, exc_info=True)
+        answers.delete()
+        AnswerOption.objects.filter(question__event=self).delete()
+
+        TalkSlot.objects.filter(schedule__event=self).delete()
+        Feedback.objects.filter(talk__event=self).delete()
+
+        resources = Resource.objects.filter(submission__event=self)
+        for resource in resources.only('pk', 'resource').iterator():
+            try:
+                resource._delete_files()
+            except Exception:
+                logger.error("Failed to delete files for Resource %s", resource.pk, exc_info=True)
+        resources.delete()
+
+        SpeakerProfile.objects.filter(event=self).delete()
+
+        # Clear unsent (outbox) emails linked to this event
+        QueuedMail.objects.filter(event=self, sent__isnull=True).delete()
+
+        self.talkquestions.all().delete()
+        self.submissions.all().delete()
+        self.rooms.all().delete()
+        self.tracks.all().delete()
+        self.tags.all().delete()
+        self.schedules.all().delete()
+        try:
+            cfp = self.cfp
+        except ObjectDoesNotExist:
+            cfp = None
+        if cfp is not None and cfp.pk is not None:
+            cfp.delete()
+            try:
+                del self.__dict__['cfp']
+            except KeyError:
+                pass
+        self.submitter_access_codes.all().delete()
+        self.submission_types.all().delete()
+        self.score_categories.all().delete()
+        self.review_phases.all().delete()
+        self.build_initial_data()
 
     def set_active_plugins(self, modules, allow_restricted=False):
         from eventyay.base.plugins import get_all_plugins
@@ -2007,17 +2569,23 @@ class Event(
     @cached_property
     def locales(self) -> list[str]:
         """Is a list of active event locales."""
-        if hasattr(self, 'settings') and 'locales' in self.settings._cache():
-            if locales := self.settings.get('locales', as_type=list):
-                return locales
+        try:
+            if hasattr(self, 'settings') and 'locales' in self.settings._cache():
+                if locales := self.settings.get('locales', as_type=list):
+                    return locales
+        except RedisError:
+            logger.warning('Event settings cache unavailable while reading locales for %s', self.slug)
         return [code for code in self.locale_array.split(',') if code]
 
     @cached_property
     def content_locales(self) -> list[str]:
         """Is a list of active content locales."""
-        if hasattr(self, 'settings') and 'content_locales' in self.settings._cache():
-            if locales := self.settings.get('content_locales', as_type=list):
-                return locales
+        try:
+            if hasattr(self, 'settings') and 'content_locales' in self.settings._cache():
+                if locales := self.settings.get('content_locales', as_type=list):
+                    return locales
+        except RedisError:
+            logger.warning('Event settings cache unavailable while reading content locales for %s', self.slug)
         fallback = [code for code in self.content_locale_array.split(',') if code]
         return fallback or self.locales
 
@@ -2041,24 +2609,28 @@ class Event(
         content_locales: list[str] | None = None,
         default_locale: str | None = None,
     ) -> None:
+
         locales_list = list(locales or [])
-        if content_locales is None:
-            content_locales_list = locales_list
-        else:
-            content_locales_list = list(content_locales)
+
         if locales_list:
             self.locale_array = ','.join(locales_list)
-        if content_locales_list:
-            self.content_locale_array = ','.join(content_locales_list)
+            self.settings.set('locales', locales_list)
         if default_locale:
             self.locale = default_locale
-        if locales_list or content_locales_list or default_locale:
+            self.settings.set('locale', default_locale)
+
+        if content_locales is not None:
+            content_locales_list = list(content_locales)
+            self.content_locale_array = ','.join(content_locales_list)
+            self.settings.set('content_locales', content_locales_list)
+        if locales_list or content_locales is not None or default_locale:
+            self.save()
             self._clear_language_caches()
 
     @cached_property
     def is_multilingual(self) -> bool:
         """Is ``True`` if the event supports more than one locale."""
-        return len(self.content_locales) > 1
+        return len(self.locales) > 1
 
     @cached_property
     def named_locales(self) -> list:
@@ -2145,116 +2717,34 @@ class Event(
         Prefer the common (event settings) primary color, then fall back to the legacy
         event field, finally defaulting to the installation default.
         """
-        return (
-            self.settings.get('primary_color')
-            or self.primary_color
-            or settings.DEFAULT_EVENT_PRIMARY_COLOR
-        )
+        return self.settings.get('primary_color') or self.primary_color or settings.DEFAULT_EVENT_PRIMARY_COLOR
 
     @cached_property
     def _visible_logo_path(self):
         """
-        Resolve a usable logo path/URL from common settings (event_logo_image/logo_image).
+        Resolve a usable logo path/URL from event_logo_image setting.
         Returns a storage-relative path (e.g. ``pub/...``) or an absolute URL.
+
+        NOTE: This method ONLY checks for event_logo_image, NOT logo_image.
+        The logo_image setting is actually used for HEADER images (see default_setting.py),
+        so we must NOT use it here to prevent header images from appearing as logos.
         """
-        def _extract_path(obj):
-            if not obj:
-                return None
-            if isinstance(obj, dict):
-                return obj.get('name') or obj.get('path') or obj.get('url')
-            if hasattr(obj, 'name') and obj.name:
-                return obj.name
-            if hasattr(obj, 'url'):
-                return obj.url
-            return str(obj)
-
-        for key in ('event_logo_image', 'logo_image'):
-            settings_logo = self.settings.get(key, default=None) or getattr(self.settings, key, None)
-            path = _extract_path(settings_logo)
-            if not path:
-                continue
-
-            # Keep full URLs
-            if path.startswith(('http://', 'https://')):
-                return path
-
-            # Strip file:// scheme if present
-            parsed = urlparse(path)
-            if parsed.scheme == 'file':
-                path = parsed.path
-
-            # Normalize absolute filesystem paths to be relative to MEDIA_ROOT
-            abs_path = os.path.abspath(path)
-            media_root = os.path.abspath(settings.MEDIA_ROOT)
-            try:
-                rel_to_media = os.path.relpath(abs_path, media_root)
-                if not rel_to_media.startswith('..'):
-                    path = rel_to_media
-            except OSError:
-                logger.exception("Failed to relativize path %s against MEDIA_ROOT %s", abs_path, media_root)
-
-            # Drop leading media prefixes
-            for prefix in ('/media/', 'media/'):
-                if path.startswith(prefix):
-                    path = path[len(prefix):]
-
-            # Collapse to pub/… if present
-            if '/pub/' in path and not path.startswith('pub/'):
-                path = path[path.index('pub/'):]
-
-            path = path.lstrip('/')
-            if path:
-                return path
-
-        return None
+        # Only check event_logo_image - NOT logo_image (which is for header images)
+        raw = self.settings.get('event_logo_image', as_type=str, default=None)
+        return _resolve_media_path(raw)
 
     @cached_property
     def _visible_header_image_path(self):
         """
         Resolve a usable header image path/URL from common settings, falling back to the legacy field.
+
+        The header image is stored under ``logo_image`` for historical reasons; ``header_image`` is
+        the legacy model field.
         """
-        def _extract_path(obj):
-            if not obj:
-                return None
-            if isinstance(obj, dict):
-                return obj.get('name') or obj.get('path') or obj.get('url')
-            if hasattr(obj, 'name') and obj.name:
-                return obj.name
-            if hasattr(obj, 'url'):
-                return obj.url
-            return str(obj)
-
-        # header image for the site is stored in common settings under logo_image (historical)
-        # and in the legacy field header_image; prefer the settings value first
+        # Prefer settings key first (historical name), then legacy model field
         for key in ('logo_image', 'header_image'):
-            settings_header = self.settings.get(key, default=None) or getattr(self.settings, key, None)
-            path = _extract_path(settings_header)
-            if not path:
-                continue
-
-            if path.startswith(('http://', 'https://')):
-                return path
-
-            parsed = urlparse(path)
-            if parsed.scheme == 'file':
-                path = parsed.path
-
-            abs_path = os.path.abspath(path)
-            media_root = os.path.abspath(settings.MEDIA_ROOT)
-            try:
-                rel_to_media = os.path.relpath(abs_path, media_root)
-                if not rel_to_media.startswith('..'):
-                    path = rel_to_media
-            except OSError:
-                logger.exception("Failed to relativize header image path %s against MEDIA_ROOT %s", abs_path, media_root)
-
-            for prefix in ('/media/', 'media/'):
-                if path.startswith(prefix):
-                    path = path[len(prefix):]
-            if '/pub/' in path and not path.startswith('pub/'):
-                path = path[path.index('pub/'):]
-
-            path = path.lstrip('/')
+            raw = self.settings.get(key, as_type=str, default=None)
+            path = _resolve_media_path(raw)
             if path:
                 return path
 
@@ -2264,6 +2754,73 @@ class Event(
         return None
 
     @cached_property
+    def _visible_preview_image_path(self):
+        """
+        Resolve a usable preview image path/URL from the ``event_preview_image`` setting.
+        Returns a storage-relative path (e.g. ``pub/…``) or an absolute HTTP URL.
+        """
+        raw = self.settings.get('event_preview_image', as_type=str, default=None)
+        return _resolve_media_path(raw)
+
+    @cached_property
+    def visible_preview_image_url(self):
+        from django.core.files.storage import default_storage
+
+        if not self._visible_preview_image_path:
+            return None
+        with suppress(Exception):
+            if is_http_url(str(self._visible_preview_image_path)):
+                return self._visible_preview_image_path
+            return default_storage.url(self._visible_preview_image_path)
+        return None
+
+    @cached_property
+    def preview_image_url_with_fallback(self):
+        """
+        Return the resolved URL of the preview image, falling back to header image, then logo.
+        If none of these are set, it returns None (which the start page card template handles by
+        rendering a default calendar placeholder icon).
+
+        For local (non-HTTP) paths, a thumbnail is generated at 800×450 with a fill-crop (``^``).
+        ``get_thumbnail`` caches results on disk using a deterministic key derived from the path
+        and geometry, so repeated calls for the same image are cheap (file-existence check only).
+        This method itself is a ``@cached_property``, so it is only invoked once per ``Event``
+        instance per request — no thundering-herd risk within a single request.
+        """
+        path = self._visible_preview_image_path or self._visible_header_image_path or self._visible_logo_path
+        if not path:
+            return None
+
+        if is_http_url(str(path)):
+            return path
+
+        try:
+            return get_thumbnail(path, '800x450^').thumb.url
+        except Exception:
+            logger.exception('Failed to create preview thumbnail for path: %s', path)
+            try:
+                return default_storage.url(path)
+            except Exception:
+                return None
+
+    @cached_property
+    def preview_image_url_small(self):
+        """
+        Return a smaller 400×225 resolved URL of the preview image for responsive srcset delivery.
+        """
+        path = self._visible_preview_image_path or self._visible_header_image_path or self._visible_logo_path
+        if not path:
+            return None
+
+        if is_http_url(str(path)):
+            return path
+
+        try:
+            return get_thumbnail(path, '400x225^').thumb.url
+        except Exception:
+            return self.preview_image_url_with_fallback
+
+    @cached_property
     def visible_logo_url(self):
         from django.core.files.storage import default_storage
 
@@ -2271,7 +2828,7 @@ class Event(
             return None
         with suppress(Exception):
             # If already a full URL, return as-is
-            if str(self._visible_logo_path).startswith(('http://', 'https://')):
+            if is_http_url(str(self._visible_logo_path)):
                 return self._visible_logo_path
             return default_storage.url(self._visible_logo_path)
         return None
@@ -2283,7 +2840,7 @@ class Event(
         if not self._visible_logo_path:
             return None
         with suppress(Exception):
-            if str(self._visible_logo_path).startswith(('http://', 'https://')):
+            if is_http_url(str(self._visible_logo_path)):
                 return None
             return default_storage.open(self._visible_logo_path)
 
@@ -2294,7 +2851,7 @@ class Event(
         if not self._visible_header_image_path:
             return None
         with suppress(Exception):
-            if str(self._visible_header_image_path).startswith(('http://', 'https://')):
+            if is_http_url(str(self._visible_header_image_path)):
                 return self._visible_header_image_path
             return default_storage.url(self._visible_header_image_path)
 
@@ -2305,7 +2862,7 @@ class Event(
         if not self._visible_header_image_path:
             return None
         with suppress(Exception):
-            if str(self._visible_header_image_path).startswith(('http://', 'https://')):
+            if is_http_url(str(self._visible_header_image_path)):
                 return None
             return default_storage.open(self._visible_header_image_path)
         return None
@@ -2323,10 +2880,39 @@ class Event(
     def event(self):
         return self
 
+    def feature_flags_as_mapping(self):
+        flags = self.feature_flags or {}
+        if isinstance(flags, dict):
+            return flags
+        if isinstance(flags, (list, tuple, set)):
+            return {flag: True for flag in flags if isinstance(flag, str)}
+        return {}
+
     def get_feature_flag(self, feature):
-        if feature in self.feature_flags:
-            return self.feature_flags[feature]
+        flags = self.feature_flags_as_mapping()
+        if feature in flags:
+            return flags[feature]
         return default_feature_flags().get(feature, False)
+
+    def session_popularity_show_on_schedule(self):
+        flags = self.feature_flags_as_mapping()
+        if 'session_popularity_show_on_schedule' in flags:
+            return bool(flags['session_popularity_show_on_schedule'])
+        return bool(
+            flags.get('session_popularity_show_on_calendar', True)
+            or flags.get('session_popularity_show_on_list', True)
+        )
+
+    def schedule_client_feature_flags(self):
+        """Feature flags exposed to schedule webapp clients via inline JSON."""
+        from eventyay.talk_rules.submission import are_featured_speakers_visible
+
+        popularity_enabled = bool(self.get_feature_flag('session_popularity_enabled'))
+        return {
+            'session_popularity_enabled': popularity_enabled,
+            'session_popularity_show_on_schedule': self.session_popularity_show_on_schedule(),
+            'featured_speakers_enabled': are_featured_speakers_visible(None, self),
+        }
 
     @cached_property
     def duration(self):
@@ -2342,7 +2928,7 @@ class Event(
     def datetime_from(self) -> dt.datetime:
         """The localised datetime of the event start date.
 
-        :rtype: datetime
+        :rtype: datetime.datetime
         """
         return make_aware(
             dt.datetime.combine(self.date_from, dt.time(hour=0, minute=0, second=0)),
@@ -2353,7 +2939,7 @@ class Event(
     def datetime_to(self) -> dt.datetime:
         """The localised datetime of the event end date.
 
-        :rtype: datetime
+        :rtype: datetime.datetime
         """
         return make_aware(
             dt.datetime.combine(self.date_to, dt.time(hour=23, minute=59, second=59)),
@@ -2393,6 +2979,20 @@ class Event(
         return User.objects.filter(submissions__in=self.talks).order_by('id').distinct()
 
     @cached_property
+    def has_schedule_content(self):
+        """Returns True if the current schedule has visible sessions or scheduled breaks.
+
+        This checks whether the current schedule has any visible, scheduled talks
+        or breaks (not just an empty published schedule).
+        """
+        if not self.current_schedule:
+            return False
+        schedule = self.current_schedule
+        if schedule.scheduled_talks.exists():
+            return True
+        return schedule.breaks.filter(start__isnull=False, is_visible=True).exists()
+
+    @cached_property
     def submitters(self):
         """Returns a queryset of all :class:`~eventyay.base.models.user.User`
         objects who have submitted to this event.
@@ -2413,15 +3013,17 @@ class Event(
         """Returns all :class:`~eventyay.base.models.organizer.Team` objects
         that concern this event."""
 
-        return self.organizer.teams.all().filter(
-            models.Q(all_events=True) | models.Q(models.Q(all_events=False) & models.Q(limit_events__in=[self]))
-        )
+        return self.organizer.teams.filter(
+            models.Q(all_events=True) | models.Q(models.Q(all_events=False) & models.Q(limit_events=self))
+        ).distinct()
 
     @cached_property
     def reviewers(self):
         from eventyay.base.models import User
 
-        return User.objects.filter(teams__in=self.teams.filter(is_reviewer=True)).distinct()
+        return User.objects.filter(
+            teams__in=self.teams.filter(Q(is_reviewer=True) | Q(can_change_submissions=True))
+        ).distinct()
 
     @cached_property
     def active_review_phase(self):
@@ -2451,7 +3053,7 @@ class Event(
         """Reorder the review phases by start date."""
         # first, sort phases so that the ones with no start date come first
         phases = list(self.review_phases.all())
-        placeholder = dt.datetime(1900, 1, 1).astimezone(self.tz)
+        placeholder = dt.datetime(1970, 1, 2, tzinfo=dt.UTC)
         phases.sort(key=lambda x: (x.start or placeholder, x.end or placeholder))
         for i, phase in enumerate(phases):
             phase.position = i
@@ -2526,23 +3128,94 @@ class Event(
     def get_mail_template(self, role):
         from eventyay.base.models import MailTemplate
         from eventyay.mail.default_templates import get_default_template
+        from i18nfield.strings import LazyI18nString
 
         try:
             with scope(event=self):
-                return self.mail_templates.get(role=role)
+                template = self.mail_templates.get(role=role)
         except MailTemplate.DoesNotExist:
-            subject, text = get_default_template(role)
+            default_subject, default_text = get_default_template(role)
+            # Initialize with all event locales from the start
+            subject_data = {}
+            text_data = {}
+            for locale in self.locales:
+                if locale:
+                    subject_data[locale] = str(default_subject.localize(locale))
+                    text_data[locale] = str(default_text.localize(locale))
+            
+            subject = LazyI18nString(subject_data) if subject_data else default_subject
+            text = LazyI18nString(text_data) if text_data else default_text
+            
             with scope(event=self):
                 template, __ = MailTemplate.objects.get_or_create(
                     event=self, role=role, defaults={'subject': subject, 'text': text}
                 )
+        return self._ensure_mail_template_locales(template, role)
+
+    def _ensure_mail_template_locales(self, template, role):
+        from eventyay.mail.default_templates import get_default_template
+
+        if role is None:
             return template
+
+        default_subject, default_text = get_default_template(role)
+        
+        # Pre-check: do we have all locales without needing a write?
+        locales_to_check = set(locale for locale in self.locales if locale)
+        all_locales_present = True
+        
+        for field_name, default_value in (('subject', default_subject), ('text', default_text)):
+            current_value = getattr(template, field_name)
+            if not (
+                hasattr(current_value, 'data')
+                and isinstance(current_value.data, dict)
+                and hasattr(default_value, 'localize')
+            ):
+                continue
+            
+            if locales_to_check - set(current_value.data.keys()):
+                all_locales_present = False
+                break
+        
+        # Early return if all locales are already present
+        if all_locales_present:
+            return template
+        
+        # Only enter transaction if we need to backfill missing locales
+        with scope(event=self), transaction.atomic():
+            if template.pk:
+                template = template.__class__.objects.select_for_update().get(pk=template.pk)
+
+            changed_fields = []
+            for field_name, default_value in (('subject', default_subject), ('text', default_text)):
+                current_value = getattr(template, field_name)
+                if not (
+                    hasattr(current_value, 'data')
+                    and isinstance(current_value.data, dict)
+                    and hasattr(default_value, 'localize')
+                ):
+                    continue
+
+                field_changed = False
+                for locale in self.locales:
+                    if locale and locale not in current_value.data:
+                        current_value.data[locale] = str(default_value.localize(locale))
+                        field_changed = True
+
+                if field_changed:
+                    changed_fields.append(field_name)
+
+            if changed_fields:
+                template.save(update_fields=changed_fields)
+        return template
 
     def build_initial_data(self):
         from eventyay.base.models import CfP, MailTemplateRoles, Schedule
+        from django_scopes import scope
 
-        if not hasattr(self, 'cfp'):
-            CfP.objects.create(event=self, default_type=self._get_default_submission_type())
+        with scope(event=self):
+            if not CfP.objects.filter(event=self).exists():
+                CfP.objects.create(event=self, default_type=self._get_default_submission_type())
 
         with scope(event=self):
             if not self.schedules.filter(version__isnull=True).exists():
@@ -2609,7 +3282,7 @@ class Event(
 
         :class:`~eventyay.base.models.mail.QueuedMail` objects.
         """
-        return self.queued_mails.filter(sent__isnull=True).count()
+        return self.queued_mails.filter(sent__isnull=True, is_draft=False).count()
 
 
 class EventExtraLink(OrderedModel, PretalxModel):
@@ -2638,13 +3311,13 @@ class SubEvent(EventMixin, LoggedModel):
     :param name: This event's full title
     :type name: str
     :param date_from: The datetime this event starts
-    :type date_from: datetime
+    :type date_from: datetime.datetime
     :param date_to: The datetime this event ends
-    :type date_to: datetime
+    :type date_to: datetime.datetime
     :param presale_start: No tickets will be sold before this date.
-    :type presale_start: datetime
+    :type presale_start: datetime.datetime
     :param presale_end: No tickets will be sold after this date.
-    :type presale_end: datetime
+    :type presale_end: datetime.datetime
     :param location: venue
     :type location: str
     """
@@ -2844,8 +3517,8 @@ class RequiredAction(models.Model):
     Represents an action that is to be done by an admin. The admin will be
     displayed a list of actions to do.
 
-    :param datatime: The timestamp of the required action
-    :type datetime: datetime
+    :param datetime: The timestamp of the required action
+    :type datetime: datetime.datetime
     :param user: The user that performed the action
     :type user: User
     :param done: If this action has been completed or dismissed

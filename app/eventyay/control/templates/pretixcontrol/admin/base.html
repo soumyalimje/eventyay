@@ -2,6 +2,8 @@
 {% load i18n static %}
 {% block custom_header %}
     {{ block.super }}
+    <link rel="stylesheet" href="{% static 'control/video_admin.css' %}">
+    <script defer src="{% static 'control/js/video-server-toggle.js' %}"></script>
 {% endblock %}
 {% block content %}
 <div class="video-admin-wrapper">
@@ -10,14 +12,14 @@
 {% endblock %}
 
 {% block nav_top_header %}
-    <a href="#" class="dropdown-toggle" data-toggle="dropdown">
+    <a href="{% url 'eventyay_admin:admin.dashboard' %}" class="dropdown-toggle">
         <span class="fa-stack fa-lg">
           <i class="fa fa-circle fa-stack-2x"></i>
-          <i class="fa fa-user fa-stack-1x fa-inverse"></i>
+          <i class="fa fa-dashboard fa-stack-1x fa-inverse"></i>
         </span>
 
         <div class="context-indicator">
-            <span class="context-name">Admin</span>
+            <span class="context-name">{% trans "Admin" %}</span>
         </div>
     </a>
 {% endblock %}
@@ -25,7 +27,7 @@
     {% for nav in admin_nav_items %}
         <li>
             <a href="{{ nav.url }}" {% if nav.active %}class="active{% if nav.children %} has-children{% endif %}"{% elif nav.children %}class="has-children"{% endif %}
-                    {% if nav.external %}target="_blank"{% endif %}>
+                    {% if nav.external %}target="_blank" rel="noopener noreferrer"{% endif %}>
                 {% if nav.icon %}
                     {% if "<svg" in nav.icon %}
                         {{ nav.icon|safe }}
@@ -33,7 +35,7 @@
                         <span class="fa fa-fw fa-{{ nav.icon }}"></span>
                     {% endif %}
                 {% endif %}
-                {{ nav.label }}
+                <span class="sidebar-text">{{ nav.label }}</span>
             </a>
             {% if nav.children %}
                 <a href="#" class="arrow">
@@ -43,9 +45,9 @@
                     {% for item in nav.children %}
                         <li>
                             <a href="{{ item.url }}"
-                                    {% if item.external %}target="_blank"{% endif %}
+                                    {% if item.external %}target="_blank" rel="noopener noreferrer"{% endif %}
                                     {% if item.active %}class="active"{% endif %}>
-                                {{ item.label }}
+                                <span class="sidebar-text">{{ item.label }}</span>
                             </a>
                         </li>
                     {% endfor %}

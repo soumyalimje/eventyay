@@ -6,12 +6,14 @@ import re
 import smtplib
 import ssl
 import warnings
+from collections.abc import Sequence
 from email.mime.image import MIMEImage
 from email.utils import formataddr
-from typing import Any, Dict, List, Sequence, Union
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
-import pytz
+import datetime
+from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 from celery import chain
@@ -32,6 +34,12 @@ from django_scopes import scope, scopes_disabled
 from i18nfield.strings import LazyI18nString
 
 from eventyay.base.email import ClassicMailRenderer
+from eventyay.base.gmail.errors import (
+    GmailDailyLimitError,
+    GmailPermanentError,
+    GmailRateLimitError,
+    GmailTemporaryError,
+)
 from eventyay.base.i18n import language
 from eventyay.base.models import (
     CachedFile,
@@ -48,8 +56,12 @@ from eventyay.base.services.tickets import get_tickets_for_order
 from eventyay.base.settings import GlobalSettingsObject
 from eventyay.base.signals import email_filter, global_email_filter
 from eventyay.celery_app import app
+from eventyay.common.mail import get_reply_to_address
+from eventyay.consts import SizeKey
+from eventyay.helpers.http import smtp_reachable
 from eventyay.multidomain.urlreverse import build_absolute_uri
 from eventyay.presale.ical import get_ical
+
 
 logger = logging.getLogger(__name__)
 INVALID_ADDRESS = 'invalid-eventyay-mail-address'
@@ -57,6 +69,14 @@ INVALID_ADDRESS = 'invalid-eventyay-mail-address'
 
 class TolerantDict(dict):
     def __missing__(self, key):
+        if isinstance(key, str) and '\\_' in key:
+            clean_key = key.replace('\\_', '_')
+            if clean_key in self:
+                return super().__getitem__(clean_key)
+        # Keep brace syntax so unresolved placeholders stay recognizable in
+        # sent mail (e.g. "{order_qr}" instead of the bare name "order_qr").
+        if isinstance(key, str):
+            return f'{{{key}}}'
         return key
 
 
@@ -65,10 +85,10 @@ class SendMailException(Exception):  # NOQA: N818
 
 
 def mail(
-    email: Union[str, Sequence[str]],
+    email: str | Sequence[str],
     subject: str,
-    template: Union[str, LazyI18nString],
-    context: Dict[str, Any] = None,
+    template: str | LazyI18nString,
+    context: dict[str, Any] = None,
     event: Event = None,
     locale: str = None,
     order: Order = None,
@@ -84,6 +104,7 @@ def mail(
     user=None,
     attach_ical=False,
     attach_cached_files: Sequence = None,
+    sync_send: bool = False,
 ):
     """
     Sends out an email to a user. The mail will be sent synchronously or asynchronously depending on the installation.
@@ -155,8 +176,9 @@ def mail(
                 context.update({'invoice_name': '', 'invoice_company': ''})
         renderer = ClassicMailRenderer(None)
         content_plain = body_plain = render_mail(template, context)
-        subject = str(subject).format_map(TolerantDict(context))
-        sender = sender or (event.settings.get('mail_from') if event else settings.MAIL_FROM) or settings.MAIL_FROM
+        subject = str(subject).format_map(TolerantDict(_stringify_mail_context(context)))
+        sender = sender or (event.settings.get('mail_from') if event else settings.DEFAULT_FROM_EMAIL) or settings.DEFAULT_FROM_EMAIL
+        sender_email_raw = sender
         if event:
             sender_name = str(event.name)
             if len(sender_name) > 75:
@@ -182,24 +204,22 @@ def mail(
                 for bcc_mail in event.settings.mail_bcc.split(','):
                     bcc.append(bcc_mail.strip())
 
-            if not auto_email:
-                if (
-                    event_reply_to
-                    and not headers.get('Reply-To')
-                ):
-                    headers['Reply-To'] = event_reply_to          
-            elif (
-                event.settings.mail_from == settings.DEFAULT_FROM_EMAIL
-                and event.settings.contact_mail
-                and not headers.get('Reply-To')
-            ):
-                headers['Reply-To'] = event.settings.contact_mail
+            if not headers.get('Reply-To'):
+                reply_to_override = (event_reply_to if event_reply_to else None) if not auto_email else None
+                reply_to = get_reply_to_address(
+                    event,
+                    override=reply_to_override,
+                    sender_email=sender_email_raw
+                )
+
+                if reply_to:
+                    headers['Reply-To'] = reply_to
 
             prefix = event.settings.get('mail_prefix')
             if prefix and prefix.startswith('[') and prefix.endswith(']'):
                 prefix = prefix[1:-1]
             if prefix:
-                subject = '[%s] %s' % (prefix, subject)
+                subject = f'[{prefix}] {subject}'
 
             body_plain += '\r\n\r\n-- \r\n'
 
@@ -255,9 +275,9 @@ def mail(
                 )
             body_plain += '\r\n'
         elif user:
-            timezone = pytz.timezone(user.timezone)
+            timezone = ZoneInfo(user.timezone)
         else:
-            timezone = pytz.timezone(settings.TIME_ZONE)
+            timezone = ZoneInfo(settings.TIME_ZONE)
 
         with override(timezone):
             try:
@@ -301,7 +321,10 @@ def mail(
 
         task_chain.append(send_task)
 
-        if 'locmem' in settings.EMAIL_BACKEND:
+        if sync_send:
+            # Run synchronously in the current process when callers need an immediate and reliable send result.
+            chain(*task_chain).apply(throw=True)
+        elif 'locmem' in settings.EMAIL_BACKEND:
             # This clause is triggered during unit tests, because transaction.on_commit never fires due to the nature
             # Django's unit tests work
             chain(*task_chain).apply_async()
@@ -320,14 +343,50 @@ class CustomEmail(EmailMultiAlternatives):
         basetype, subtype = mimetype.split('/', 1)
         if basetype == 'multipart' and isinstance(content, SafeMIMEMultipart):
             return content
+        if basetype == 'text' and isinstance(content, SafeMIMEText):
+            return content
         return super()._create_mime_attachment(content, mimetype)
+
+    def _add_bodies(self, msg):
+        from django.core.mail.message import EmailMessage
+        from django.utils.encoding import force_bytes
+        
+        # Call EmailMessage._add_bodies to handle the plain text body
+        EmailMessage._add_bodies(self, msg)
+
+        if self.alternatives:
+            if hasattr(self, "alternative_subtype"):
+                raise AttributeError(
+                    "EmailMultiAlternatives no longer supports the"
+                    " undocumented `alternative_subtype` attribute"
+                )
+            msg.make_alternative()
+            encoding = self.encoding or settings.DEFAULT_CHARSET
+            for alternative in self.alternatives:
+                if isinstance(alternative, tuple) and not hasattr(alternative, 'content'):
+                    content, mimetype = alternative[0], alternative[1]
+                else:
+                    content, mimetype = alternative.content, alternative.mimetype
+
+                if isinstance(content, (SafeMIMEMultipart, SafeMIMEText)):
+                    msg.attach(content)
+                else:
+                    maintype, subtype = mimetype.split("/", 1)
+                    if maintype == "text":
+                        if isinstance(content, bytes):
+                            content = content.decode()
+                        msg.add_alternative(content, subtype=subtype, charset=encoding)
+                    else:
+                        content = force_bytes(content, encoding=encoding, strings_only=True)
+                        msg.add_alternative(content, maintype=maintype, subtype=subtype)
+        return msg
 
 
 @app.task(base=TransactionAwareTask, bind=True, acks_late=True)
 def mail_send_task(
     self,
     *args,
-    to: List[str],
+    to: list[str],
     subject: str,
     body: str,
     html: str,
@@ -335,23 +394,29 @@ def mail_send_task(
     event: int = None,
     position: int = None,
     headers: dict = None,
-    bcc: List[str] = None,
-    invoices: List[int] = None,
+    bcc: list[str] = None,
+    invoices: list[int] = None,
     order: int = None,
     attach_tickets=False,
     user=None,
     attach_ical=False,
-    attach_cached_files: List[int] = None,
+    attach_cached_files: list[int] = None,
     attach_file_base64: str = None,
     attach_file_name: str = None,
 ) -> bool:
     email = CustomEmail(subject, body, sender, to=to, bcc=bcc, headers=headers)
     if html is not None:
-        html_message = SafeMIMEMultipart(_subtype='related', encoding=settings.DEFAULT_CHARSET)
         html_with_cid, cid_images = replace_images_with_cid_paths(html)
-        html_message.attach(SafeMIMEText(html_with_cid, 'html', settings.DEFAULT_CHARSET))
-        attach_cid_images(html_message, cid_images, verify_ssl=True)
-        email.attach_alternative(html_message, 'multipart/related')
+        if cid_images:
+            html_message = SafeMIMEMultipart(_subtype='related', encoding=settings.DEFAULT_CHARSET)
+            html_message.attach(SafeMIMEText(html_with_cid, 'html', settings.DEFAULT_CHARSET))
+            attached_count = attach_cid_images(html_message, cid_images, verify_ssl=True)
+            if attached_count > 0:
+                email.attach_alternative(html_message, 'multipart/related')
+            else:
+                email.attach_alternative(SafeMIMEText(html_with_cid, 'html', settings.DEFAULT_CHARSET), 'text/html')
+        else:
+            email.attach_alternative(SafeMIMEText(html_with_cid, 'html', settings.DEFAULT_CHARSET), 'text/html')
 
     if user:
         user = User.objects.get(pk=user)
@@ -393,8 +458,10 @@ def mail_send_task(
                                 args.append((name, content, ct.type))
                                 attach_size += len(content)
 
-                            if attach_size < 4 * 1024 * 1024:
-                                # Do not attach more than 4MB, it will bounce way to often.
+                            if attach_size < settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_MAIL]:
+                                # The maximum attachment size is configurable by overriding
+                                # the `upload_size_mail` key in your TOML / size_limit_mb dictionary.
+                                # Values above ~4MB are not recommended, as larger emails are more likely to bounce.
                                 for a in args:
                                     try:
                                         email.attach(*a)
@@ -428,7 +495,7 @@ def mail_send_task(
                             for i, e in enumerate(ical_events):
                                 cal = get_ical([e])
                                 email.attach(
-                                    'event-{}.ics'.format(i),
+                                    f'event-{i}.ics',
                                     cal.serialize(),
                                     'text/calendar',
                                 )
@@ -469,8 +536,47 @@ def mail_send_task(
             email.attach(attach_file_name, attach_file_content, 'application/pdf')
 
         try:
+            logger.info('Try to send email to %s with subject "%s"', to, subject)
+            logger.debug('Email backend: %s', backend)
             backend.send_messages([email])
+        except (
+            GmailRateLimitError,
+            GmailTemporaryError,
+        ) as e:
+            countdown = getattr(backend, 'retry_countdown', 60)
+            try:
+                self.retry(
+                    max_retries=5,
+                    countdown=min(countdown * (2 ** self.request.retries), 300),
+                )
+            except MaxRetriesExceededError:
+                if order:
+                    order.log_action(
+                        'eventyay.event.order.email.error',
+                        data={
+                            'subject': 'Gmail temporary error',
+                            'message': str(e),
+                            'recipient': '',
+                            'invoices': [],
+                        },
+                    )
+                raise SendMailException(f'Failed to send an email to {to}.') from e
+            raise
+        except (GmailDailyLimitError, GmailPermanentError) as e:
+            logger.warning('Gmail delivery rejected without further retries: %s', e)
+            if order:
+                order.log_action(
+                    'eventyay.event.order.email.error',
+                    data={
+                        'subject': 'Gmail delivery rejected',
+                        'message': str(e),
+                        'recipient': '',
+                        'invoices': [],
+                    },
+                )
+            raise SendMailException(f'Failed to send an email to {to}.') from e
         except (smtplib.SMTPResponseException, smtplib.SMTPSenderRefused) as e:
+            logger.debug('Got error %s. Retry...', e)
             if e.smtp_code in (101, 111, 421, 422, 431, 442, 447, 452):
                 # Most likely temporary, retry again (but pretty soon)
                 try:
@@ -482,7 +588,7 @@ def mail_send_task(
                         order.log_action(
                             'eventyay.event.order.email.error',
                             data={
-                                'subject': 'SMTP code {}, max retries exceeded'.format(e.smtp_code),
+                                'subject': f'SMTP code {e.smtp_code}, max retries exceeded',
                                 'message': e.smtp_error.decode()
                                 if isinstance(e.smtp_error, bytes)
                                 else str(e.smtp_error),
@@ -497,14 +603,14 @@ def mail_send_task(
                 order.log_action(
                     'eventyay.event.order.email.error',
                     data={
-                        'subject': 'SMTP code {}'.format(e.smtp_code),
+                        'subject': f'SMTP code {e.smtp_code}',
                         'message': e.smtp_error.decode() if isinstance(e.smtp_error, bytes) else str(e.smtp_error),
                         'recipient': '',
                         'invoices': [],
                     },
                 )
 
-            raise SendMailException('Failed to send an email to {}.'.format(to))
+            raise SendMailException(f'Failed to send an email to {to}.')
         except smtplib.SMTPRecipientsRefused as e:
             smtp_codes = [a[0] for a in e.recipients.values()]
 
@@ -534,7 +640,7 @@ def mail_send_task(
                     },
                 )
 
-            raise SendMailException('Failed to send an email to {}.'.format(to))
+            raise SendMailException(f'Failed to send an email to {to}.')
         except Exception as e:
             if isinstance(
                 e,
@@ -572,55 +678,98 @@ def mail_send_task(
                     },
                 )
             logger.exception('Error sending email')
-            raise SendMailException('Failed to send an email to {}.'.format(to))
+            raise SendMailException(f'Failed to send an email to {to}.')
 
 
 def mail_send(*args, **kwargs):
     mail_send_task.apply_async(args=args, kwargs=kwargs)
 
 
+def _stringify_mail_context(context: dict[str, Any] | None) -> dict[str, str]:
+    """Coerce placeholder values to strings for ``str.format_map``."""
+    if not context:
+        return {}
+    return {key: '' if value is None else str(value) for key, value in context.items()}
+
+
+# Tiptap email chips look like:
+#   <span class="tiptap-placeholder-chip" data-variable="order_qr">{order_qr}</span>
+# ``format_map`` only replaces the ``{order_qr}`` text node. When chip text is
+# missing braces (or was left unresolved), replace the whole span from context.
+_DATA_VARIABLE_CHIP_RE = re.compile(
+    r'<span\b([^>]*\bdata-variable=["\']([a-zA-Z][a-zA-Z0-9_]*)["\'][^>]*)>(.*?)</span>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def expand_email_variable_chips(body: str, context: dict[str, str]) -> str:
+    """Replace Tiptap ``data-variable`` chips with resolved context values.
+
+    Runs after ``format_map`` so successfully expanded chips are unwrapped to
+    their HTML content, and chips whose visible text never contained
+    ``{placeholder}`` braces still resolve when the key is in ``context``.
+    """
+    if not body or not context:
+        return body
+
+    def replace_chip(match: re.Match) -> str:
+        key = match.group(2)
+        if key not in context:
+            return match.group(0)
+        value = context[key]
+        # Skip empty / still-unresolved tolerant placeholders.
+        if value == '' or value == f'{{{key}}}' or value == key:
+            return match.group(0)
+        return value
+
+    return _DATA_VARIABLE_CHIP_RE.sub(replace_chip, body)
+
+
 def render_mail(template, context):
     if isinstance(template, LazyI18nString):
         body = str(template)
         if context:
-            body = body.format_map(TolerantDict(context))
+            string_context = _stringify_mail_context(context)
+            body = body.format_map(TolerantDict(string_context))
+            body = expand_email_variable_chips(body, string_context)
     else:
         tpl = get_template(template)
         body = tpl.render(context)
     return body
 
 
-def replace_images_with_cid_paths(body_html):
-    if body_html:
-        email = BeautifulSoup(body_html, 'lxml')
-        cid_images = []
-        for image in email.findAll('img'):
-            original_image_src = image['src']
-
-            try:
-                cid_id = 'image_%s' % cid_images.index(original_image_src)
-            except ValueError:
-                cid_images.append(original_image_src)
-                cid_id = 'image_%s' % (len(cid_images) - 1)
-
-            image['src'] = 'cid:%s' % cid_id
-
-        return str(email), cid_images
-    else:
+def replace_images_with_cid_paths(body_html: str) -> tuple[str, list[str]]:
+    if not body_html:
         return body_html, []
+    email = BeautifulSoup(body_html, 'lxml')
+    cid_images = []
+    for image in email.findAll('img'):
+        original_image_src = image['src']
+
+        try:
+            cid_id = f'image_{cid_images.index(original_image_src)}'
+        except ValueError:
+            cid_images.append(original_image_src)
+            cid_id = f'image_{len(cid_images) - 1}'
+
+        image['src'] = f'cid:{cid_id}'
+
+    return str(email), cid_images
 
 
-def attach_cid_images(msg, cid_images, verify_ssl=True):
+def attach_cid_images(msg: SafeMIMEMultipart, cid_images: Sequence[str], verify_ssl: bool = True) -> int:
+    attached_count = 0
     if cid_images and len(cid_images) > 0:
         msg.mixed_subtype = 'mixed'
         for key, image in enumerate(cid_images):
-            cid = 'image_%s' % key
+            cid = f'image_{key}'
             try:
-                mime_image = convert_image_to_cid(image, cid, verify_ssl)
-                if mime_image:
+                if mime_image := convert_image_to_cid(image, cid, verify_ssl):
                     msg.attach(mime_image)
-            except:
-                logger.exception('ERROR attaching CID image %s[%s]' % (cid, image))
+                    attached_count += 1
+            except (ValueError, IndexError, requests.RequestException, ssl.SSLError):
+                logger.exception('ERROR attaching CID image %s[%s]', cid, image)
+    return attached_count
 
 
 def encoder_linelength(msg):
@@ -638,34 +787,40 @@ def encoder_linelength(msg):
     msg.set_payload(b'\r\n'.join(pieces))
 
 
-def convert_image_to_cid(image_src, cid_id, verify_ssl=True):
-    try:
-        if image_src.startswith('data:image/'):
-            image_type, image_content = image_src.split(',', 1)
-            image_type = re.findall(r'data:image/(\w+);base64', image_type)[0]
-            mime_image = MIMEImage(image_content, _subtype=image_type, _encoder=encoder_linelength)
-            mime_image.add_header('Content-Transfer-Encoding', 'base64')
-        elif image_src.startswith('data:'):
-            logger.exception('ERROR creating MIME element %s[%s]' % (cid_id, image_src))
-            return None
-        else:
-            image_src = normalize_image_url(image_src)
-
-            path = urlparse(image_src).path
-            guess_subtype = os.path.splitext(path)[1][1:]
-
-            response = requests.get(image_src, verify=verify_ssl)
-            mime_image = MIMEImage(response.content, _subtype=guess_subtype)
-
-        mime_image.add_header('Content-ID', '<%s>' % cid_id)
-
-        return mime_image
-    except:
-        logger.exception('ERROR creating mime_image %s[%s]' % (cid_id, image_src))
+# May raise:
+# - ValueError (If image_src lacks ",")
+# - IndexError (If regex failed)
+# - requests.RequestException
+# - ssl.SSLError
+def convert_image_to_cid(image_src: str, cid_id: str, verify_ssl: bool = True) -> MIMEImage | None:
+    if image_src.startswith('data:image/'):
+        # Let ValueError bubble up here.
+        image_type, image_content = image_src.split(',', 1)
+        image_type = re.findall(r'data:image/(\w+);base64', image_type)[0]
+        mime_image = MIMEImage(image_content, _subtype=image_type, _encoder=encoder_linelength)
+        mime_image.add_header('Content-Transfer-Encoding', 'base64')
+        guess_subtype = image_type
+    elif image_src.startswith('data:'):
+        logger.warning('Non-image MIME element %s[%s]', cid_id, image_src)
         return None
+    else:
+        image_src = normalize_image_url(image_src)
+
+        path = urlparse(image_src).path
+        guess_subtype = os.path.splitext(path)[1][1:]
+
+        response = requests.get(image_src, verify=verify_ssl)
+        mime_image = MIMEImage(response.content, _subtype=guess_subtype)
+
+    mime_image.add_header('Content-ID', f'<{cid_id}>')
+
+    filename = f"{cid_id}.{guess_subtype}" if guess_subtype else cid_id
+    mime_image.add_header('Content-Disposition', 'inline', filename=filename)
+
+    return mime_image
 
 
-def normalize_image_url(url):
+def normalize_image_url(url: str) -> str:
     if '://' not in url:
         """
         If we see a relative URL in an email, we can't know if it is meant to be a media file
@@ -695,16 +850,23 @@ def get_mail_backend(timeout=None):
     or by returning a custom one based on the system's settings.
     """
     from eventyay.base.email import CustomSMTPBackend, SendGridEmail
+    from eventyay.base.gmail.resolver import get_gmail_mail_backend
 
     gs = GlobalSettingsObject()
+    smtp_host = gs.settings.smtp_host
+    smtp_port = gs.settings.smtp_port
 
     if gs.settings.email_vendor is not None:
+        if gs.settings.email_vendor == 'gmail_api':
+            backend = get_gmail_mail_backend(timeout=timeout)
+            if backend:
+                return backend
         if gs.settings.email_vendor == 'sendgrid':
             return SendGridEmail(api_key=gs.settings.send_grid_api_key)
-        else:
+        if smtp_reachable(smtp_host, smtp_port, timeout=timeout):
             return CustomSMTPBackend(
-                host=gs.settings.smtp_host,
-                port=gs.settings.smtp_port,
+                host=smtp_host,
+                port=smtp_port,
                 username=gs.settings.smtp_username,
                 password=gs.settings.smtp_password,
                 use_tls=gs.settings.smtp_use_tls,
@@ -712,5 +874,9 @@ def get_mail_backend(timeout=None):
                 fail_silently=False,
                 timeout=timeout,
             )
-    else:
-        return get_connection(fail_silently=False)
+        logger.warning(
+            'Global SMTP %s:%s is not reachable, falling back to system email backend',
+            smtp_host,
+            smtp_port,
+        )
+    return get_connection(fail_silently=False, timeout=timeout)

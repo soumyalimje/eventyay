@@ -2,7 +2,8 @@ from datetime import timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-import pytz
+import datetime
+
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import (
@@ -31,6 +32,7 @@ from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext, pgettext
 
 from eventyay.base.decimal import round_decimal
+from eventyay.base.meetup import is_meetup_event
 from eventyay.base.models import (
     Product,
     ProductCategory,
@@ -46,12 +48,14 @@ from eventyay.base.models import (
     WaitingListEntry,
 )
 from eventyay.base.services.quotas import QuotaAvailability
+from eventyay.base.settings import is_event_series_creation_enabled, is_meetup_creation_enabled
 from eventyay.base.timeline import timeline_for_event
 from eventyay.control.forms.event import CommentForm
 from eventyay.control.signals import (
     event_dashboard_widgets,
     user_dashboard_widgets,
 )
+from eventyay.plugins.statistics.views import get_statistics_context
 from eventyay.helpers.daterange import daterange
 
 from ...base.models.orders import CancellationRequest
@@ -291,29 +295,60 @@ def quota_widgets(sender, subevent=None, lazy=False, **kwargs):
 
 @receiver(signal=event_dashboard_widgets)
 def shop_state_widget(sender, **kwargs):
+    request = kwargs.get('request')
+    is_common = bool(request and request.path.startswith('/common/'))
+    if is_meetup_event(sender):
+        label = _('Meetup is') if is_common else _('Registration is')
+    else:
+        label = _('Event is') if is_common else _('Ticket shop is')
+    url_name = 'eventyay_common:event.live' if is_common else 'control:event.live'
+    if is_common:
+        state = (
+            _('live (private test mode)')
+            if sender.live and sender.private_testmode
+            else (
+                _('live and in test mode')
+                if sender.live and sender.testmode
+                else (
+                    _('live')
+                    if sender.live
+                    else (
+                        _('in private test mode')
+                        if sender.private_testmode
+                        else (_('in test mode') if sender.testmode else _('not yet public'))
+                    )
+                )
+            )
+        )
+        icon = (
+            'fa-check-circle'
+            if sender.live and not sender.testmode and not sender.private_testmode
+            else ('fa-warning' if sender.live else 'fa-times-circle')
+        )
+        css_class = 'live' if sender.live else 'off'
+    else:
+        ticket_status = sender.ticket_component_presale_status
+        state = ticket_status['text']
+        icon = ticket_status['icon']
+        css_class = ticket_status['class']
     return [
         {
+            'key': 'shop_state',
             'display_size': 'small',
             'priority': 1000,
-            'content': '<div class="shopstate">{t1}<br><span class="{cls}"><span class="fa {icon}"></span> {state}</span>{t2}</div>'.format(
-                t1=_('Your ticket shop is'),
+            'content': (
+                '<div class="shopstate">{t1}<br>'
+                '<span class="{cls}"><span class="fa {icon}"></span> {state}</span>'
+                '{t2}</div>'
+            ).format(
+                t1=label,
                 t2=_('Click here to change'),
-                state=_('live')
-                if sender.live and not sender.testmode
-                else (
-                    _('live and in test mode')
-                    if sender.live
-                    else (_('not yet public') if not sender.testmode else (_('in private test mode')))
-                ),
-                icon='fa-check-circle'
-                if sender.live and not sender.testmode
-                else (
-                    'fa-warning' if sender.live else ('fa-times-circle' if not sender.testmode else ('fa-times-circle'))
-                ),
-                cls='live' if sender.live else 'off',
+                state=state,
+                icon=icon,
+                cls=css_class,
             ),
             'url': reverse(
-                'control:event.live',
+                url_name,
                 kwargs={'event': sender.slug, 'organizer': sender.organizer.slug},
             ),
         }
@@ -352,13 +387,13 @@ def checkin_widget(sender, subevent=None, lazy=False, **kwargs):
 @receiver(signal=event_dashboard_widgets)
 def welcome_wizard_widget(sender, **kwargs):
     template = get_template('pretixcontrol/event/dashboard_widget_welcome.html')
-    ctx = {'title': _('Welcome')}
+    ctx = {'title': _('Tickets')}
     kwargs = {'event': sender.slug, 'organizer': sender.organizer.slug}
 
     if not sender.products.exists():
         ctx.update(
             {
-                'subtitle': _('Get started with our setup tool'),
+                'subtitle': _('Get started with ticketing'),
                 'text': _(
                     'To start selling tickets, you need to create products or quotas. The fastest way to create '
                     'this is to use our setup tool.'
@@ -395,7 +430,12 @@ def event_index(request, organizer, event):
     )
     widgets = []
     if can_view_orders:
-        for r, result in event_dashboard_widgets.send(sender=request.event, subevent=subevent, lazy=True):
+        for r, result in event_dashboard_widgets.send(
+            sender=request.event,
+            subevent=subevent,
+            lazy=True,
+            request=request,
+        ):
             widgets.extend(result)
 
     qs = (
@@ -433,7 +473,11 @@ def event_index(request, organizer, event):
             initial={'comment': request.event.comment},
             readonly=not can_change_event_settings,
         ),
+        'can_view_orders': can_view_orders,
     }
+
+    if can_view_orders:
+        ctx.update(get_statistics_context(request, subevent=subevent))
 
     ctx['has_overpaid_orders'] = (
         can_view_orders
@@ -486,7 +530,9 @@ def event_index(request, organizer, event):
     ctx['nearly_now'] = now().astimezone(ZoneInfo(request.event.timezone)) - timedelta(seconds=20)
     ctx['organizer_teams'] = request.organizer.teams.values_list('id', 'name')
     resp = render(request, 'pretixcontrol/event/index.html', ctx)
-    # resp['Content-Security-Policy'] = "style-src 'unsafe-inline'"
+    if can_view_orders and ctx.get('stats_has_orders'):
+        resp['Content-Security-Policy'] = "script-src 'unsafe-eval'; style-src 'unsafe-inline'"
+        resp._csp_update = {'script-src': ["'unsafe-eval'"], 'style-src': ["'unsafe-inline'"]}
     return resp
 
 
@@ -499,9 +545,19 @@ def event_index_widgets_lazy(request, organizer, event):
         except SubEvent.DoesNotExist:
             pass
 
+    can_view_orders = request.user.has_event_permission(
+        request.organizer, request.event, 'can_view_orders', request=request
+    )
+
     widgets = []
-    for r, result in event_dashboard_widgets.send(sender=request.event, subevent=subevent, lazy=False):
-        widgets.extend(result)
+    if can_view_orders:
+        for r, result in event_dashboard_widgets.send(
+            sender=request.event,
+            subevent=subevent,
+            lazy=False,
+            request=request,
+        ):
+            widgets.extend(result)
 
     return JsonResponse({'widgets': widgets})
 
@@ -572,7 +628,7 @@ def widgets_for_event_qs(request, qs, user, nmax, lazy=False):
     for event in events:
         if not lazy:
             tzname = event.cache.get_or_set('timezone', lambda: event.settings.timezone)
-            tz = pytz.timezone(tzname)
+            tz = ZoneInfo(tzname)
             if event.has_subevents:
                 if event.min_from is None:
                     dr = pgettext('subevent', 'No dates')
@@ -709,6 +765,8 @@ def user_index(request):
     ctx = {
         'widgets': rearrange(widgets),
         'can_create_event': request.user.teams.filter(can_create_events=True).exists(),
+        'event_series_creation_enabled': is_event_series_creation_enabled(request),
+        'meetup_creation_enabled': is_meetup_creation_enabled(request),
         'upcoming': widgets_for_event_qs(
             request,
             annotated_event_query(request, lazy=True)

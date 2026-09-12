@@ -35,18 +35,18 @@ from webauthn.helpers import generate_challenge
 
 from eventyay.base.auth import get_auth_backends
 from eventyay.base.forms.auth import (
+    PASSWORD_COMPLEXITY_ERROR,
     LoginForm,
     PasswordForgotForm,
     PasswordRecoverForm,
     RegistrationForm,
 )
 from eventyay.base.models import TeamInvite, U2FDevice, User, WebAuthnDevice
-from eventyay.base.models.page import Page
 from eventyay.base.services.mail import SendMailException
-from eventyay.base.settings import GlobalSettingsObject
 from eventyay.helpers.cookies import set_cookie_without_samesite
 from eventyay.helpers.jwt_generate import generate_sso_token
 from eventyay.multidomain.middlewares import get_cookie_domain
+
 
 logger = logging.getLogger(__name__)
 
@@ -65,12 +65,12 @@ def process_login(request, user, keep_logged_in):
     :return: This method returns a ``HttpResponse``.
     """
     request.session['eventyay_auth_long_session'] = settings.EVENTYAY_LONG_SESSIONS and keep_logged_in
-    
+
     # Check for socialauth_next_url (from OAuth flows) first, then fall back to backend's get_next_url
     next_url = request.session.pop('socialauth_next_url', None)
     if not next_url:
         next_url = get_auth_backends()[user.auth_backend].get_next_url(request)
-    
+
     if user.require_2fa:
         request.session['eventyay_auth_2fa_user'] = user.pk
         request.session['eventyay_auth_2fa_time'] = str(int(time.time()))
@@ -111,7 +111,7 @@ def set_cookie_after_logged_in(request, response):
             domain=get_cookie_domain(request),
             path=settings.CSRF_COOKIE_PATH,
             secure=request.scheme == 'https',
-            httponly=settings.CSRF_COOKIE_HTTPONLY,
+            httponly=True,
         )
     return response
 
@@ -152,8 +152,6 @@ def login(request):
     ctx['backends'] = backends
     ctx['backend'] = backend
 
-    gs = GlobalSettingsObject()
-    ctx['login_providers'] = gs.settings.get('login_providers', as_type=dict)
     return render(request, 'eventyay_common/auth/login.html', ctx)
 
 
@@ -163,7 +161,7 @@ def logout(request):
     """
     auth_logout(request)
     request.session['eventyay_auth_login_time'] = 0
-    next = reverse('eventyay_common:auth.login')
+    next = reverse('auth.login')
     if 'next' in request.GET and url_has_allowed_host_and_scheme(request.GET.get('next'), allowed_hosts=None):
         next += '?next=' + quote(request.GET.get('next'))
     if 'back' in request.GET and url_has_allowed_host_and_scheme(request.GET.get('back'), allowed_hosts=None):
@@ -171,46 +169,9 @@ def logout(request):
     return redirect(next)
 
 
-def register(request):
-    """
-    Render and process a basic registration form.
-    """
-    if not settings.EVENTYAY_REGISTRATION or 'native' not in get_auth_backends():
-        raise PermissionDenied('Registration is disabled')
-    ctx = {}
-    if request.user.is_authenticated:
-        return redirect(request.GET.get('next', 'eventyay_common:dashboard'))
-    if request.method == 'POST':
-        form = RegistrationForm(data=request.POST)
-        if form.is_valid():
-            user = User.objects.create_user(
-                form.cleaned_data['email'],
-                form.cleaned_data['password'],
-                locale=request.LANGUAGE_CODE,
-                timezone=request.timezone if hasattr(request, 'timezone') else settings.TIME_ZONE,
-            )
-            user = authenticate(
-                request=request,
-                email=user.email,
-                password=form.cleaned_data['password'],
-            )
-            user.log_action('eventyay.eventyay_common.auth.user.created', user=user)
-            auth_login(request, user)
-            request.session['eventyay_auth_login_time'] = int(time.time())
-            request.session['eventyay_auth_long_session'] = settings.EVENTYAY_LONG_SESSIONS and form.cleaned_data.get(
-                'keep_logged_in', False
-            )
-            response = redirect(request.GET.get('next', 'eventyay_common:dashboard'))
-            set_cookie_after_logged_in(request, response)
-            return response
-    else:
-        form = RegistrationForm()
-    ctx['form'] = form
-    ctx['confirmation_required'] = Page.objects.filter(confirmation_required=True)
-    return render(request, 'eventyay_common/auth/register.html', ctx)
 
 
-def invite(request, token):
+def invite(request: HttpRequest, token):
     """
     Registration form in case of an invite
     """
@@ -229,7 +190,7 @@ def invite(request, token):
                 'and make sure it is correct and that the link has not been used before.'
             ),
         )
-        return redirect('eventyay_common:auth.login')
+        return redirect('auth.login')
 
     if request.user.is_authenticated:
         if inv.team.members.filter(pk=request.user.pk).exists():
@@ -256,7 +217,7 @@ def invite(request, token):
             return redirect('eventyay_common:dashboard')
 
     if request.method == 'POST':
-        form = RegistrationForm(data=request.POST)
+        form = RegistrationForm(data=request.POST, request=request)
         with transaction.atomic():
             valid = form.is_valid()
             if valid:
@@ -296,6 +257,9 @@ def invite(request, token):
     else:
         form = RegistrationForm(initial={'email': inv.email})
     ctx['form'] = form
+    ctx['password_requirement'] = PASSWORD_COMPLEXITY_ERROR
+    pw_errors = form.errors.get('password', []) if hasattr(form, 'errors') else []
+    ctx['show_password_requirement_help'] = not any(str(e) == str(PASSWORD_COMPLEXITY_ERROR) for e in pw_errors)
     return render(request, 'eventyay_common/auth/invite.html', ctx)
 
 
@@ -347,7 +311,8 @@ class Forgot(TemplateView):
 
     @cached_property
     def form(self):
-        return PasswordForgotForm(data=self.request.POST if self.request.method == 'POST' else None)
+        data = self.request.POST if self.request.method == 'POST' else None
+        return PasswordForgotForm(data=data, request=self.request)
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -399,7 +364,7 @@ class Recover(TemplateView):
             user.save()
             messages.success(request, _('You can now login using your new password.'))
             user.log_action('eventyay.eventyay_common.auth.user.forgot_password.recovered')
-            return redirect('eventyay_common:auth.login')
+            return redirect('auth.login')
         else:
             return self.get(request, *args, **kwargs)
 
@@ -445,7 +410,7 @@ class Login2FAView(TemplateView):
             fail = True
         if fail:
             messages.error(request, _('Please try again.'))
-            return redirect('eventyay_common:auth.login')
+            return redirect('auth.login')
         return super().dispatch(request, *args, **kwargs)
 
     def post(self, request, *args, **kwargs):
@@ -561,7 +526,7 @@ class CustomAuthorizationView(AuthorizationView):
                 domain=get_cookie_domain(request),
                 path=settings.CSRF_COOKIE_PATH,
                 secure=request.scheme == 'https',
-                httponly=settings.CSRF_COOKIE_HTTPONLY,
+                httponly=True,
             )
         return response
 

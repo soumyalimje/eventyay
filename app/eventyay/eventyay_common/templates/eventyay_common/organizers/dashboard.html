@@ -1,0 +1,69 @@
+{% extends "eventyay_common/organizers/base.html" %}
+{% load i18n %}
+{% load static %}
+{% load compress %}
+
+{% block title %}{{ request.organizer.name }} — {% trans "Organizer Dashboard" %}{% endblock %}
+
+{% block custom_header %}
+  <link rel="stylesheet" type="text/css" href="{% static 'vendored/apexcharts/apexcharts.css' %}" />
+  {% compress css %}
+    <link rel="stylesheet" type="text/css" href="{% static 'eventyay-common/css/organizer-dashboard.css' %}" />
+  {% endcompress %}
+  {% compress js %}
+    <script defer src="{% static 'vendored/apexcharts/apexcharts.min.js' %}"></script>
+    <script defer src="{% static 'eventyay-common/js/organizer-analytics.js' %}"></script>
+  {% endcompress %}
+  <script type="module" src="{% static 'eventyay-common/js/organizer-dashboard-filters.js' %}"></script>
+{% endblock %}
+
+{% block inner %}
+  <div class="od-dashboard">
+    <header class="od-header">
+      <div>
+        <h1 class="od-header-title">
+          {% blocktrans with name=request.organizer.name %}{{ name }} Organizer Dashboard{% endblocktrans %}
+        </h1>
+        <p class="od-header-subtitle">{{ dashboard_subtitle }}</p>
+      </div>
+      <div class="od-header-actions">
+        <a class="od-btn" href="{{ public_profile_url }}" target="_blank" rel="noopener noreferrer">
+          <span class="fa fa-eye" aria-hidden="true"></span>
+          {% trans "View public profile" %}
+        </a>
+        {% if can_create_event %}
+          <a class="od-btn od-btn-primary" href="{{ create_event_url }}">
+            <span class="fa fa-plus" aria-hidden="true"></span>
+            {% trans "Create event" %}
+          </a>
+        {% endif %}
+        {% if can_change_organizer_settings %}
+          <a class="od-btn" href="{{ organizer_settings_url }}">
+            <span class="fa fa-cog" aria-hidden="true"></span>
+            {% trans "Organizer settings" %}
+          </a>
+        {% endif %}
+        <a class="od-btn od-btn-icon" href="?refresh=true" title="{% trans 'Refresh analytics' %}">
+          <span class="fa fa-refresh" aria-hidden="true"></span>
+          <span class="sr-only">{% trans "Refresh analytics" %}</span>
+        </a>
+      </div>
+    </header>
+
+    {% if is_onboarding %}
+      {% include "eventyay_common/organizers/includes/getting_started.html" %}
+    {% else %}
+      {% include "eventyay_common/organizers/includes/action_required.html" %}
+    {% endif %}
+
+    {% include "eventyay_common/organizers/includes/kpi_cards.html" %}
+    {% include "eventyay_common/organizers/includes/event_portfolio.html" %}
+    {% include "eventyay_common/organizers/includes/analytics.html" %}
+    {% include "eventyay_common/organizers/includes/organizer_tools.html" %}
+    {% include "eventyay_common/organizers/includes/recent_activity.html" %}
+
+    <p class="od-footer-note">
+      {% trans "Times displayed in your account timezone" %} · {% trans "powered by eventyay" %}
+    </p>
+  </div>
+{% endblock %}

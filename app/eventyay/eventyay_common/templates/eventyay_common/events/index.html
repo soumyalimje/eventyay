@@ -1,63 +1,85 @@
 {% extends "eventyay_common/base.html" %}
 {% load i18n %}
+{% load static %}
 {% load urlreplace %}
 {% load bootstrap3 %}
 {% block title %}{% trans "Events management" %}{% endblock %}
+
+{% block custom_header %}
+    {{ block.super }}
+{% endblock %}
+
 {% block content %}
     <h1>{% trans "Events" %}</h1>
     {% if events|length == 0 and not filter_form.filtered %}
-        <div class="empty-collection">
-            <p>
-                {% blocktrans trimmed %}
-                    You currently do not have access to any events.
-                {% endblocktrans %}
-            </p>
-
-            <a href='{% url "eventyay_common:events.add" %}' class="btn btn-primary btn-lg">
-                <span class="fa fa-plus"></span>
-                {% trans "Create a new event" %}
-            </a>
-        </div>
+        {% url 'eventyay_common:events.add' as create_event_url %}
+        {% trans "No events yet" as empty_title %}
+        {% trans "You currently do not have access to any events. Create one to get started." as empty_description %}
+        {% trans "Create Event" as empty_primary_label %}
+        
+        {% if event_series_creation_enabled %}
+            {% trans "Create Event Series" as series_label %}
+        {% endif %}
+        
+        {% if meetup_creation_enabled %}
+            {% trans "Create Meetup" as meetup_label %}
+        {% endif %}
+        
+        {% include "eventyay_common/includes/personal_empty_state.html" with icon="calendar" title=empty_title description=empty_description primary_url=create_event_url primary_label=empty_primary_label secondary_url=create_event_url|add:'?series=1' secondary_label=series_label tertiary_url=create_event_url|add:'?meetup=1' tertiary_label=meetup_label %}
     {% else %}
-        <div class="panel panel-default">
-            <div class="panel-heading">
-                <h3 class="panel-title">{% trans "Filter" %}</h3>
-            </div>
-            <div class="panel-body">
-                <form class="" action="" method="get">
-                    <div class="row filter-form">
-                        <div class="col-md-3 col-sm-6 col-xs-12">
-                            {% bootstrap_field filter_form.query layout='inline' %}
-                        </div>
-                        <div class="col-md-3 col-sm-6 col-xs-12">
-                            {% bootstrap_field filter_form.status layout='inline' %}
-                        </div>
-                        <div class="col-md-3 col-sm-6 col-xs-12">
-                            {% bootstrap_field filter_form.organizer layout='inline' %}
-                        </div>
-                        <div class="col-md-3 col-sm-6 col-xs-12">
-                            <div class="form-group" style="gap: 20px; display: flex;">
-                                <button class="btn btn-primary" type="submit">
-                                    <span class="fa fa-filter"></span>
-                                </button>
-                                <a href="?" class="btn btn-default">
-                                    <span class="fa fa-eraser"></span>
-                                </a>
-                            </div>
-                        </div>
+        <div class="advanced-filter-search" data-advanced-filter-search>
+            <form class="filter-form advanced-filter-search-form" action="" method="get">
+                <div class="advanced-filter-search-bar">
+                    <div class="input-group advanced-filter-search-query-group">
+                        <input id="id_query" type="text" name="query" class="form-control" placeholder="{% trans 'Search events…' %}" aria-label="{% trans 'Search events…' %}" value="{{ filter_form.query.value|default_if_none:'' }}">
+                        <span class="input-group-btn">
+                            <button class="btn btn-primary" type="submit">
+                                <span class="fa fa-search" aria-hidden="true"></span>
+                                {% trans "Search" %}
+                            </button>
+                        </span>
                     </div>
-                </form>
-            </div>
+                    <div class="advanced-filter-field advanced-filter-field--inline">
+                        {% bootstrap_field filter_form.status layout='inline' %}
+                    </div>
+                    <div class="advanced-filter-field advanced-filter-field--inline">
+                        {% bootstrap_field filter_form.organizer layout='inline' %}
+                    </div>
+                    <div class="advanced-filter-search-actions">
+                        <button class="btn btn-primary" type="submit">
+                            <span class="fa fa-filter" aria-hidden="true"></span>
+                            {% trans "Filter" %}
+                        </button>
+                        <a href="{{ request.path }}" class="btn btn-default btn-clear-filter" aria-label="{% trans 'Clear filters' %}" title="{% trans 'Clear filters' %}">
+                            <span class="fa fa-eraser" aria-hidden="true"></span>
+                            <span class="sr-only">{% trans "Clear filters" %}</span>
+                        </a>
+                    </div>
+                </div>
+            </form>
         </div>
-        <p>
-            <a href='{% url "eventyay_common:events.add" %}' class="btn btn-default">
-                <span class="fa fa-plus"></span>
-                {% trans "Create a new event" %}
-            </a>
-        </p>
-        <table class="table table-condensed table-hover">
-            <thead>
-            <tr>
+        <div data-ajax-results-region>
+            <p>
+                <a href='{% url "eventyay_common:events.add" %}' class="btn btn-default">
+                    <span class="fa fa-plus"></span>
+                    {% trans "Create Event" %}
+                </a>
+                {% if event_series_creation_enabled %}
+                <a href='{% url "eventyay_common:events.add" %}?series=1' class="btn btn-default">
+                    {% include "eventyay_common/includes/icon_calendar_series.html" %}
+                    {% trans "Create Event Series" %}
+                </a>
+                {% endif %}
+                {% if meetup_creation_enabled %}
+                <a href='{% url "eventyay_common:events.add" %}?meetup=1' class="btn btn-default">
+                    <span class="fa fa-users"></span>
+                    {% trans "Create Meetup" %}
+                </a>
+                {% endif %}
+            </p>
+            <table class="table table-condensed table-hover events-table">
+                <thead>
+                <tr>
                 <th>
                     {% trans "Event name" %}
                 </th>
@@ -91,17 +113,17 @@
                 <th class="text-right flip">
                     {% trans "Actions" %}
                 </th>
-            </tr>
-            </thead>
-            <tbody>
-            {% for e in events %}
-                <tr>
-                    <td class="event-name-col">
+                </tr>
+                </thead>
+                <tbody>
+                {% for e in events %}
+                    <tr>
+                    <td class="event-name-col" data-label="{% trans 'Event name' %}">
                         <strong><a href='{% url "eventyay_common:event.index" organizer=e.organizer.slug event=e.slug %}'>{{ e.name }}</a></strong>
                     </td>
-                    <td>{{ e.slug }}</td>
-                    <td>{{ e.organizer }}</td>
-                    <td class="event-date-col">
+                    <td data-label="{% trans 'Short form' %}">{{ e.slug }}</td>
+                    <td data-label="{% trans 'Organizer' %}">{{ e.organizer }}</td>
+                    <td class="event-date-col" data-label="{% trans 'Date' %}">
                         {% if e.has_subevents %}
                             {{ e.min_from|default_if_none:""|date:"SHORT_DATETIME_FORMAT" }}
                         {% else %}
@@ -122,7 +144,7 @@
                             <span class="fa fa-globe text-muted" data-toggle="tooltip" title="{{ e.timezone }}"></span>
                         {% endif %}
                     </td>
-                    <td>
+                    <td data-label="{% trans 'Paid tickets' %}">
                         {% for q in e.first_quotas|slice:":3" %}
                             {% include "pretixcontrol/fragment_quota_box_paid.html" with quota=q %}
                         {% endfor %}
@@ -134,7 +156,7 @@
                             </a>
                         {% endif %}
                     </td>
-                    <td>
+                    <td data-label="{% trans 'Shop' %}" class="events-table__cell--no-border">
                         {% if not e.live %}
                             <span class="label label-danger">{% trans "Shop disabled" %}</span>
                         {% elif e.presale_has_ended %}
@@ -146,23 +168,22 @@
                         {% endif %}
                     </td>
                     <td class="text-right flip">
-                        {% if 'pretix_venueless' in e.plugins_array %}
-                            <a href='{% url "eventyay_common:event.create_access_to_video" organizer=e.organizer.slug event=e.slug %}'
-                               class="btn btn-sm btn-default" title="{% trans "Enable video access" %}"
-                               data-toggle="tooltip">
-                                <span class="fa fa-video-camera"></span>
-                            </a>
-                        {% endif %}
+                        <a href='{% url "eventyay_common:event.create_access_to_video" organizer=e.organizer.slug event=e.slug %}'
+                           class="btn btn-sm btn-default" title="{% trans "Enable video access" %}"
+                           data-toggle="tooltip">
+                            <span class="fa fa-video-camera"></span>
+                        </a>
                         <a href='{% url "eventyay_common:event.update" organizer=e.organizer.slug event=e.slug %}'
                            class="btn btn-sm btn-default" title="{% trans "Edit" %}"
                            data-toggle="tooltip">
                             <span class="fa fa-edit"></span>
                         </a>
                     </td>
-                </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% include "pretixcontrol/pagination.html" %}
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% include "pretixcontrol/pagination.html" %}
+        </div>
     {% endif %}
 {% endblock %}

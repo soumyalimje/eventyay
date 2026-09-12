@@ -1,19 +1,23 @@
-import importlib.util
+import datetime
 import inspect
 import json
+import logging
 import mimetypes
 import os
 import re
 from collections import OrderedDict
-from importlib import import_module
 from decimal import Decimal
+from urllib.parse import urlparse, urlunparse
 
+import jwt
 from django import forms
 from django.conf import settings
 from django.contrib import messages
+from django.core.exceptions import PermissionDenied
 from django.core.files import File
 from django.db import transaction
 from django.db.models import Exists, OuterRef, Q, Sum
+from django.db.models.query import prefetch_related_objects
 from django.http import (
     FileResponse,
     Http404,
@@ -21,6 +25,7 @@ from django.http import (
     JsonResponse,
 )
 from django.shortcuts import get_object_or_404, redirect
+from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.utils.functional import cached_property
 from django.utils.timezone import now
@@ -38,6 +43,8 @@ from eventyay.base.models import (
     Quota,
     TaxRule,
 )
+from eventyay.common.views.helpers import build_login_url_with_next
+from eventyay.base.models.checkin import Checkin, CheckinList
 from eventyay.base.models.orders import (
     CachedCombinedTicket,
     InvoiceAddress,
@@ -47,6 +54,7 @@ from eventyay.base.models.orders import (
     QuestionAnswer,
 )
 from eventyay.base.payment import PaymentException
+from eventyay.base.services.checkin import perform_checkin
 from eventyay.base.services.invoices import (
     generate_cancellation,
     generate_invoice,
@@ -59,6 +67,7 @@ from eventyay.base.services.orders import (
     OrderChangeManager,
     OrderError,
     cancel_order,
+    cancel_order_positions,
     change_payment_provider,
 )
 from eventyay.base.services.pricing import get_price
@@ -71,6 +80,7 @@ from eventyay.base.signals import (
 from eventyay.base.templatetags.money import money_filter
 from eventyay.base.views.mixins import OrderQuestionsViewMixin
 from eventyay.base.views.tasks import AsyncAction
+from eventyay.eventyay_common.utils import encode_email
 from eventyay.helpers.safedownload import check_token
 from eventyay.multidomain.urlreverse import build_absolute_uri, eventreverse
 from eventyay.presale.forms.checkout import InvoiceAddressForm, QuestionsForm
@@ -84,12 +94,39 @@ from eventyay.presale.views import (
 from eventyay.presale.views.robots import NoSearchIndexViewMixin
 
 
-package_name = 'pretix_venueless'
+logger = logging.getLogger(__name__)
 
-if importlib.util.find_spec(package_name) is not None:
-    pretix_venueless = import_module(package_name)
-else:
-    pretix_venueless = None
+
+def record_video_join_checkin(event, position, include_pending):
+    """Record video-join check-in without blocking repeat JWT redirects."""
+    list_name = gettext('Eventyay Video')
+    if Checkin.objects.filter(
+        position_id=position.pk,
+        list__event=event,
+        list__name=list_name,
+        type=Checkin.TYPE_ENTRY,
+    ).exists():
+        return
+
+    cl = CheckinList.objects.get_or_create(
+        event=event,
+        subevent=position.subevent,
+        name=list_name,
+        defaults={
+            'all_products': True,
+            'include_pending': include_pending,
+        },
+    )[0]
+    try:
+        perform_checkin(position, cl, {})
+    except Exception:
+        logger.exception(
+            'Error during Eventyay Video check-in',
+            extra={
+                'event_id': getattr(event, 'id', None),
+                'position_id': getattr(position, 'id', None),
+            },
+        )
 
 
 class OrderDetailMixin(NoSearchIndexViewMixin):
@@ -126,7 +163,19 @@ class OrderPositionDetailMixin(NoSearchIndexViewMixin):
                 order__code=self.kwargs['order'],
                 positionid=self.kwargs['position'],
             )
-            .select_related('order', 'order__event')
+            .select_related(
+                'order',
+                'order__event',
+                'product',
+                'product__category',
+                'variation',
+                'subevent',
+            )
+            .prefetch_related(
+                'addons',
+                'addons__product',
+                'addons__variation',
+            )
             .first()
         )
         if p:
@@ -134,16 +183,135 @@ class OrderPositionDetailMixin(NoSearchIndexViewMixin):
                 return p
             else:
                 return None
-        else:
-            # Do a comparison as well to harden timing attacks
-            if 'abcdefghijklmnopq'.lower() == self.kwargs['secret'].lower():
-                return None
-            else:
-                return None
 
     @cached_property
     def order(self):
         return self.position.order if self.position else None
+
+class OrderProtectedActionMixin:
+    def dispatch(self, request, *args, **kwargs):
+        self.request = request
+        order = getattr(self, 'order', None)
+        position = getattr(self, 'position', None)
+
+        if order is None and position:
+            order = position.order
+
+        if not request.user.is_authenticated:
+            return redirect(build_login_url_with_next(request.get_full_path()))
+
+        if order:
+            user_email = (request.user.email or '').lower()
+            allowed_emails = {(order.email or '').lower()}
+
+            if position and position.attendee_email:
+                allowed_emails.add(position.attendee_email.lower())
+
+            allowed_emails.discard('')
+
+            if user_email not in allowed_emails:
+                raise PermissionDenied(_('You are not authorized to access this order.'))
+
+        return super().dispatch(request, *args, **kwargs)
+
+
+@method_decorator(xframe_options_exempt, 'dispatch')
+class OrderPositionJoin(OrderProtectedActionMixin, EventViewMixin, OrderPositionDetailMixin, View):
+    """Generate a video access token for a specific order position and redirect to the Video SPA.
+
+    This used to live in the old ticket-video plugin; video is now integrated.
+    """
+
+    def post(self, request, *args, **kwargs):
+        if not self.position:
+            raise Http404(_('Unknown order code or not authorized to access this order.'))
+
+        forbidden = (
+            (self.order.status != Order.STATUS_PAID and not (self.order.status == Order.STATUS_PENDING and request.event.settings.venueless_allow_pending))
+            or self.position.canceled
+            or not self.position.product.admission
+        )
+        if forbidden:
+            raise PermissionDenied()
+
+        if request.event.settings.venueless_start and request.event.settings.venueless_start.datetime(
+            self.position.subevent or request.event
+        ) > now():
+            raise PermissionDenied()
+
+        iat = datetime.datetime.now(datetime.timezone.utc)
+        exp = iat + datetime.timedelta(days=30)
+        profile = {'fields': {}}
+        if self.position.attendee_name:
+            profile['display_name'] = self.position.attendee_name
+        if self.position.company:
+            profile['fields']['company'] = self.position.company
+
+        for a in self.position.answers.filter(question_id__in=request.event.settings.venueless_questions).select_related('question'):
+            profile['fields'][a.question.identifier] = a.answer
+
+        uid_token = encode_email(self.order.email) if self.order.email else self.position.pseudonymization_id
+
+        payload = {
+            'iss': request.event.settings.venueless_issuer,
+            'aud': request.event.settings.venueless_audience,
+            'exp': exp,
+            'iat': iat,
+            'uid': uid_token,
+            'profile': profile,
+            'traits': list(
+                {
+                    'attendee',
+                    f'eventyay-video-event-{request.event.slug}',
+                    f'eventyay-video-subevent-{self.position.subevent_id}',
+                    f'eventyay-video-product-{self.position.product_id}',
+                    f'eventyay-video-variation-{self.position.variation_id}',
+                    f'eventyay-video-category-{self.position.product.category_id}',
+                }
+                | {f'eventyay-video-product-{p.product_id}' for p in self.position.addons.all()}
+                | {f'eventyay-video-variation-{p.variation_id}' for p in self.position.addons.all() if p.variation_id}
+                | {
+                    f'eventyay-video-category-{p.product.category_id}'
+                    for p in self.position.addons.all()
+                    if p.product.category_id
+                }
+            ),
+        }
+
+        token = jwt.encode(payload, request.event.settings.venueless_secret, algorithm='HS256')
+
+        record_video_join_checkin(
+            request.event,
+            self.position,
+            request.event.settings.venueless_allow_pending,
+        )
+
+        if kwargs.get('view_schedule') == 'True':
+            redirect_url = request.event.settings.venueless_talk_schedule_url
+            logger.info('Redirecting to %s...', redirect_url)
+            return redirect(redirect_url)
+
+        baseurl = request.event.settings.venueless_url
+        if '{token}' in baseurl:
+            redirect_url = baseurl.format(token=token)
+            logger.info('Redirecting to %s...', redirect_url)
+            return redirect(redirect_url)
+
+        # Ensure the URL includes the event identifier so VideoSPAView has event context.
+        video_path = reverse(
+            'video.spa',
+            kwargs={
+                'organizer': request.event.organizer.slug,
+                'event': request.event.slug,
+            },
+        )
+        parsed = urlparse(str(baseurl))
+        baseurl = urlunparse((parsed.scheme, parsed.netloc, video_path, '', '', ''))
+
+        redirect_url = f'{baseurl}/#token={token}'.replace('//#', '/#')
+        logger.info('Redirecting to %s...', redirect_url)
+        return redirect(redirect_url)
+
 
     def get_position_url(self):
         return eventreverse(
@@ -199,7 +367,7 @@ class TicketPageMixin:
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class OrderDetails(EventViewMixin, OrderDetailMixin, CartMixin, TicketPageMixin, TemplateView):
+class OrderDetails(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, CartMixin, TicketPageMixin, TemplateView):
     template_name = 'pretixpresale/event/order.html'
 
     def get(self, request, *args, **kwargs):
@@ -303,30 +471,22 @@ class OrderDetails(EventViewMixin, OrderDetailMixin, CartMixin, TicketPageMixin,
         ).exclude(provider__in=('offsetting', 'reseller', 'boxoffice', 'manual'))
         ctx['user_change_allowed'] = self.order.user_change_allowed
         ctx['user_cancel_allowed'] = self.order.user_cancel_allowed
+        ctx['user_partial_cancel_allowed'] = self.order.user_partial_cancel_allowed
+        canceled_positions_qs = self.order.all_positions.filter(canceled=True, addon_to__isnull=True)
+        ctx['canceled_position_count'] = canceled_positions_qs.count()
         for r in ctx['refunds']:
             if r.provider == 'giftcard':
                 gc = GiftCard.objects.get(pk=r.info_data.get('gift_card'))
                 r.giftcard = gc
-        
+
         ctx['viewer_email'] = self.request.user.email if self.request.user.is_authenticated else ''
         ctx['can_modify_order'] = self.order.is_modification_allowed_by(ctx.get('viewer_email'))
-
-        ctx['is_video_plugin_enabled'] = False
-        if (
-            getattr(
-                getattr(getattr(pretix_venueless, 'apps', None), 'PluginApp', None),
-                'name',
-                None,
-            )
-            in self.request.event.get_plugins()
-        ):
-            ctx['is_video_plugin_enabled'] = True
 
         return ctx
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class OrderPositionDetails(EventViewMixin, OrderPositionDetailMixin, CartMixin, TicketPageMixin, TemplateView):
+class OrderPositionDetails(OrderProtectedActionMixin, EventViewMixin, OrderPositionDetailMixin, CartMixin, TicketPageMixin, TemplateView):
     template_name = 'pretixpresale/event/position.html'
 
     def get(self, request, *args, **kwargs):
@@ -375,7 +535,7 @@ class OrderPositionDetails(EventViewMixin, OrderPositionDetailMixin, CartMixin, 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
 @method_decorator(iframe_entry_view_wrapper, 'dispatch')
-class OrderPaymentStart(EventViewMixin, OrderDetailMixin, TemplateView):
+class OrderPaymentStart(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, TemplateView):
     """
     This is used if a payment is retried or the payment method is changed. It shows the payment
     provider's form that asks for payment details (e.g. CC number).
@@ -404,8 +564,8 @@ class OrderPaymentStart(EventViewMixin, OrderDetailMixin, TemplateView):
 
     def post(self, request, *args, **kwargs):
         resp = self.payment.payment_provider.payment_prepare(request, self.payment)
-        if 'payment_change_{}'.format(self.order.pk) in request.session:
-            del request.session['payment_change_{}'.format(self.order.pk)]
+        if f'payment_change_{self.order.pk}' in request.session:
+            del request.session[f'payment_change_{self.order.pk}']
         if isinstance(resp, str):
             return redirect(resp)
         elif resp is True:
@@ -445,7 +605,7 @@ class OrderPaymentStart(EventViewMixin, OrderDetailMixin, TemplateView):
 
 @method_decorator(xframe_options_exempt, 'dispatch')
 @method_decorator(iframe_entry_view_wrapper, 'dispatch')
-class OrderPaymentConfirm(EventViewMixin, OrderDetailMixin, TemplateView):
+class OrderPaymentConfirm(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, TemplateView):
     """
     This is used if a payment is retried or the payment method is changed. It is shown after the
     payment details have been entered and allows the user to confirm and review the details. On
@@ -493,8 +653,8 @@ class OrderPaymentConfirm(EventViewMixin, OrderDetailMixin, TemplateView):
         except PaymentException as e:
             messages.error(request, str(e))
             return redirect(self.get_order_url())
-        if 'payment_change_{}'.format(self.order.pk) in request.session:
-            del request.session['payment_change_{}'.format(self.order.pk)]
+        if f'payment_change_{self.order.pk}' in request.session:
+            del request.session[f'payment_change_{self.order.pk}']
         return redirect(resp or self.get_order_url())
 
     def get_context_data(self, **kwargs):
@@ -521,7 +681,7 @@ class OrderPaymentConfirm(EventViewMixin, OrderDetailMixin, TemplateView):
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class OrderPaymentComplete(EventViewMixin, OrderDetailMixin, View):
+class OrderPaymentComplete(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, View):
     """
     This is used for the first try of a payment. This means the user just entered payment
     details and confirmed them during the order process and we don't need to show them again,
@@ -578,7 +738,7 @@ class OrderPaymentComplete(EventViewMixin, OrderDetailMixin, View):
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class OrderPayChangeMethod(EventViewMixin, OrderDetailMixin, TemplateView):
+class OrderPayChangeMethod(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, TemplateView):
     template_name = 'pretixpresale/event/order_pay_change.html'
 
     def dispatch(self, request, *args, **kwargs):
@@ -699,7 +859,7 @@ class OrderPayChangeMethod(EventViewMixin, OrderDetailMixin, TemplateView):
         for p in self.provider_forms:
             if p['provider'].identifier == request.POST.get('payment', ''):
                 request.session['payment'] = p['provider'].identifier
-                request.session['payment_change_{}'.format(self.order.pk)] = '1'
+                request.session[f'payment_change_{self.order.pk}'] = '1'
 
                 with transaction.atomic():
                     old_fee, new_fee, fee, newpayment = change_payment_provider(self.order, p['provider'], None)
@@ -756,7 +916,7 @@ def can_generate_invoice(event, order, ignore_payments=False):
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class OrderInvoiceCreate(EventViewMixin, OrderDetailMixin, View):
+class OrderInvoiceCreate(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, View):
     def dispatch(self, request, *args, **kwargs):
         self.request = request
         if not self.order:
@@ -776,7 +936,7 @@ class OrderInvoiceCreate(EventViewMixin, OrderDetailMixin, View):
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class OrderModify(EventViewMixin, OrderDetailMixin, OrderQuestionsViewMixin, TemplateView):
+class OrderModify(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, OrderQuestionsViewMixin, TemplateView):
     form_class = QuestionsForm
     invoice_form_class = InvoiceAddressForm
     template_name = 'pretixpresale/event/order_modify.html'
@@ -879,8 +1039,98 @@ class OrderModify(EventViewMixin, OrderDetailMixin, OrderQuestionsViewMixin, Tem
         return super().dispatch(request, *args, **kwargs)
 
 
+class OrderPositionCancelMixin:
+    def get_cancel_positions_url(self):
+        return eventreverse(
+            self.request.event,
+            'presale:event.order.cancel.positions',
+            kwargs={'order': self.order.code, 'secret': self.order.secret},
+        )
+
+
 @method_decorator(xframe_options_exempt, 'dispatch')
-class OrderCancel(EventViewMixin, OrderDetailMixin, TemplateView):
+class OrderPositionCancel(OrderProtectedActionMixin, OrderPositionCancelMixin, EventViewMixin, OrderDetailMixin, TemplateView):
+    template_name = 'pretixpresale/event/order_cancel_positions.html'
+
+    def dispatch(self, request, *args, **kwargs):
+        if not self.order:
+            raise Http404(_('Unknown order code or not authorized to access this order.'))
+        if not self.order.user_partial_cancel_allowed:
+            messages.error(request, _('You cannot cancel individual tickets in this order.'))
+            return redirect(self.get_order_url())
+        return super().dispatch(request, *args, **kwargs)
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        positions = self.order.user_cancelable_positions
+        prefetch_related_objects(positions, 'variation', 'addon_to', 'addons')
+        positions = sorted(positions, key=lambda p: p.positionid)
+
+        position_rows = []
+        for position in positions:
+            addons = [a for a in position.addons.all() if not a.canceled]
+            position_total = position.price + sum(addon.price for addon in addons)
+            cancellation_fee = self.order.user_partial_cancel_fee(position_total)
+            position_rows.append(
+                {
+                    'position': position,
+                    'position_total': position_total,
+                    'cancellation_fee': cancellation_fee,
+                    'refund_amount': position_total - cancellation_fee,
+                    'addons': addons,
+                }
+            )
+
+        ctx['order'] = self.order
+        ctx['position_rows'] = position_rows
+        ctx['is_paid_order'] = self.order.status == Order.STATUS_PAID and self.order.total != Decimal('0.00')
+        return ctx
+
+
+@method_decorator(xframe_options_exempt, 'dispatch')
+class OrderPositionCancelDo(OrderProtectedActionMixin, OrderPositionCancelMixin, EventViewMixin, OrderDetailMixin, AsyncAction, View):
+    task = cancel_order_positions
+    known_errortypes = ['OrderError']
+
+    def get_success_url(self, value):
+        return self.get_order_url()
+
+    def get_error_url(self):
+        return self.get_cancel_positions_url()
+
+    def post(self, request, *args, **kwargs):
+        if not self.order:
+            raise Http404(_('Unknown order code or not authorized to access this order.'))
+        if not self.order.user_partial_cancel_allowed:
+            messages.error(request, _('You cannot cancel individual tickets in this order.'))
+            return redirect(self.get_order_url())
+
+        position_ids = request.POST.getlist('positions')
+        if not position_ids:
+            messages.error(request, _('Please select at least one ticket to cancel.'))
+            return redirect(self.get_cancel_positions_url())
+
+        giftcard = self.request.event.settings.cancel_allow_user_paid_refund_as_giftcard == 'force' or (
+            self.request.event.settings.cancel_allow_user_paid_refund_as_giftcard == 'option'
+            and self.request.POST.get('giftcard') == 'true'
+        )
+        comment = gettext('Canceled by customer (partial)')
+
+        return self.do(
+            self.order.pk,
+            position_ids=position_ids,
+            user=self.request.user.pk if self.request.user.is_authenticated else None,
+            try_auto_refund=True,
+            refund_as_giftcard=giftcard,
+            comment=comment,
+        )
+
+    def get_success_message(self, value):
+        return _('The selected tickets have been canceled.')
+
+
+@method_decorator(xframe_options_exempt, 'dispatch')
+class OrderCancel(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, TemplateView):
     template_name = 'pretixpresale/event/order_cancel.html'
 
     def dispatch(self, request, *args, **kwargs):
@@ -921,7 +1171,7 @@ class OrderCancel(EventViewMixin, OrderDetailMixin, TemplateView):
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class OrderCancelDo(EventViewMixin, OrderDetailMixin, AsyncAction, View):
+class OrderCancelDo(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, AsyncAction, View):
     task = cancel_order
     known_errortypes = ['OrderError']
 
@@ -997,7 +1247,8 @@ class OrderCancelDo(EventViewMixin, OrderDetailMixin, AsyncAction, View):
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class AnswerDownload(EventViewMixin, OrderDetailMixin, View):
+@method_decorator(xframe_options_exempt, 'dispatch')
+class AnswerDownload(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, View):
     def get(self, request, *args, **kwargs):
         answid = kwargs.get('answer')
         token = request.GET.get('token', '')
@@ -1095,20 +1346,11 @@ class OrderDownloadMixin:
                         value.extension,
                     )
                 else:
-                    resp['Content-Disposition'] = 'attachment; filename="{}-{}-{}{}"'.format(
-                        self.request.event.slug.upper(),
-                        self.order.code,
-                        self.order_position.positionid,
-                        value.extension,
-                    )
+                    resp['Content-Disposition'] = f'attachment; filename="{self.request.event.slug.upper()}-{self.order.code}-{self.order_position.positionid}{value.extension}"'
                 return resp
         elif isinstance(value, CachedCombinedTicket):
             resp = FileResponse(value.file.file, content_type=value.type)
-            resp['Content-Disposition'] = 'attachment; filename="{}-{}{}"'.format(
-                self.request.event.slug.upper(),
-                self.order.code,
-                value.extension,
-            )
+            resp['Content-Disposition'] = f'attachment; filename="{self.request.event.slug.upper()}-{self.order.code}{value.extension}"'
             return resp
         else:
             return redirect(self.get_self_url())
@@ -1130,7 +1372,7 @@ class OrderDownloadMixin:
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class OrderDownload(OrderDownloadMixin, EventViewMixin, OrderDetailMixin, AsyncAction, View):
+class OrderDownload(OrderProtectedActionMixin, OrderDownloadMixin, EventViewMixin, OrderDetailMixin, AsyncAction, View):
     task = generate
     known_errortypes = ['OrderError']
 
@@ -1153,7 +1395,7 @@ class OrderDownload(OrderDownloadMixin, EventViewMixin, OrderDetailMixin, AsyncA
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class OrderPositionDownload(OrderDownloadMixin, EventViewMixin, OrderPositionDetailMixin, AsyncAction, View):
+class OrderPositionDownload(OrderProtectedActionMixin, OrderDownloadMixin, EventViewMixin, OrderPositionDetailMixin, AsyncAction, View):
     task = generate
     known_errortypes = ['OrderError']
 
@@ -1178,7 +1420,7 @@ class OrderPositionDownload(OrderDownloadMixin, EventViewMixin, OrderPositionDet
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class InvoiceDownload(EventViewMixin, OrderDetailMixin, View):
+class InvoiceDownload(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, View):
     def get(self, request, *args, **kwargs):
         if not self.order:
             raise Http404(_('Unknown order code or not authorized to access this order.'))
@@ -1212,13 +1454,13 @@ class InvoiceDownload(EventViewMixin, OrderDetailMixin, View):
         except FileNotFoundError:
             invoice_pdf_task.apply(args=(invoice.pk,))
             return self.get(request, *args, **kwargs)
-        resp['Content-Disposition'] = 'inline; filename="{}.pdf"'.format(invoice.number)
+        resp['Content-Disposition'] = f'inline; filename="{invoice.number}.pdf"'
         resp._csp_ignore = True  # Some browser's PDF readers do not work with CSP
         return resp
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
-class OrderChange(EventViewMixin, OrderDetailMixin, TemplateView):
+class OrderChange(OrderProtectedActionMixin, EventViewMixin, OrderDetailMixin, TemplateView):
     template_name = 'pretixpresale/event/order_change.html'
 
     def dispatch(self, request, *args, **kwargs):
@@ -1265,7 +1507,7 @@ class OrderChange(EventViewMixin, OrderDetailMixin, TemplateView):
             ia = None
         for p in positions:
             p.form = OrderPositionChangeForm(
-                prefix='op-{}'.format(p.pk),
+                prefix=f'op-{p.pk}',
                 instance=p,
                 invoice_address=ia,
                 event=self.request.event,

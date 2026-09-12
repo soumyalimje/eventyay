@@ -4,7 +4,29 @@ var async_task_timeout = null;
 var async_task_check_url = null;
 var async_task_old_url = null;
 var async_task_is_download = false;
+var async_task_is_print = false;
 var async_task_is_long = false;
+var async_task_restored = false;
+
+function _restore_async_old_url_once() {
+    "use strict";
+    if (async_task_restored) {
+        return;
+    }
+    if (async_task_old_url && location.href.indexOf("async_id") !== -1) {
+        try {
+            history.replaceState({}, "pretix", async_task_old_url);
+        } catch (e) {
+            // Log failures to manipulate history for diagnostics (CSP, private mode, etc.)
+            try {
+                console.debug('async_task: failed to restore history URL', e);
+            } catch (_) {
+                // ignore if console is unavailable
+            }
+        }
+        async_task_restored = true;
+    }
+}
 
 function async_task_check() {
     "use strict";
@@ -23,11 +45,27 @@ function async_task_check() {
 function async_task_check_callback(data, jqXHR, status) {
     "use strict";
     if (data.ready && data.redirect) {
+        waitingDialog.hide();
+        ajaxErrDialog.hide();
         if (async_task_is_download && data.success) {
-            waitingDialog.hide();
-            if (location.href.indexOf("async_id") !== -1) {
-                history.replaceState({}, "pretix", async_task_old_url);
+            _restore_async_old_url_once();
+        }
+        if (async_task_is_print && data.success) {
+            _restore_async_old_url_once();
+            var $iframe = $("#print-iframe");
+            if ($iframe.length === 0) {
+                $iframe = $('<iframe id="print-iframe" style="visibility:hidden; position:absolute; width:1px; height:1px; left:-9999px;"></iframe>');
+                $("body").append($iframe);
             }
+            $iframe.off("load").on("load", function() {
+                try {
+                    this.contentWindow.print();
+                } catch(e) {
+                    console.log("Could not auto-print: ", e);
+                }
+            });
+            $iframe.attr("src", data.redirect);
+            return;
         }
         location.href = data.redirect;
         return;
@@ -76,9 +114,7 @@ function async_task_check_error(jqXHR, textStatus, errorThrown) {
         // This is some kind of 500/404/403 page, show it in an overlay
         $("body").data('ajaxing', false);
         waitingDialog.hide();
-        if (location.href.indexOf("async_id") !== -1) {
-            history.replaceState({}, "pretix", async_task_old_url);
-        }
+        _restore_async_old_url_once();
         ajaxErrDialog.show(c.first().html());
     } else {
         if (jqXHR.status >= 400 && jqXHR.status < 500) {
@@ -97,12 +133,33 @@ function async_task_check_error(jqXHR, textStatus, errorThrown) {
 function async_task_callback(data, jqXHR, status) {
     "use strict";
     $("body").data('ajaxing', false);
+    ajaxErrDialog.hide();
     if (data.redirect) {
+        waitingDialog.hide();
         if (async_task_is_download && data.success) {
-            waitingDialog.hide();
-            if (location.href.indexOf("async_id") !== -1) {
-                history.replaceState({}, "pretix", async_task_old_url);
+            _restore_async_old_url_once();
+        }
+        // If we pushed a waiting state earlier, restore the original
+        // URL before navigating to the redirect target so the browser's
+        // back/forward history behaves as expected.
+        if (location.href.indexOf("async_id") !== -1) {
+            history.replaceState({}, "pretix", async_task_old_url);
+        }
+        if (async_task_is_print && data.success) {
+            var $iframe = $("#print-iframe");
+            if ($iframe.length === 0) {
+                $iframe = $('<iframe id="print-iframe" style="visibility:hidden; position:absolute; width:1px; height:1px; left:-9999px;"></iframe>');
+                $("body").append($iframe);
             }
+            $iframe.off("load").on("load", function() {
+                try {
+                    this.contentWindow.print();
+                } catch(e) {
+                    console.log("Could not auto-print: ", e);
+                }
+            });
+            $iframe.attr("src", data.redirect);
+            return;
         }
         location.href = data.redirect;
         return;
@@ -184,22 +241,30 @@ $(function () {
     "use strict";
     $("body").on('submit', 'form[data-asynctask]', function (e) {
         e.preventDefault();
-        $(this).removeClass("dirty");  // Avoid problems with are-you-sure.js
+        var $form = $(this);
+        $form.removeClass("dirty");  // Avoid problems with are-you-sure.js
         if ($("body").data('ajaxing')) {
             return;
         }
         async_task_id = null;
-        async_task_is_download = $(this).is("[data-asynctask-download]");
-        async_task_is_long = $(this).is("[data-asynctask-long]");
+        async_task_is_download = $form.is("[data-asynctask-download]");
+        async_task_is_print = $form.is("[data-asynctask-print]");
+        async_task_is_long = $form.is("[data-asynctask-long]");
         async_task_old_url = location.href;
         $("body").data('ajaxing', true);
-        if ($(this).is("[data-asynctask-headline]")) {
-            waitingDialog.show($(this).attr("data-asynctask-headline"));
+        ajaxErrDialog.hide();
+        // Clear only validation errors rendered by the shared form error partials.
+        var $validationAlerts = $form.find(".alert-danger[data-validation-error='true']");
+        $validationAlerts.fadeOut('fast', function () {
+            $(this).remove();
+        });
+        if ($form.is("[data-asynctask-headline]")) {
+            waitingDialog.show($form.attr("data-asynctask-headline"));
         } else {
             waitingDialog.show(gettext('We are processing your request …'));
         }
-        if ($(this).is("[data-asynctask-text]")) {
-            $("#loadingmodal p.text").text($(this).attr("data-asynctask-text")).show();
+        if ($form.is("[data-asynctask-text]")) {
+            $("#loadingmodal p.text").text($form.attr("data-asynctask-text")).show();
         } else {
             $("#loadingmodal p.text").hide();
         }
@@ -212,8 +277,8 @@ $(function () {
         $.ajax(
             {
                 'type': 'POST',
-                'url': $(this).attr('action'),
-                'data': $(this).serialize() + '&ajax=1',
+                'url': $form.attr('action'),
+                'data': $form.serialize() + '&ajax=1',
                 'success': async_task_callback,
                 'error': async_task_error,
                 'context': this,
@@ -248,5 +313,6 @@ var ajaxErrDialog = {
     hide: function () {
         "use strict";
         $("body").removeClass("ajaxerr");
+        $("#ajaxerr").html("");
     }
 };

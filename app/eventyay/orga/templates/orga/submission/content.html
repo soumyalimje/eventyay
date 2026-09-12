@@ -2,109 +2,301 @@
 
 {% load compress %}
 {% load filesize %}
-{% load formset_tags %}
 {% load staff_session %}
 {% load i18n %}
 {% load static %}
 {% load rules %}
+{% load rich_text %}
 
-{% block scripts %}
+{% block stylesheets %}
     {{ block.super }}
-    {% compress js %}
-        <script defer src="{% static "js/jquery.js" %}"></script>
-        <script defer src="{% static "js/jquery.formset.js" %}"></script>
-        <script defer src="{% static "cfp/js/animateFormset.js" %}"></script>
-        <script defer src="{% static "orga/js/speakers.js" %}"></script>
-        <script defer src="{% static "orga/js/submission_form.js" %}"></script>
+    {% compress css %}
+        <link rel="stylesheet" href="{% static 'orga/css/submission_content.css' %}">
     {% endcompress %}
-{% endblock scripts %}
+{% endblock stylesheets %}
 
 {% block submission_content %}
     {% has_event_perm "base.send_queuedmail" request.user request request.event as can_send_mails %}
     {% has_event_perm "base.list_all_review" request.user request request.event as can_view_all_reviews %}
-    <form method="post" enctype="multipart/form-data">
-        <fieldset>
-            {% if not submission %}
-                <div id="main-title" class="d-md-flex justify-content-between">
-                    <h2>{% translate "Create proposal" %}</h2>
-                    {% include "orga/event/component_link.html" %}
+    {% has_event_perm "base.update_submission" request.user request submission as can_edit_submission %}
+    {% has_event_perm "base.orga_list_speakerprofile" request.user request request.event as can_view_speakers %}
+
+    {% if submission.access_code %}
+        <div class="alert alert-info">
+            <span></span>
+            <span>
+                {% blocktranslate trimmed %}
+                    This proposal was created using an access code:
+                {% endblocktranslate %}
+                <a href="{{ submission.access_code.urls.edit }}">{{ submission.access_code.code }}</a>
+            </span>
+        </div>
+    {% endif %}
+
+    <div class="submission-content-view">
+        <div class="form-group row">
+            <label class="col-md-3 col-form-label">{% translate "Proposal title" %}</label>
+            <div class="col-md-9">
+                <strong class="submission-title-with-track">
+                    <span class="color-square" style="--track-color: {{ submission.track.color|default:'#cccccc' }}"{% if submission.track %} title="{{ submission.track.name }}"{% endif %}></span>
+                    <span>{{ submission.title }}</span>
+                </strong>
+            </div>
+        </div>
+
+        <div class="form-group row">
+            <label class="col-md-3 col-form-label">{% translate "Session type" %}</label>
+            <div class="col-md-9">
+                {{ submission.submission_type }}
+            </div>
+        </div>
+
+        {% if submission.track %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Track" %}</label>
+                <div class="col-md-9">
+                    {{ submission.track.name }}
                 </div>
-            {% endif %}
+            </div>
+        {% endif %}
 
-            {% if submission.access_code %}
-                <div class="alert alert-info"><span></span><span>
-                    {% blocktranslate trimmed %}
-                        This proposal was created using an access code:
-                    {% endblocktranslate %} <a href="{{ submission.access_code.urls.edit }}">{{ submission.access_code.code }}</a>
-                </span></div>
-            {% endif %}
-            {% include "common/forms/errors.html" %}
-            {% csrf_token %}
-
-            {{ form.title.as_field_group }}
-
-            {% if action == "create" %}
-                {{ form.state.as_field_group }}
-                </fieldset>
-                <fieldset>
-                    <legend id="speaker">{% translate "Speaker" %}</legend>
-                    {{ new_speaker_form }}
-                </fieldset>
-                <fieldset>
-                    <legend id="proposal">{% translate "Proposal" %}</legend>
-            {% endif %}
-            {% if form.room %}
-                <div id="show-if-state" {% if action == "create" %}class="d-none"{% endif %}>
-                    {{ form.room.as_field_group }}
-                    {{ form.start.as_field_group }}
-                    {{ form.end.as_field_group }}
+        <div class="form-group row">
+            <label class="col-md-3 col-form-label">{% translate "Tags" %}</label>
+            <div class="col-md-9 submission-tags-row">
+                <div id="submission-tags-display" class="submission-tags-display" data-no-tags-label="{% translate 'No tags' %}">
+                    {% if submission.tags.all %}
+                        {% for tag in submission.tags.all %}
+                            <span class="badge mr-1 mb-1 {% if tag.foreground_color == 'white' %}text-white{% elif tag.foreground_color == 'black' %}text-dark{% endif %}" {% if tag.color %}style="--tag-color: {{ tag.color }}"{% endif %} data-tag-id="{{ tag.id }}">{{ tag.tag }}</span>
+                        {% endfor %}
+                    {% else %}
+                        <span class="text-muted" id="no-tags-text">{% translate "No tags" %}</span>
+                    {% endif %}
                 </div>
-            {% endif %}
-            {% if form.instance.median_score != None and can_view_all_reviews %}
-                <div class="form-group row">
-                    <label class="col-md-3 col-form-label">
-                        {% translate "Reviews" %}
-                    </label>
-                    <div class="col-md-9">
-                        <div class="pt-2">
-                            {{ submission.reviews.count }} {% translate "reviews" %}
+                {% if can_edit_submission %}
+                    {{ available_tags_json|json_script:"submission-tags-data" }}
+                    <details
+                        class="dropdown d-inline-block"
+                        id="tags-dropdown"
+                        aria-haspopup="menu"
+                        role="menu"
+                        data-tags-api="{{ request.event.api_urls.tags }}"
+                        data-submission-api="{{ request.event.api_urls.submissions }}{{ submission.code }}/"
+                        data-csrf-token="{{ csrf_token }}"
+                        data-no-tags-label="{% translate 'No tags' %}"
+                        data-no-match-label="{% translate 'No matching tags found' %}"
+                        data-default-color="#17a2b8"
+                    >
+                        <summary class="btn btn-sm btn-outline-info" role="button" title="{% translate 'Manage tags' %}" aria-label="{% translate 'Manage tags' %}">
+                            <i class="fa fa-plus" aria-hidden="true"></i>
+                        </summary>
+                        <div class="dropdown-content tags-dropdown-menu dropdown-content-s{% if rtl %}e{% else %}w{% endif %}">
+                            <div class="tags-dropdown-header">
+                                {% translate 'Manage tags' %}
+                            </div>
+                            <div class="tags-dropdown-search">
+                                <label class="sr-only" for="tags-search-input">{% translate 'Search tags' %}</label>
+                                <input type="search" class="form-control form-control-sm" id="tags-search-input" placeholder="{% translate 'Search tags...' %}" autocomplete="off">
+                            </div>
+                            <div class="dropdown-item-container" id="tags-list" role="group" aria-label="{% translate 'Tags' %}"></div>
+                            <div class="tags-dropdown-create" id="create-tag-container" hidden>
+                                <button type="button" class="btn btn-sm btn-link btn-block text-left" id="create-tag-btn">
+                                    <i class="fa fa-plus" aria-hidden="true"></i>
+                                    <span id="create-tag-label-prefix">{% translate 'Create tag' %}</span>
+                                    "<span id="create-tag-name"></span>"
+                                </button>
+                            </div>
+                            <div class="tags-dropdown-error text-danger" id="tags-error" hidden></div>
                         </div>
-                    </div>
-                </div>
-            {% endif %}
-            {{ form.submission_type.as_field_group }}
-            {% if form.track %}{{ form.track.as_field_group }}{% endif %}
-            {% if form.tags %}{{ form.tags.as_field_group }}{% endif %}
-            {% if form.abstract %}{{ form.abstract.as_field_group }}{% endif %}
-            {% if form.description %}{{ form.description.as_field_group }}{% endif %}
-            {% if form.notes %}{{ form.notes.as_field_group }}{% endif %}
-            {{ form.internal_notes.as_field_group }}
-            {% if form.content_locale %}{{ form.content_locale.as_field_group }}{% endif %}
-            {% if form.do_not_record %}{{ form.do_not_record.as_field_group }}{% endif %}
-            {{ form.is_featured.as_field_group }}
-            {{ form.duration.as_field_group }}
-            {% if form.slot_count %}{{ form.slot_count.as_field_group }}{% endif %}
-            {% if form.image %}{{ form.image.as_field_group }}{% endif %}
-            {% if action != "create" %}
-                {% include "cfp/includes/submission_resources_form.html" %}
-            {% endif %}
-            {% if questions_form and questions_form.fields %}
-                <div><legend id="custom">{{ phrases.cfp.custom_fields }}</legend></div>
-                {{ questions_form }}
-            {% endif %}
+                    </details>
+                {% endif %}
+            </div>
+        </div>
 
-            {% if not form.read_only %}
-                <div class="submit-group panel">
-                    <span></span>
-                    <span>
-                        <button type="submit" class="btn btn-success btn-lg">
-                            <i class="fa fa-check"></i>
-                            {{ phrases.base.save }}
-                        </button>
-                    </span>
+        {% if submission.abstract %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Abstract" %}</label>
+                <div class="col-md-9">
+                    {{ submission.abstract|rich_text }}
                 </div>
-            {% endif %}
-        </fieldset></form>
+            </div>
+        {% endif %}
 
-    <span id="vars" remoteUrl="{{ request.event.organiser.orga_urls.user_search }}"></span>
+        {% if submission.description %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Description" %}</label>
+                <div class="col-md-9">
+                    {{ submission.description|rich_text }}
+                </div>
+            </div>
+        {% endif %}
+
+        {% if submission.notes %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Notes" %}</label>
+                <div class="col-md-9">
+                    {{ submission.notes|rich_text }}
+                </div>
+            </div>
+        {% endif %}
+
+        {% if submission.internal_notes %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Internal notes" %}</label>
+                <div class="col-md-9">
+                    {{ submission.internal_notes|rich_text }}
+                </div>
+            </div>
+        {% endif %}
+
+        <div class="form-group row">
+            <label class="col-md-3 col-form-label">{% translate "Language" %}</label>
+            <div class="col-md-9">
+                {{ submission.get_content_locale_display }}
+            </div>
+        </div>
+
+        {% if submission.do_not_record %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Don't record this session." %}</label>
+                <div class="col-md-9">
+                    <span class="value-pill value-pill--positive"><i class="fa fa-check text-success"></i> {% translate "Yes" %}</span>
+                </div>
+            </div>
+        {% endif %}
+
+        {% if submission.is_featured %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Show this session in public list of featured sessions." %}</label>
+                <div class="col-md-9">
+                    <span class="value-pill value-pill--positive"><i class="fa fa-check text-success"></i> {% translate "Yes" %}</span>
+                </div>
+            </div>
+        {% endif %}
+
+        <div class="form-group row">
+            <label class="col-md-3 col-form-label">{% translate "Duration" %}</label>
+            <div class="col-md-9">
+                {{ submission.get_duration }} {% translate "minutes" %}
+            </div>
+        </div>
+
+        {% if submission.slot_count > 1 %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Slot Count" %}</label>
+                <div class="col-md-9">
+                    {{ submission.slot_count }}
+                </div>
+            </div>
+        {% endif %}
+
+        {% if submission.image %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Session image" %}</label>
+                <div class="col-md-9">
+                    <a href="{{ submission.image.url }}" target="_blank">
+                        <img src="{{ submission.image.url }}" alt="{{ submission.title }}">
+                    </a>
+                </div>
+            </div>
+        {% endif %}
+
+        {% if session_videos_enabled and session_video_urls %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Session videos" %}</label>
+                <div class="col-md-9 session-video-urls">
+                    <ul class="list-unstyled mb-0">
+                        {% for url in session_video_urls %}
+                            <li class="mb-1">
+                                <a href="{{ url }}" target="_blank" rel="noopener noreferrer">{{ url }}</a>
+                            </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            </div>
+        {% endif %}
+
+        {% if submission.active_resources %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Resources" %}</label>
+                <div class="col-md-9">
+                    <ul class="list-unstyled">
+                        {% for resource in submission.active_resources %}
+                            <li class="mb-2">
+                                {% if resource.link %}
+                                    <i class="fa fa-link"></i>
+                                    <a href="{{ resource.link }}" target="_blank">{{ resource.description }}</a>
+                                {% else %}
+                                    <i class="fa fa-paperclip"></i>
+                                    <a href="{{ resource.resource.url }}" target="_blank">{{ resource.description }}</a>
+                                {% endif %}
+                            </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            </div>
+        {% endif %}
+
+        {% if questions_form and questions_form.fields %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{{ phrases.cfp.custom_fields }}</label>
+                <div class="col-md-9 custom-fields-container">
+                    {% for field in questions_form %}
+                        <div class="mb-3">
+                            <strong>{{ field.label }}</strong>
+                            <div class="mt-1">
+                                {% if field.field.answer %}
+                                    {% if field.field.question.variant == 'boolean' %}
+                                        {% if field.field.answer.boolean_answer %}
+                                            <span class="value-pill value-pill--positive"><i class="fa fa-check text-success"></i> {% translate "Yes" %}</span>
+                                        {% else %}
+                                            <span class="value-pill value-pill--negative"><i class="fa fa-times text-danger"></i> {% translate "No" %}</span>
+                                        {% endif %}
+                                    {% elif field.field.answer.answer_file %}
+                                        <a href="{{ field.field.answer.answer_file.url }}" target="_blank">
+                                            <i class="fa fa-paperclip"></i> {{ field.field.answer.answer_file.name }}
+                                        </a>
+                                    {% else %}
+                                        {{ field.field.answer.answer_string|rich_text|default:"-" }}
+                                    {% endif %}
+                                {% else %}
+                                    <em class="text-muted">{% translate "No answer provided" %}</em>
+                                {% endif %}
+                            </div>
+                        </div>
+                    {% endfor %}
+                </div>
+            </div>
+        {% endif %}
+
+        {% if submission.median_score != None and can_view_all_reviews %}
+            <div class="form-group row">
+                <label class="col-md-3 col-form-label">{% translate "Reviews" %}</label>
+                <div class="col-md-9">
+                    {{ submission.reviews.count }} {% translate "reviews" %}
+                </div>
+            </div>
+        {% endif %}
+
+        <div class="submit-group panel">
+            <span></span>
+            <span>
+                {% if can_edit_submission %}
+                    <a class="btn btn-info btn-lg" href="{{ submission.orga_urls.edit }}">
+                        <i class="fa fa-edit"></i>
+                        {% translate "Edit" %}
+                    </a>
+                {% endif %}
+            </span>
+        </div>
+    </div>
 {% endblock submission_content %}
+
+{% block scripts %}
+    {{ block.super }}
+    {% has_event_perm 'base.update_submission' request.user request submission as can_manage_submission_tags %}
+    {% if can_manage_submission_tags %}
+        {% compress js %}
+            <script defer src="{% static 'orga/js/submission_tags.js' %}"></script>
+        {% endcompress %}
+    {% endif %}
+{% endblock scripts %}

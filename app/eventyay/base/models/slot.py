@@ -8,7 +8,9 @@ from zoneinfo import ZoneInfo
 
 import vobject
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
+from django.db.models.signals import post_delete, post_save
+from django.dispatch import receiver
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 from django_scopes import ScopedManager
@@ -17,8 +19,9 @@ from i18nfield.fields import I18nCharField
 from eventyay.base.models import PretalxModel
 from eventyay.common.text.serialize import serialize_duration
 from eventyay.common.urls import get_base_url
-from eventyay.talk_rules.agenda import is_agenda_submission_visible, is_agenda_visible
+from eventyay.talk_rules.agenda import can_view_wip_schedule, is_agenda_submission_visible, is_agenda_visible
 from eventyay.talk_rules.submission import is_break, is_wip, orga_can_change_submissions
+
 
 INSTANCE_IDENTIFIER = None
 
@@ -77,7 +80,8 @@ class TalkSlot(PretalxModel):
                 # is down to the API/view
                 & ((is_break & is_agenda_visible) | is_agenda_submission_visible)
             )
-            | orga_can_change_submissions,
+            | orga_can_change_submissions
+            | (is_wip & can_view_wip_schedule),
             'update': is_wip & orga_can_change_submissions,
         }
 
@@ -87,6 +91,20 @@ class TalkSlot(PretalxModel):
             f'TalkSlot(event={self.schedule.event.slug}, submission={getattr(self.submission, "title", None)}, '
             f'schedule={self.schedule.version})'
         )
+
+    def _validate_submission_room(self):
+        if self.room_id and self.submission_id:
+            from eventyay.base.models.room import validate_talk_slot_room
+
+            validate_talk_slot_room(self.room)
+
+    def clean(self):
+        super().clean()
+        self._validate_submission_room()
+
+    def save(self, *args, **kwargs):
+        self._validate_submission_room()
+        super().save(*args, **kwargs)
 
     @cached_property
     def event(self):
@@ -210,9 +228,7 @@ class TalkSlot(PretalxModel):
         vevent.add('summary').value = f'{self.submission.title} - {self.submission.display_speaker_names}'
         vevent.add('dtstamp').value = creation_time
         vevent.add('location').value = str(self.room.name)
-        vevent.add('uid').value = 'pretalx-{}-{}{}@{}'.format(
-            self.submission.event.slug, self.submission.code, self.id_suffix, netloc
-        )
+        vevent.add('uid').value = f'pretalx-{self.submission.event.slug}-{self.submission.code}{self.id_suffix}@{netloc}'
 
         vevent.add('dtstart').value = self.local_start
         vevent.add('dtend').value = self.local_end
@@ -222,8 +238,15 @@ class TalkSlot(PretalxModel):
     def full_ical(self):
         netloc = urlparse(settings.SITE_URL).netloc
         cal = vobject.iCalendar()
-        cal.add('prodid').value = '-//pretalx//{}//{}'.format(
-            netloc, self.submission.code if self.submission else self.pk
-        )
+        cal.add('prodid').value = f'-//pretalx//{netloc}//{self.submission.code if self.submission else self.pk}'
         self.build_ical(cal)
         return cal
+
+
+@receiver(post_save, sender=TalkSlot)
+@receiver(post_delete, sender=TalkSlot)
+def invalidate_schedule_cache_on_slot_change(sender, instance, **kwargs):
+    from eventyay.base.services.stale_cache import bump_schedule_cache_version_on_commit
+
+    if instance.schedule.version:
+        bump_schedule_cache_version_on_commit(instance.schedule.event_id)

@@ -1,4 +1,4 @@
-/*global $,gettext*/
+/*global $,gettext,safeSelector*/
 
 function gettext(msgid) {
     if (typeof django !== 'undefined' && typeof django.gettext !== 'undefined') {
@@ -70,6 +70,78 @@ $(document).ajaxError(function (event, jqXHR, settings, thrownError) {
         alert(gettext('Unknown error.'));
     }
 });
+
+var initScrollingMultipleChoiceContainer = function ($container) {
+    if ($container.data("scrollingChoiceInit")) {
+        return;
+    }
+    if ($container.find(".choice-options-all").length > 0) {
+        $container.data("scrollingChoiceInit", true);
+        return;
+    }
+
+    var $search = null;
+    if ($container.hasClass("scrolling-multiple-choice-searchable")) {
+        $search = $("<input>", {
+            type: "search",
+            "class": "form-control scrolling-multiple-choice-search",
+            placeholder: gettext("Search…"),
+            "aria-label": gettext("Search options"),
+        });
+        if ($container.attr("id")) {
+            $search.attr("aria-controls", $container.attr("id"));
+        }
+        $container.before($search);
+    }
+
+    var filterChoices = function () {
+        if (!$search) {
+            return;
+        }
+        var query = $search.val().toLowerCase().trim();
+        $container.children("li, .checkbox").each(function () {
+            var $item = $(this);
+            var text = $item.text().toLowerCase();
+            $item.toggle(!query || text.indexOf(query) !== -1);
+        });
+    };
+
+    if ($search) {
+        $search.on("input", filterChoices);
+    }
+
+    var choiceCheckboxes = function (visibleOnly) {
+        var $boxes = $container.find("input[type=checkbox]");
+        if (!visibleOnly) {
+            return $boxes;
+        }
+        return $boxes.filter(function () {
+            var $row = $(this).closest("li, .checkbox");
+            return !$row.length || $row.is(":visible");
+        });
+    };
+
+    var searchIsActive = function () {
+        return $search && $search.val().trim().length > 0;
+    };
+
+    var $small = $("<small>");
+    var $a_all = $("<a>").addClass("choice-options-all").attr("href", "#").text(gettext("All"));
+    var $a_none = $("<a>").addClass("choice-options-none").attr("href", "#").text(gettext("None"));
+    $container.prepend($small.append($a_all).append(" / ").append($a_none));
+
+    $container.find(".choice-options-none").click(function (e) {
+        choiceCheckboxes(searchIsActive()).prop("checked", false);
+        e.preventDefault();
+        return false;
+    });
+    $container.find(".choice-options-all").click(function (e) {
+        choiceCheckboxes(searchIsActive()).prop("checked", true);
+        e.preventDefault();
+        return false;
+    });
+    $container.data("scrollingChoiceInit", true);
+};
 
 var form_handlers = function (el) {
     el.find(".datetimepicker").each(function () {
@@ -164,7 +236,7 @@ var form_handlers = function (el) {
 
     el.find(".datetimepicker[data-date-after], .datepickerfield[data-date-after]").each(function () {
         var later_field = $(this),
-            earlier_field = $($(this).attr("data-date-after")),
+            earlier_field = safeSelector($(this).attr("data-date-after")),
             update = function () {
                 var earlier = earlier_field.data('DateTimePicker').date(),
                     later = later_field.data('DateTimePicker').date();
@@ -181,7 +253,7 @@ var form_handlers = function (el) {
 
     el.find(".datetimepicker[data-date-default], .datepickerfield[data-date-default]").each(function () {
         var fill_field = $(this),
-            default_field = $($(this).attr("data-date-default")),
+            default_field = safeSelector($(this).attr("data-date-default")),
             show = function () {
                 var fill_date = fill_field.data('DateTimePicker').date(),
                     default_date = default_field.data('DateTimePicker').date();
@@ -250,6 +322,24 @@ var form_handlers = function (el) {
         return parts.host;
     }
 
+    function hexToRgbObj(hex) {
+        if (!hex) return null;
+        var result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+        return result ? {
+            r: parseInt(result[1], 16),
+            g: parseInt(result[2], 16),
+            b: parseInt(result[3], 16)
+        } : null;
+    }
+
+    function getEffectiveColor(name, defaultHex) {
+        var $field = $("input[name$='" + name + "']");
+        if ($field.length && $field.val() && !$field.is(".no-contrast")) {
+            return hexToRgbObj($field.val());
+        }
+        return hexToRgbObj(defaultHex);
+    }
+
     function updateContrastState($input, rgb) {
         var $host = getColorFieldHost($input),
             $note = $host.find(".contrast-state");
@@ -261,7 +351,24 @@ var form_handlers = function (el) {
             $note = $("<div class='help-block contrast-state'></div>");
             $host.append($note);
         }
-        var c = contrast([255,255,255], [rgb.r, rgb.g, rgb.b]);
+        
+        var name = $input.attr("name") || "";
+        var compareRgb = {r: 255, g: 255, b: 255};
+        var backgroundName = gettext("white background");
+
+        if (name.indexOf("header_background_color") !== -1) {
+            compareRgb = getEffectiveColor("header_text_color", "#ffffff") || {r: 255, g: 255, b: 255};
+            backgroundName = gettext("header text color");
+        } else if (name.indexOf("header_text_color") !== -1) {
+            var primaryFallback = getEffectiveColor("primary_color", "#3b1c4a") || {r: 59, g: 28, b: 74};
+            compareRgb = getEffectiveColor("header_background_color", null) || primaryFallback;
+            backgroundName = gettext("header background color");
+        } else if (name.indexOf("navigation_text_color") !== -1) {
+            compareRgb = {r: 255, g: 255, b: 255};
+            backgroundName = gettext("white background");
+        }
+
+        var c = contrast([compareRgb.r, compareRgb.g, compareRgb.b], [rgb.r, rgb.g, rgb.b]);
         if (c > 7) {
             $note.html("<span class='fa fa-fw fa-check-circle'></span>")
                 .append(gettext('Your color has great contrast and is very easy to read!'));
@@ -272,8 +379,7 @@ var form_handlers = function (el) {
             $note.removeClass("text-success").removeClass("text-warning").removeClass("text-danger");
         } else {
             $note.html("<span class='fa fa-fw fa-warning'></span>")
-                .append(gettext('Your color has bad contrast for text on white background, please choose a darker ' +
-                    'shade.'));
+                .append(gettext('Your color has bad contrast for text on ' + backgroundName + ', please choose a different shade.'));
             $note.addClass("text-danger").removeClass("text-success").removeClass("text-warning");
         }
     }
@@ -306,6 +412,24 @@ var form_handlers = function (el) {
             colorString = pickerColor && pickerColor.toString ? pickerColor.toString() : null;
         updateColorPreview($input, colorString);
         updateContrastState($input, rgb);
+        
+        if (!e.isTriggeredByDependency) {
+            var name = $input.attr("name") || "";
+            if (name.indexOf("header_background_color") !== -1 || name.indexOf("primary_color") !== -1) {
+                var $depTxt = $("input[name$='header_text_color']");
+                if ($depTxt.length && $depTxt.val()) {
+                    var txtRgb = hexToRgbObj($depTxt.val());
+                    if (txtRgb) updateContrastState($depTxt, txtRgb);
+                }
+            }
+            if (name.indexOf("header_text_color") !== -1 || name.indexOf("primary_color") !== -1) {
+                var $depBg = $("input[name$='header_background_color']");
+                if ($depBg.length && $depBg.val()) {
+                    var bgRgb = hexToRgbObj($depBg.val());
+                    if (bgRgb) updateContrastState($depBg, bgRgb);
+                }
+            }
+        }
     });
 
     $colorInputs.on('input', function () {
@@ -314,7 +438,7 @@ var form_handlers = function (el) {
 
     el.find("input[data-checkbox-dependency]").each(function () {
         var dependent = $(this),
-            dependency = $($(this).attr("data-checkbox-dependency")),
+            dependency = safeSelector($(this).attr("data-checkbox-dependency")),
             update = function () {
                 var enabled = dependency.prop('checked');
                 dependent.prop('disabled', !enabled).closest('.form-group, .form-field-boundary').toggleClass('disabled', !enabled);
@@ -331,7 +455,7 @@ var form_handlers = function (el) {
         if (dependency.substr(0, 1) === '<') {
             dependency = $(this).closest("form, .form-horizontal").find(dependency.substr(1));
         } else {
-            dependency = $(dependency);
+            dependency = safeSelector(dependency);
         }
 
         var dependent = $(this),
@@ -347,7 +471,7 @@ var form_handlers = function (el) {
         if (searchString.substr(0, 1) === '<') {
             return $(sourceElement).closest("form, .form-horizontal").find(searchString.substr(1));
         } else {
-            return $(searchString);
+            return safeSelector(searchString);
         }
     }
 
@@ -376,8 +500,9 @@ var form_handlers = function (el) {
                     enabled = !enabled;
                 }
                 var $toggling = dependent;
-                if (dependent.attr("data-disable-dependent")) {
-                    $toggling.attr('disabled', !enabled).trigger("change");
+                if (dependent.is('[data-disable-dependent]')) {
+                    $toggling.prop('disabled', !enabled).trigger("change");
+                    $toggling.find('input, select, textarea').prop('disabled', !enabled).trigger("change");
                 }
                 if (dependent.get(0).tagName.toLowerCase() !== "div") {
                     $toggling = dependent.closest('.form-group');
@@ -400,7 +525,7 @@ var form_handlers = function (el) {
 
     el.find("input[data-required-if], select[data-required-if], textarea[data-required-if]").each(function () {
         var dependent = $(this),
-            dependency = $($(this).attr("data-required-if")),
+            dependency = safeSelector($(this).attr("data-required-if")),
             update = function (ev) {
                 var enabled = (dependency.attr("type") === 'checkbox' || dependency.attr("type") === 'radio') ? dependency.prop('checked') : !!dependency.val();
                 dependent.prop('required', enabled).closest('.form-group').toggleClass('required', enabled).find('.optional').stop().animate({
@@ -466,25 +591,8 @@ var form_handlers = function (el) {
         dependency.on("change", update);
     });
 
-    el.find("div.scrolling-multiple-choice").each(function () {
-        if ($(this).find(".choice-options-all").length > 0) {
-            return;
-        }
-        var $small = $("<small>");
-        var $a_all = $("<a>").addClass("choice-options-all").attr("href", "#").text(gettext("All"));
-        var $a_none = $("<a>").addClass("choice-options-none").attr("href", "#").text(gettext("None"));
-        $(this).prepend($small.append($a_all).append(" / ").append($a_none));
-
-        $(this).find(".choice-options-none").click(function (e) {
-            $(this).closest(".scrolling-multiple-choice").find("input[type=checkbox]").prop("checked", false);
-            e.preventDefault();
-            return false;
-        });
-        $(this).find(".choice-options-all").click(function (e) {
-            $(this).closest(".scrolling-multiple-choice").find("input[type=checkbox]").prop("checked", true);
-            e.preventDefault();
-            return false;
-        });
+    el.find("div.scrolling-multiple-choice, ul.scrolling-multiple-choice").each(function () {
+        initScrollingMultipleChoiceContainer($(this));
     });
 
     el.find('.select2-static').select2({
@@ -560,7 +668,7 @@ var form_handlers = function (el) {
             },
         }).on("select2:select", function () {
             // Allow continuing to select
-            if ($s.hasAttribute("multiple")) {
+            if ($s.prop("multiple")) {
                 window.setTimeout(function () {
                     $s.parent().find('.select2-search__field').focus();
                 }, 50);
@@ -657,6 +765,88 @@ var form_handlers = function (el) {
 
     el.find("input[name*=question], select[name*=question]").change(questions_toggle_dependent);
     questions_toggle_dependent();
+
+    if (el.find('input[name="limit_checkin_lists"]').length) {
+        var eventMap = {};
+        var $mapEl = document.getElementById('device-checkin-list-event-map');
+        if ($mapEl) {
+            try {
+                eventMap = JSON.parse($mapEl.textContent);
+            } catch (ignore) {
+                eventMap = {};
+            }
+        }
+
+        var $deviceForm = el.find('input[name="limit_checkin_lists"]').first().closest('form');
+        var $allEvents = $deviceForm.find('#id_all_events');
+        var $eventCheckboxes = $deviceForm.find('input[name="limit_events"]');
+        var $checkinListGroup = $deviceForm.find('input[name="limit_checkin_lists"]').first().closest('.form-group');
+        var $helpBlock = $checkinListGroup.find('.help-block').first();
+        var defaultHelpText = $helpBlock.text();
+
+        var getEventIdForList = function ($checkbox) {
+            var eventId = $checkbox.attr('data-event-id');
+            if (eventId) {
+                return String(eventId);
+            }
+            return eventMap[String($checkbox.val())] || '';
+        };
+
+        var getSelectedEventIds = function () {
+            if ($allEvents.prop('checked')) {
+                return null;
+            }
+            var selected = [];
+            $eventCheckboxes.each(function () {
+                if (this.checked) {
+                    selected.push(String(this.value));
+                }
+            });
+            return selected;
+        };
+
+        var updateDeviceCheckinListVisibility = function () {
+            var selectedEventIds = getSelectedEventIds();
+            var showAll = selectedEventIds === null;
+            var hasEventSelection = showAll || selectedEventIds.length > 0;
+            var visibleCount = 0;
+
+            $deviceForm.find('input[name="limit_checkin_lists"]').each(function () {
+                var $checkbox = $(this);
+                var eventId = getEventIdForList($checkbox);
+                var $item = $checkbox.closest('li');
+                if (!$item.length) {
+                    $item = $checkbox.closest('label').parent('div');
+                }
+                var visible = hasEventSelection && (showAll || (eventId && selectedEventIds.indexOf(eventId) !== -1));
+
+                $item.toggle(visible);
+                if (visible) {
+                    visibleCount += 1;
+                } else if ($checkbox.prop('checked')) {
+                    $checkbox.prop('checked', false);
+                }
+            });
+
+            if (!$helpBlock.length) {
+                return;
+            }
+            if (!hasEventSelection) {
+                $helpBlock.text(gettext('Select one or more events above to see matching check-in lists.'));
+            } else if (visibleCount === 0) {
+                $helpBlock.text(gettext('No check-in lists exist for the selected events yet.'));
+            } else {
+                $helpBlock.text(defaultHelpText);
+            }
+        };
+
+        updateDeviceCheckinListVisibility();
+        $allEvents.on('change', updateDeviceCheckinListVisibility);
+        $eventCheckboxes.on('change', updateDeviceCheckinListVisibility);
+        $deviceForm.find('#id_security_profile').on('change', function () {
+            window.setTimeout(updateDeviceCheckinListVisibility, 150);
+        });
+    }
 };
 
 $(function () {
@@ -694,7 +884,7 @@ $(function () {
         });
     }
 
-    $("#sumtoggle").find("button").click(function () {
+    $(document).on("click", "#sumtoggle button", function () {
         $(".table-product-overview .sum-gross").toggle($(this).attr("data-target") === ".sum-gross");
         $(".table-product-overview .sum-net").toggle($(this).attr("data-target") === ".sum-net");
         $(".table-product-overview .count").toggle($(this).attr("data-target") === ".count");
@@ -705,8 +895,8 @@ $(function () {
 
     $('.collapsible').collapse();
     $("input[data-toggle=radiocollapse]").change(function () {
-        $($(this).attr("data-parent")).find(".collapse.in").collapse('hide');
-        $($(this).attr("data-target")).collapse('show');
+        safeSelector($(this).attr("data-parent")).find(".collapse.in").collapse('hide');
+        safeSelector($(this).attr("data-target")).collapse('show');
     });
     $("div.collapsed").removeClass("collapsed").addClass("collapse");
     $(".has-error").each(function () {
@@ -746,7 +936,7 @@ $(function () {
             var url = $(this).attr("data-rng-url");
             $("#id_codes").html("Generating...");
             $(".form-group:has(#voucher-bulk-codes-num)").removeClass("has-error");
-            $.getJSON(url + '?num=' + num + '&prefix=' + escape(prefix), function (data) {
+            $.getJSON(url + '?num=' + num + '&prefix=' + encodeURIComponent(prefix), function (data) {
                 $("#id_codes").val(data.codes.join("\n"));
             });
         } else {
@@ -763,7 +953,7 @@ $(function () {
     $(".qrcode-canvas").each(function () {
         $(this).qrcode(
             {
-                text: $.trim($($(this).attr("data-qrdata")).html())
+                text: $.trim(safeSelector($(this).attr("data-qrdata")).html())
             }
         );
     });
@@ -778,15 +968,36 @@ $(function () {
     });
 
     // Tables with bulk selection, e.g. subevent list
-    $("input[data-toggle-table]").each(function (ev) {
-        var $toggle = $(this);
-        var $actionButtons = $(".batch-select-actions button", this.form);
-        var countLabels = $("<span></span>").appendTo($actionButtons);
+    window.eventyayInitBatchSelection = function (root) {
+        root = root || document;
+        $(root).find("input[data-toggle-table]:not([data-batch-selection-init])").each(function (ev) {
+            $(this).attr("data-batch-selection-init", "1");
+            var $toggle = $(this);
+        var $batchSelectActions = $(".batch-select-actions", this.form);
+        var $actionButtons = $batchSelectActions.find("[data-batch-action]");
+        if (!$actionButtons.length) {
+            $actionButtons = $batchSelectActions.find("button");
+        }
+        var $countTargets = $batchSelectActions.find("[data-batch-count-label]");
+        if (!$countTargets.length) {
+            $countTargets = $actionButtons.filter("button");
+        }
+        var countLabels = $();
+        $countTargets.each(function () {
+            countLabels = countLabels.add($("<span></span>").appendTo(this));
+        });
         var $table = $toggle.closest("table");
         var $selectAll = $table.find(".table-select-all");
-        var $rows = $table.find("tbody tr");
-        var $checkboxes = $rows.find("td:first-child input[type=checkbox]");
+        var $rows = $table.find("tbody tr").filter(function () {
+            var firstCell = this.firstElementChild;
+            return firstCell && firstCell.querySelector("input[type=checkbox][name]");
+        });
+        var $checkboxes = $rows.map(function () {
+            return this.firstElementChild.querySelector("input[type=checkbox][name]");
+        });
+        var $selectionRows = $rows;
         var firstIndex, lastIndex, selectionChecked, onChangeSelectionHappened = false;
+        var suppressRowClick = null;
         var updateSelection = function(a, b, checked) {
             if (a > b) {
                 //[a, b] = [b, a];// ES6 not ready yet for pretix
@@ -795,7 +1006,7 @@ $(function () {
                 b = tmp;
             }
             for (var i = a; i <= b; i++) {
-                var checkbox = $checkboxes.get(i);
+                var checkbox = $selectionRows.get(i).firstElementChild.querySelector("input[type=checkbox][name]");
                 if (!checkbox.hasAttribute("data-inital")) checkbox.setAttribute("data-inital", checkbox.checked);
                 if (checked === undefined || checked === null) checkbox.checked = checkbox.getAttribute("data-inital") === "true";
                 else checkbox.checked = checked;
@@ -805,10 +1016,8 @@ $(function () {
             onChangeSelectionHappened = true;
 
             var row = ev.target.closest("tr");
-            var currentIndex = 0;
-            while(row = row.previousSibling) {
-                if (row.tagName) currentIndex++;
-            }
+            var currentIndex = $selectionRows.index(row);
+            if (currentIndex < 0) return;
             var dCurrent = currentIndex - firstIndex;
             var dLast = lastIndex - firstIndex;
             if (dCurrent*dLast < 0) {
@@ -825,18 +1034,20 @@ $(function () {
             ev.preventDefault();
         };
         $table.on("pointerdown", function(ev) {
-            if (!ev.target.closest("td:first-child")) return;
             var row = ev.target.closest("tr");
-            selectionChecked = !row.querySelector("td:first-child input").checked;
+            if (!row || !row.closest("tbody")) return;
+            var firstCell = row.firstElementChild;
+            var rowCheckbox = firstCell && firstCell.querySelector("input[type=checkbox][name]");
+            if (!rowCheckbox || !firstCell.contains(ev.target)) return;
+            suppressRowClick = row;
+            selectionChecked = !rowCheckbox.checked;
 
-            firstIndex = 0;
-            while(row = row.previousSibling) {
-                if (row.tagName) firstIndex++;
-            }
+            $selectionRows = $rows.filter(":visible");
+            firstIndex = $selectionRows.index(row);
             lastIndex = firstIndex;
 
             ev.preventDefault();
-            $rows.on("pointerenter", onChangeSelection);
+            $selectionRows.on("pointerenter", onChangeSelection);
 
             $(document).one("pointerup", function(ev) {
                 if (onChangeSelectionHappened) {
@@ -845,24 +1056,108 @@ $(function () {
                     $checkboxes.removeAttr("data-inital");
 
                     update();
+                } else if (suppressRowClick) {
+                    var checkbox = suppressRowClick.firstElementChild.querySelector("input[type=checkbox][name]");
+                    if (checkbox) {
+                        $(checkbox).prop("checked", selectionChecked).trigger("change");
+                    } else {
+                        update();
+                    }
+                    ev.preventDefault();
+                    $(suppressRowClick).find("td:first-child").one("click", function(e) {
+                        e.preventDefault();
+                        e.stopImmediatePropagation();
+                    });
                 }
-                $rows.off("pointerenter", onChangeSelection);
+                suppressRowClick = null;
+                $selectionRows.off("pointerenter", onChangeSelection);
+                $selectionRows = $rows;
             });
         });
 
+        var $form = $toggle.closest("form");
         var update = function() {
-            var nrOfChecked = $checkboxes.filter(":checked").length;
-            var allChecked = nrOfChecked == $checkboxes.length;
+             var nrOfChecked = $checkboxes.filter(":checked").length;
+             var allChecked = nrOfChecked == $checkboxes.length;
+             var $checked = $checkboxes.filter(":checked");
+             var eligibilityMode = $batchSelectActions.is("[data-batch-disabled-reason-ineligible]");
+             var nrEligibleChecked = eligibilityMode ? $checked.filter('[data-batch-eligible="true"]').length : nrOfChecked;
+             var nrIneligibleChecked = eligibilityMode ? (nrOfChecked - nrEligibleChecked) : 0;
+             var $actionHint = $batchSelectActions.find("[data-batch-action-hint]");
+            var reasonNone = $batchSelectActions.attr("data-batch-disabled-reason-none");
+            var reasonAllIneligible = $batchSelectActions.attr("data-batch-disabled-reason-ineligible");
+            var reasonPartialSkip = $batchSelectActions.attr("data-batch-partial-skip-notice");
+            var actionsDisabled = false;
+            var disabledReason = "";
 
             if (!nrOfChecked) countLabels.empty();
             else countLabels.text(" ("+nrOfChecked+")");
 
-            if (!allChecked) $selectAll.find("input").prop("checked", false); 
+            if (!allChecked) $selectAll.find("input").prop("checked", false);
 
-            $actionButtons.attr("disabled", !nrOfChecked);
+            if (!nrOfChecked) {
+                // Nothing selected at all — disable
+                actionsDisabled = true;
+                disabledReason = reasonNone || "";
+            } else if (nrEligibleChecked === 0) {
+                // All selected are ineligible — disable
+                actionsDisabled = true;
+                disabledReason = reasonAllIneligible || "";
+            }
+            // else: at least one eligible order — keep enabled (mixed or all eligible)
+
+            $actionButtons.prop("disabled", actionsDisabled);
+            if (actionsDisabled && disabledReason) {
+                $actionButtons.attr("title", disabledReason);
+            } else {
+                $actionButtons.removeAttr("title");
+            }
+            if ($actionHint.length) {
+                if (!nrOfChecked) {
+                    $actionHint.text("").prop("hidden", true);
+                } else if (nrEligibleChecked === 0) {
+                    // All ineligible: show hard error hint
+                    $actionHint.text(reasonAllIneligible || "").prop("hidden", false);
+                } else if (nrIneligibleChecked > 0 && reasonPartialSkip) {
+                    // Mixed: show partial-skip notice
+                    var skipMsg = reasonPartialSkip.replace("{count}", nrIneligibleChecked);
+                    $actionHint.text(skipMsg).prop("hidden", false);
+                } else {
+                    $actionHint.text("").prop("hidden", true);
+                }
+            }
             $toggle.prop("checked", allChecked).prop("indeterminate", nrOfChecked > 0 && !allChecked);
             $selectAll.toggleClass("hidden", nrOfChecked !== $checkboxes.length).prop("hidden", nrOfChecked !== $checkboxes.length);
+            
+            $batchSelectActions.toggleClass("hidden", actionsDisabled);
+        }
 
+        if ($batchSelectActions.attr("data-batch-disabled-reason-ineligible") && !$form.data("batch-selection-submit-bound")) {
+            $form.data("batch-selection-submit-bound", true);
+            $form.on("submit", function(ev) {
+                var $batchSelectActions = $(this).find(".batch-select-actions");
+                var $checkboxes = $(this).find("tbody input[type=checkbox]");
+                var reasonNone = $batchSelectActions.attr("data-batch-disabled-reason-none");
+                var $actionHint = $batchSelectActions.find("[data-batch-action-hint]");
+                var nrOfChecked = $checkboxes.filter(":checked").length;
+                var nrEligibleChecked = $checkboxes.filter(":checked").filter('[data-batch-eligible="true"]').length;
+
+                if (!nrOfChecked) {
+                    ev.preventDefault();
+                    if ($actionHint.length) {
+                        $actionHint.text(reasonNone || "").prop("hidden", false);
+                    }
+                    return false;
+                }
+                if (nrEligibleChecked === 0) {
+                    var reasonAllIneligible = $batchSelectActions.attr("data-batch-disabled-reason-ineligible");
+                    ev.preventDefault();
+                    if ($actionHint.length) {
+                        $actionHint.text(reasonAllIneligible || "").prop("hidden", false);
+                    }
+                    return false;
+                }
+            });
         }
 
         $checkboxes.change(update);
@@ -877,7 +1172,10 @@ $(function () {
         })
 
         update();
-    });
+        });
+    };
+
+    window.eventyayInitBatchSelection();
 
     // Items and categories
     $(".internal-name-wrapper").each(function () {
@@ -919,6 +1217,9 @@ $(function () {
                 $("<pre>").text(JSON.stringify(data.data, null, 2)).appendTo($a.parent());
             }
             $a.remove();
+        }).fail(function () {
+            $a.find(".fa").removeClass("fa-cog fa-spin").addClass("fa-eye");
+            alert(gettext('Could not load log details.'));
         });
         return false;
     });
@@ -953,12 +1254,34 @@ $(function () {
         return false;
     });
 
+    // Voucher page specific delete selected toggle
+    var $vouchersDeleteBtn = $('button[name="action"][value="delete"]');
+    var $vouchersForm = $vouchersDeleteBtn.closest('form');
+    // Only run this behavior on the voucher list (other pages also use .table-quotas + a delete button).
+    if ($vouchersForm.length) {
+        var updateVouchersDeleteBtn = function () {
+            var $vouchersCheckboxes = $vouchersForm.find('input[name="voucher"], input[name="voucher_group"]');
+            $vouchersDeleteBtn.toggleClass('hidden', $vouchersCheckboxes.filter(':checked').length === 0);
+        };
+
+        $vouchersForm.on('change', 'input[name="voucher"], input[name="voucher_group"], input[data-toggle-table]', function () {
+            setTimeout(updateVouchersDeleteBtn, 50);
+        });
+
+        updateVouchersDeleteBtn();
+    }
+
     $("#ajaxerr").on("click", ".ajaxerr-close", ajaxErrDialog.hide);
     moment.locale($("body").attr("data-datetimelocale"));
 });
 
 $(function () {
-   $('form[method=post]').filter(function () {
+    $('form[method=post]').filter(function () {
        return $(this).find("button:not([type=button]), input[type=submit]").length > 0;
-   }).areYouSure( {'message': gettext('You have unsaved changes!')});
+    }).areYouSure( {'message': gettext('You have unsaved changes!')});
+
+    // Move preview modal to body to avoid z-index and nesting issues
+    if ($("#preview-modal").length) {
+        $("#preview-modal").appendTo("body");
+    }
 });

@@ -4,13 +4,13 @@ from datetime import datetime
 from datetime import timezone as tz
 from decimal import Decimal
 from typing import Optional, Tuple
-from urllib.parse import urljoin
 
-import pytz
+from zoneinfo import ZoneInfo
 import requests
 from celery import shared_task
 from dateutil.relativedelta import relativedelta
 from django.conf import settings
+from django.utils import timezone
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import DatabaseError
@@ -27,8 +27,8 @@ from ..base.models import BillingInvoice, Event, Order, Organizer
 from ..base.models.organizer import OrganizerBillingModel
 from ..base.services.mail import mail_send_task
 from ..base.settings import GlobalSettingsObject
+from ..consts import EVENTYAY_EMAIL_NONE_VALUE
 from ..helpers.jwt_generate import generate_sso_token
-from .base_tasks import CreateWorldTask, SendEventTask
 from .billing_invoice import InvoicePDFGenerator
 from .schemas.billing import CollectBillingResponse
 
@@ -53,8 +53,10 @@ def send_team_webhook(self, user_id, team):
 
     try:
         # Send the POST request with the payload and the headers
+        from django.urls import reverse
+        webhook_url = reverse('eventyay_common:webhook.team')
         response = requests.post(
-            urljoin(settings.TALK_HOSTNAME, 'webhook/team/'),
+            webhook_url,
             json=payload,
             headers=headers,
         )
@@ -67,7 +69,6 @@ def send_team_webhook(self, user_id, team):
             self.retry(exc=e)
         except self.MaxRetriesExceededError:
             logger.error('Max retries exceeded for sending organizer webhook.')
-
 
 def get_header_token(user_id):
     # Fetch the user and organizer instances
@@ -137,8 +138,8 @@ def collect_billing_invoice(
         voucher_value=invoice_voucher.value if invoice_voucher else 0,
         monthly_bill=last_month_date,
         reminder_schedule=settings.BILLING_REMINDER_SCHEDULE,
-        created_by=settings.EVENTYAY_EMAIL_NONE_VALUE,
-        updated_by=settings.EVENTYAY_EMAIL_NONE_VALUE,
+        created_by=EVENTYAY_EMAIL_NONE_VALUE,
+        updated_by=EVENTYAY_EMAIL_NONE_VALUE,
     )
     billing_invoice.next_reminder_datetime = get_next_reminder_datetime(settings.BILLING_REMINDER_SCHEDULE)
     billing_invoice.save()
@@ -210,7 +211,7 @@ def update_billing_invoice_information(invoice_id: str):
             id=invoice_id,
         ).update(
             status=BillingInvoice.STATUS_PAID,
-            paid_datetime=datetime.now(),
+            paid_datetime=timezone.now(),
             payment_method='stripe',
             reminder_enabled=False,
         )
@@ -374,12 +375,15 @@ def get_next_reminder_datetime(reminder_schedule):
     @return:
     """
     reminder_schedule.sort()
-    today = datetime.now()
+    today = timezone.localtime()
     # Find the next scheduled day in the current month
     next_reminder = None
     for day in reminder_schedule:
         # Create a datetime object for each scheduled
-        reminder_date = datetime(today.year, today.month, day)
+        try:
+            reminder_date = today.replace(day=day, hour=0, minute=0, second=0, microsecond=0)
+        except ValueError:
+            continue
         # Check if the scheduled day is in the future
         if reminder_date > today:
             next_reminder = reminder_date
@@ -389,7 +393,7 @@ def get_next_reminder_datetime(reminder_schedule):
         next_month = today.month + 1 if today.month < 12 else 1
         next_year = today.year if today.month < 12 else today.year + 1
         # Select the first date in BILLING_REMIND_SCHEDULE for the next month
-        next_reminder = datetime(next_year, next_month, reminder_schedule[0])
+        next_reminder = today.replace(year=next_year, month=next_month, day=reminder_schedule[0], hour=0, minute=0, second=0, microsecond=0)
 
     return next_reminder
 
@@ -433,7 +437,7 @@ def retry_failed_payment(self):
     pending_invoices = BillingInvoice.objects.filter(status=BillingInvoice.STATUS_PENDING)
     today = datetime.now(tz.utc)
     logger.info('Start - running task to retry failed payment: %s', today)
-    timezone = pytz.timezone(settings.TIME_ZONE)
+    timezone = ZoneInfo(settings.TIME_ZONE)
     for invoice in pending_invoices:
         if invoice.final_ticket_fee <= 0:
             continue
@@ -443,7 +447,7 @@ def retry_failed_payment(self):
         reminder_dates.sort()
         for reminder_date in reminder_dates:
             reminder_date = datetime(today.year, today.month, reminder_date)
-            reminder_date = timezone.localize(reminder_date)
+            reminder_date = reminder_date.replace(tzinfo=timezone)
             if (
                 not invoice.last_reminder_datetime or invoice.last_reminder_datetime < reminder_date
             ) and reminder_date <= today:
@@ -463,7 +467,7 @@ def check_billing_status_for_warning(self):
     pending_invoices = BillingInvoice.objects.filter(status=BillingInvoice.STATUS_PENDING, reminder_enabled=True)
     today = datetime.now(tz.utc)
     logger.info('Start - running task to check billing status for warning on: %s', today)
-    timezone = pytz.timezone(settings.TIME_ZONE)
+    timezone = ZoneInfo(settings.TIME_ZONE)
     for invoice in pending_invoices:
         if invoice.final_ticket_fee <= 0:
             continue
@@ -483,7 +487,7 @@ def check_billing_status_for_warning(self):
             continue
         for reminder_date in reminder_dates:
             reminder_date = datetime(today.year, today.month, reminder_date)
-            reminder_date = timezone.localize(reminder_date)
+            reminder_date = reminder_date.replace(tzinfo=timezone)
             if (
                 not invoice.last_reminder_datetime or invoice.last_reminder_datetime < reminder_date
             ) and reminder_date <= today:
@@ -517,7 +521,7 @@ def check_billing_status_for_warning(self):
                     f'- Final Amount Due: {invoice.final_ticket_fee} {invoice.currency}\n\n'
                     f'If you have already made the payment, please disregard this notice. '
                     f'However, if you need additional time or have any questions, '
-                    f'feel free to reach out to us at {settings.PRETIX_EMAIL_NONE_VALUE}.\n\n'
+                    f'feel free to reach out to us at {EVENTYAY_EMAIL_NONE_VALUE}.\n\n'
                     f'Thank you for your attention and for choosing us!\n\n'
                     f'Warm regards,\n'
                     f'EventYay Team'
@@ -543,7 +547,7 @@ def billing_invoice_send_email(subject, content, invoice, organizer_billing):
         kwargs={
             'subject': subject,
             'body': content,
-            'sender': settings.EVENTYAY_EMAIL_NONE_VALUE,
+            'sender': EVENTYAY_EMAIL_NONE_VALUE,
             'to': organizer_billing_contact,
             'html': None,
             'attach_file_base64': pdf_base64,

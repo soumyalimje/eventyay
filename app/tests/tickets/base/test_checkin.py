@@ -1,0 +1,787 @@
+import time
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+import pytest
+from django.conf import settings
+from django.utils.timezone import now
+from django_scopes import scope
+from freezegun import freeze_time
+
+from eventyay.base.models import Checkin, Device, Event, Order, OrderPosition, Organizer
+from eventyay.base.services.checkin import (
+    CheckInError,
+    RequiredQuestionsError,
+    SQLLogic,
+    checkin_error_response_data,
+    checkin_reason_explanation,
+    perform_checkin,
+    process_exit_all,
+)
+
+
+@pytest.fixture(scope='function')
+def event():
+    o = Organizer.objects.create(name='Dummy', slug='dummy')
+    event = Event.objects.create(
+        organizer=o,
+        name='Dummy',
+        slug='dummy',
+        date_from=now(),
+        plugins='eventyay.plugins.banktransfer',
+    )
+    event.settings.timezone = 'Europe/Berlin'
+    with scope(organizer=o):
+        yield event
+
+
+@pytest.fixture
+def clist(event):
+    c = event.checkin_lists.create(name='Default', all_products=True)
+    return c
+
+
+@pytest.fixture
+def item(event):
+    return event.products.create(name='Ticket', default_price=3, admission=True)
+
+
+@pytest.fixture
+def position(event, item):
+    order = Order.objects.create(
+        code='FOO',
+        event=event,
+        email='dummy@dummy.test',
+        status=Order.STATUS_PAID,
+        locale='en',
+        datetime=now() - timedelta(days=4),
+        expires=now() - timedelta(hours=4) + timedelta(days=10),
+        total=Decimal('23.00'),
+    )
+    return OrderPosition.objects.create(
+        order=order,
+        product=item,
+        variation=None,
+        price=Decimal('23.00'),
+        attendee_name_parts={'full_name': 'Peter'},
+        positionid=1,
+    )
+
+
+@pytest.mark.django_db
+def test_checkin_valid(position, clist):
+    perform_checkin(position, clist, {})
+    assert position.checkins.count() == 1
+
+
+@pytest.mark.django_db
+def test_checkin_canceled_order(position, clist):
+    o = position.order
+    o.status = Order.STATUS_CANCELED
+    o.save()
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert excinfo.value.code == 'unpaid'
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {}, canceled_supported=True)
+    assert excinfo.value.code == 'canceled'
+    assert position.checkins.count() == 0
+
+    o.status = Order.STATUS_EXPIRED
+    o.save()
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {}, canceled_supported=True)
+    assert excinfo.value.code == 'canceled'
+    assert position.checkins.count() == 0
+
+
+@pytest.mark.django_db
+def test_checkin_canceled_position(position, clist):
+    position.canceled = True
+    position.save()
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert excinfo.value.code == 'unpaid'
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {}, canceled_supported=True)
+    assert excinfo.value.code == 'canceled'
+    assert position.checkins.count() == 0
+
+
+@pytest.mark.django_db
+def test_checkin_invalid_product(position, clist):
+    clist.all_products = False
+    clist.save()
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert excinfo.value.code == 'product'
+    clist.limit_products.add(position.product)
+    perform_checkin(position, clist, {})
+
+
+@pytest.mark.django_db
+def test_checkin_invalid_subevent(position, clist, event):
+    event.has_subevents = True
+    event.save()
+    se1 = event.subevents.create(name='Foo', date_from=event.date_from)
+    se2 = event.subevents.create(name='Foo', date_from=event.date_from)
+    position.subevent = se1
+    position.save()
+    clist.subevent = se2
+    clist.save()
+
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert excinfo.value.code == 'subevent'
+
+
+@pytest.mark.django_db
+def test_checkin_all_subevents(position, clist, event):
+    event.has_subevents = True
+    event.save()
+    se1 = event.subevents.create(name='Foo', date_from=event.date_from)
+    position.subevent = se1
+    position.save()
+    perform_checkin(position, clist, {})
+
+
+@pytest.mark.django_db
+def test_unpaid(position, clist):
+    o = position.order
+    o.status = Order.STATUS_PENDING
+    o.save()
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert excinfo.value.code == 'unpaid'
+
+
+@pytest.mark.django_db
+def test_unpaid_include_pending_ignore(position, clist):
+    o = position.order
+    o.status = Order.STATUS_PENDING
+    o.save()
+    clist.include_pending = True
+    clist.save()
+    perform_checkin(position, clist, {}, ignore_unpaid=True)
+
+
+@pytest.mark.django_db
+def test_unpaid_ignore_without_include_pendung(position, clist):
+    o = position.order
+    o.status = Order.STATUS_PENDING
+    o.save()
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert excinfo.value.code == 'unpaid'
+
+
+@pytest.mark.django_db
+def test_unpaid_force(position, clist):
+    o = position.order
+    o.status = Order.STATUS_PENDING
+    o.save()
+    perform_checkin(position, clist, {}, force=True)
+
+
+@pytest.mark.django_db
+def test_required_question_missing(event, position, clist):
+    q = event.questions.create(
+        question='Quo vadis?',
+        type='S',
+        required=True,
+        ask_during_checkin=True,
+    )
+    q.products.add(position.product)
+    with pytest.raises(RequiredQuestionsError) as excinfo:
+        perform_checkin(position, clist, {}, questions_supported=True)
+    assert excinfo.value.code == 'incomplete'
+    assert excinfo.value.questions == [q]
+
+
+@pytest.mark.django_db
+def test_required_question_missing_but_not_supported(event, position, clist):
+    q = event.questions.create(
+        question='Quo vadis?',
+        type='S',
+        required=True,
+        ask_during_checkin=True,
+    )
+    q.products.add(position.product)
+    perform_checkin(position, clist, {}, questions_supported=False)
+
+
+@pytest.mark.django_db
+def test_required_question_missing_but_forced(event, position, clist):
+    q = event.questions.create(
+        question='Quo vadis?',
+        type='S',
+        required=True,
+        ask_during_checkin=True,
+    )
+    q.products.add(position.product)
+    perform_checkin(position, clist, {}, questions_supported=True, force=True)
+
+
+@pytest.mark.django_db
+def test_optional_question_missing(event, position, clist):
+    q = event.questions.create(
+        question='Quo vadis?',
+        type='S',
+        required=False,
+        ask_during_checkin=True,
+    )
+    q.products.add(position.product)
+    with pytest.raises(RequiredQuestionsError) as excinfo:
+        perform_checkin(position, clist, {}, questions_supported=True)
+    assert excinfo.value.code == 'incomplete'
+    assert excinfo.value.questions == [q]
+
+
+@pytest.mark.django_db
+def test_required_online_question_missing(event, position, clist):
+    q = event.questions.create(
+        question='Quo vadis?',
+        type='S',
+        required=True,
+        ask_during_checkin=False,
+    )
+    q.products.add(position.product)
+    perform_checkin(position, clist, {}, questions_supported=True)
+
+
+@pytest.mark.django_db
+def test_question_filled_previously(event, position, clist):
+    q = event.questions.create(
+        question='Quo vadis?',
+        type='S',
+        required=True,
+        ask_during_checkin=True,
+    )
+    q.products.add(position.product)
+    position.answers.create(question=q, answer='Foo')
+    perform_checkin(position, clist, {}, questions_supported=True)
+
+
+@pytest.mark.django_db
+def test_question_filled(event, position, clist):
+    q = event.questions.create(
+        question='Quo vadis?',
+        type='S',
+        required=True,
+        ask_during_checkin=True,
+    )
+    q.products.add(position.product)
+    perform_checkin(position, clist, {q: 'Foo'}, questions_supported=True)
+    a = position.answers.get()
+    assert a.question == q
+    assert a.answer == 'Foo'
+
+
+@pytest.mark.django_db
+def test_single_entry(position, clist):
+    perform_checkin(position, clist, {})
+
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert excinfo.value.code == 'checkout_required'
+    assert not excinfo.value.cross_gate
+
+    assert position.checkins.count() == 1
+
+
+@pytest.mark.django_db
+def test_single_entry_repeat_nonce(position, clist):
+    perform_checkin(position, clist, {}, nonce='foo')
+    perform_checkin(position, clist, {}, nonce='foo')
+
+    assert position.checkins.count() == 1
+
+
+@pytest.mark.django_db
+def test_multi_entry(position, clist):
+    clist.allow_multiple_entries = True
+    clist.save()
+    perform_checkin(position, clist, {})
+    perform_checkin(position, clist, {})
+
+    assert position.checkins.count() == 2
+
+
+@pytest.mark.django_db
+def test_multi_entry_repeat_nonce(position, clist):
+    clist.allow_multiple_entries = True
+    clist.save()
+    perform_checkin(position, clist, {}, nonce='foo')
+    perform_checkin(position, clist, {}, nonce='foo')
+
+    assert position.checkins.count() == 1
+
+
+@pytest.mark.django_db
+def test_single_entry_forced_reentry(position, clist):
+    perform_checkin(position, clist, {}, force=True)
+
+    perform_checkin(position, clist, {}, force=True, nonce='bla')
+    perform_checkin(position, clist, {}, force=True, nonce='bla')
+
+    assert position.checkins.count() == 2
+    assert not position.checkins.last().forced
+    assert position.checkins.first().forced
+    assert position.order.all_logentries().count() == 2
+
+
+@pytest.mark.django_db
+def test_multi_exit(position, clist):
+    perform_checkin(position, clist, {})
+    perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT)
+    perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT)
+
+    assert position.checkins.count() == 3
+
+
+@pytest.mark.django_db
+def test_single_entry_after_exit_ordered_by_date(position, clist):
+    dt1 = now() - timedelta(minutes=10)
+    dt2 = now() - timedelta(minutes=5)
+    perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT, datetime=dt2)
+    time.sleep(1)
+    perform_checkin(position, clist, {}, datetime=dt1)
+    perform_checkin(position, clist, {})
+
+    assert position.checkins.count() == 3
+
+
+@pytest.mark.django_db
+def test_single_entry_after_exit(position, clist):
+    perform_checkin(position, clist, {})
+    perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT)
+    perform_checkin(position, clist, {})
+
+    assert position.checkins.count() == 3
+
+
+@pytest.mark.django_db
+def test_single_entry_after_exit_forbidden(position, clist):
+    clist.allow_entry_after_exit = False
+    clist.save()
+
+    perform_checkin(position, clist, {})
+    perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT)
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert excinfo.value.code == 'already_redeemed'
+
+    assert position.checkins.count() == 2
+
+
+@pytest.mark.django_db
+def test_rules_simple(position, clist):
+    clist.rules = {'and': [False, True]}
+    clist.save()
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    perform_checkin(position, clist, {}, type='exit')
+    assert excinfo.value.code == 'rules'
+
+    clist.rules = {'and': [True, True]}
+    clist.save()
+
+    assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+    perform_checkin(position, clist, {})
+
+
+@pytest.mark.django_db
+def test_rules_product(event, position, clist):
+    i2 = event.products.create(name='Ticket', default_price=3, admission=True)
+    clist.rules = {
+        'inList': [
+            {'var': 'product'},
+            {
+                'objectList': [
+                    {'lookup': ['product', str(i2.pk), 'Ticket']},
+                ]
+            },
+        ]
+    }
+    clist.save()
+    assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert excinfo.value.code == 'rules'
+
+    clist.rules = {
+        'inList': [
+            {'var': 'product'},
+            {
+                'objectList': [
+                    {'lookup': ['product', str(i2.pk), 'Ticket']},
+                    {'lookup': ['product', str(position.product.pk), 'Ticket']},
+                ]
+            },
+        ]
+    }
+    clist.save()
+    assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+    perform_checkin(position, clist, {})
+
+
+@pytest.mark.django_db
+def test_rules_variation(item, position, clist):
+    v1 = item.variations.create(value='A')
+    v2 = item.variations.create(value='B')
+    position.variation = v2
+    position.save()
+    clist.rules = {
+        'inList': [
+            {'var': 'variation'},
+            {
+                'objectList': [
+                    {'lookup': ['variation', str(v1.pk), 'Ticket – A']},
+                ]
+            },
+        ]
+    }
+    clist.save()
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+    assert excinfo.value.code == 'rules'
+
+    clist.rules = {
+        'inList': [
+            {'var': 'variation'},
+            {
+                'objectList': [
+                    {'lookup': ['variation', str(v1.pk), 'Ticket – A']},
+                    {'lookup': ['variation', str(v2.pk), 'Ticket – B']},
+                ]
+            },
+        ]
+    }
+    clist.save()
+    assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+    perform_checkin(position, clist, {})
+
+
+@pytest.mark.django_db
+def test_rules_scan_number(position, clist):
+    # Ticket is valid three times
+    clist.allow_multiple_entries = True
+    clist.rules = {'<': [{'var': 'entries_number'}, 3]}
+    clist.save()
+    assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+    perform_checkin(position, clist, {})
+    perform_checkin(position, clist, {})
+    perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT)
+    assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+    perform_checkin(position, clist, {})
+    assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert excinfo.value.code == 'rules'
+
+
+@pytest.mark.django_db
+def test_rules_scan_today(event, position, clist):
+    # Ticket is valid three times per day
+    event.settings.timezone = 'Europe/Berlin'
+    clist.allow_multiple_entries = True
+    clist.rules = {'<': [{'var': 'entries_today'}, 3]}
+    clist.save()
+    with freeze_time('2020-01-01 10:00:00'):
+        perform_checkin(position, clist, {})
+        perform_checkin(position, clist, {})
+        perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT)
+        assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        perform_checkin(position, clist, {})
+        assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        with pytest.raises(CheckInError) as excinfo:
+            perform_checkin(position, clist, {})
+        assert excinfo.value.code == 'rules'
+
+    with freeze_time('2020-01-01 22:50:00'):
+        assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        with pytest.raises(CheckInError) as excinfo:
+            perform_checkin(position, clist, {})
+        assert excinfo.value.code == 'rules'
+
+    with freeze_time('2020-01-01 23:10:00'):
+        assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        perform_checkin(position, clist, {})
+        perform_checkin(position, clist, {})
+        perform_checkin(position, clist, {})
+        assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        with pytest.raises(CheckInError) as excinfo:
+            perform_checkin(position, clist, {})
+        assert excinfo.value.code == 'rules'
+
+
+@pytest.mark.django_db
+def test_rules_scan_days(event, position, clist):
+    # Ticket is valid unlimited times, but only on two arbitrary days
+    event.settings.timezone = 'Europe/Berlin'
+    clist.allow_multiple_entries = True
+    clist.rules = {
+        'or': [
+            {'>': [{'var': 'entries_today'}, 0]},
+            {'<': [{'var': 'entries_days'}, 2]},
+        ]
+    }
+    clist.save()
+    with freeze_time('2020-01-01 10:00:00'):
+        perform_checkin(position, clist, {})
+        perform_checkin(position, clist, {})
+        assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        perform_checkin(position, clist, {})
+
+    with freeze_time('2020-01-03 10:00:00'):
+        perform_checkin(position, clist, {})
+        perform_checkin(position, clist, {})
+        perform_checkin(position, clist, {})
+        assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        perform_checkin(position, clist, {})
+
+    with freeze_time('2020-01-03 22:50:00'):
+        assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        perform_checkin(position, clist, {})
+
+    with freeze_time('2020-01-03 23:50:00'):
+        assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        with pytest.raises(CheckInError) as excinfo:
+            perform_checkin(position, clist, {})
+        assert excinfo.value.code == 'rules'
+
+
+@pytest.mark.django_db
+def test_rules_time_isafter_tolerance(event, position, clist):
+    # Ticket is valid starting 10 minutes before admission time
+    event.settings.timezone = 'Europe/Berlin'
+    event.date_admission = event.datetime(2020, 1, 1, 12, 0, 0, tzinfo=timezone)
+    event.save()
+    clist.rules = {'isAfter': [{'var': 'now'}, {'buildTime': ['date_admission']}, 10]}
+    clist.save()
+    with freeze_time('2020-01-01 10:45:00'):
+        assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        with pytest.raises(CheckInError) as excinfo:
+            perform_checkin(position, clist, {})
+        assert excinfo.value.code == 'rules'
+
+    with freeze_time('2020-01-01 10:51:00'):
+        assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        perform_checkin(position, clist, {})
+
+
+@pytest.mark.django_db
+def test_rules_time_isafter_no_tolerance(event, position, clist):
+    # Ticket is valid only after admission time
+    event.settings.timezone = 'Europe/Berlin'
+    event.date_from = event.datetime(2020, 1, 1, 12, 0, 0, tzinfo=timezone)
+    # also tests that date_admission falls back to date_from
+    event.save()
+    clist.rules = {'isAfter': [{'var': 'now'}, {'buildTime': ['date_admission']}]}
+    clist.save()
+    with freeze_time('2020-01-01 10:51:00'):
+        assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        with pytest.raises(CheckInError) as excinfo:
+            perform_checkin(position, clist, {})
+        assert excinfo.value.code == 'rules'
+
+    with freeze_time('2020-01-01 11:01:00'):
+        assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        perform_checkin(position, clist, {})
+
+
+@pytest.mark.django_db
+def test_rules_time_isbefore_with_tolerance(event, position, clist):
+    # Ticket is valid until 10 minutes after end time
+    event.settings.timezone = 'Europe/Berlin'
+    event.date_to = event.datetime(2020, 1, 1, 12, 0, 0, tzinfo=timezone)
+    event.save()
+    clist.rules = {'isBefore': [{'var': 'now'}, {'buildTime': ['date_to']}, 10]}
+    clist.save()
+    with freeze_time('2020-01-01 11:11:00'):
+        assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        with pytest.raises(CheckInError) as excinfo:
+            perform_checkin(position, clist, {})
+        assert excinfo.value.code == 'rules'
+
+    with freeze_time('2020-01-01 11:09:00'):
+        assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        perform_checkin(position, clist, {})
+
+
+@pytest.mark.django_db
+def test_rules_time_isafter_custom_time(event, position, clist):
+    # Ticket is valid starting at a custom time
+    event.settings.timezone = 'Europe/Berlin'
+    clist.rules = {
+        'isAfter': [
+            {'var': 'now'},
+            {'buildTime': ['custom', '2020-01-01T22:00:00.000Z']},
+            None,
+        ]
+    }
+    clist.save()
+    with freeze_time('2020-01-01 21:55:00'):
+        assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        with pytest.raises(CheckInError) as excinfo:
+            perform_checkin(position, clist, {})
+        assert excinfo.value.code == 'rules'
+
+    with freeze_time('2020-01-01 22:05:00'):
+        assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        perform_checkin(position, clist, {})
+
+
+@pytest.mark.django_db
+def test_rules_isafter_subevent(position, clist, event):
+    event.has_subevents = True
+    event.save()
+    event.settings.timezone = 'Europe/Berlin'
+    se1 = event.subevents.create(name='Foo', date_from=event.datetime(2020, 2, 1, 12, 0, 0, tzinfo=timezone))
+    position.subevent = se1
+    position.save()
+    clist.rules = {'isAfter': [{'var': 'now'}, {'buildTime': ['date_admission']}]}
+    clist.save()
+    with freeze_time('2020-02-01 10:51:00'):
+        assert not OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        with pytest.raises(CheckInError) as excinfo:
+            perform_checkin(position, clist, {})
+        assert excinfo.value.code == 'rules'
+
+    with freeze_time('2020-02-01 11:01:00'):
+        assert OrderPosition.objects.filter(SQLLogic(clist).apply(clist.rules), pk=position.pk).exists()
+        perform_checkin(position, clist, {})
+
+
+@pytest.mark.django_db(transaction=True)
+def test_position_queries(django_assert_num_queries, position, clist):
+    with django_assert_num_queries(13) as captured:
+        perform_checkin(position, clist, {})
+    if 'sqlite' not in settings.DATABASES['default']['ENGINE']:
+        assert any('FOR UPDATE' in s['sql'] for s in captured)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_auto_checkout_at_correct_time(event, position, clist):
+    clist.exit_all_at = event.datetime(2020, 1, 2, 3, 0, tzinfo=timezone)
+    clist.save()
+    with freeze_time('2020-01-01 10:00:00+01:00'):
+        perform_checkin(position, clist, {})
+    with freeze_time('2020-01-02 02:55:00+01:00'):
+        process_exit_all(sender=None)
+    assert position.checkins.count() == 1
+    with freeze_time('2020-01-02 03:05:00+01:00'):
+        process_exit_all(sender=None)
+    assert clist.inside_count == 0
+    assert position.checkins.count() == 2
+    assert position.checkins.first().type == Checkin.TYPE_EXIT
+    clist.refresh_from_db()
+    assert clist.exit_all_at == event.datetime(2020, 1, 3, 3, 0, tzinfo=timezone)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_auto_check_out_only_if_checked_in(event, position, clist):
+    clist.exit_all_at = event.datetime(2020, 1, 2, 3, 0, tzinfo=timezone)
+    clist.save()
+    with freeze_time('2020-01-02 03:05:00+01:00'):
+        process_exit_all(sender=None)
+    assert position.checkins.count() == 0
+
+    with freeze_time('2020-01-02 04:05:00+01:00'):
+        perform_checkin(position, clist, {})
+    with freeze_time('2020-01-02 04:10:00+01:00'):
+        perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT)
+
+    with freeze_time('2020-01-03 03:05:00+01:00'):
+        process_exit_all(sender=None)
+    assert position.checkins.count() == 2
+
+
+@pytest.mark.django_db
+def test_limit_one_checkin_per_day_allows_next_day(position, clist):
+    clist.limit_one_checkin_per_day = True
+    clist.save()
+
+    with freeze_time('2020-01-01 10:00:00+01:00'):
+        perform_checkin(position, clist, {})
+    with freeze_time('2020-01-01 18:00:00+01:00'):
+        perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT)
+
+    with freeze_time('2020-01-02 10:00:00+01:00'):
+        perform_checkin(position, clist, {})
+
+    assert position.checkins.filter(type=Checkin.TYPE_ENTRY).count() == 2
+
+
+@pytest.mark.django_db
+def test_limit_one_checkin_per_gate(position, clist, event):
+    gate_a = event.organizer.gates.create(name='Gate A')
+    gate_b = event.organizer.gates.create(name='Gate B')
+    device_a = Device.objects.create(organizer=event.organizer, name='Scanner A', all_events=True, gate=gate_a)
+    device_b = Device.objects.create(organizer=event.organizer, name='Scanner B', all_events=True, gate=gate_b)
+
+    clist.limit_one_checkin_per_gate = True
+    clist.allow_entry_after_exit = True
+    clist.save()
+
+    with freeze_time('2020-01-01 10:00:00+01:00'):
+        perform_checkin(position, clist, {}, auth=device_a)
+    with freeze_time('2020-01-01 11:00:00+01:00'):
+        perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT, auth=device_a)
+
+    with freeze_time('2020-01-01 12:00:00+01:00'):
+        with pytest.raises(CheckInError) as excinfo:
+            perform_checkin(position, clist, {}, auth=device_a)
+        assert excinfo.value.code == 'already_redeemed'
+
+        perform_checkin(position, clist, {}, auth=device_b)
+    assert position.checkins.filter(type=Checkin.TYPE_ENTRY).count() == 2
+
+
+@pytest.mark.django_db
+def test_limit_one_checkin_per_day(position, clist):
+    clist.limit_one_checkin_per_day = True
+    clist.save()
+
+    with freeze_time('2020-01-01 10:00:00+01:00'):
+        perform_checkin(position, clist, {})
+    with freeze_time('2020-01-01 11:00:00+01:00'):
+        perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT)
+
+    with freeze_time('2020-01-01 12:00:00+01:00'):
+        with pytest.raises(CheckInError) as excinfo:
+            perform_checkin(position, clist, {})
+        assert excinfo.value.code == 'already_redeemed'
+    assert position.checkins.filter(type=Checkin.TYPE_ENTRY).count() == 1
+
+
+@pytest.mark.django_db
+def test_checkout_required_cross_gate(position, clist, event):
+    gate_a = event.organizer.gates.create(name='Gate A')
+    gate_b = event.organizer.gates.create(name='Gate B')
+    device_a = Device.objects.create(organizer=event.organizer, name='Scanner A', all_events=True, gate=gate_a)
+    device_b = Device.objects.create(organizer=event.organizer, name='Scanner B', all_events=True, gate=gate_b)
+
+    perform_checkin(position, clist, {}, auth=device_a)
+
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {}, auth=device_b)
+    assert excinfo.value.code == 'checkout_required'
+    assert excinfo.value.cross_gate is True
+    assert 'Gate A' in str(excinfo.value)
+    assert checkin_reason_explanation(excinfo.value, position, event)
+    assert checkin_error_response_data(excinfo.value) == {'cross_gate': True}
+
+
+@pytest.mark.django_db
+def test_already_redeemed_includes_reason_explanation(position, clist):
+    clist.allow_entry_after_exit = False
+    clist.save()
+    perform_checkin(position, clist, {})
+    perform_checkin(position, clist, {}, type=Checkin.TYPE_EXIT)
+
+    with pytest.raises(CheckInError) as excinfo:
+        perform_checkin(position, clist, {})
+    assert excinfo.value.code == 'already_redeemed'
+    assert checkin_reason_explanation(excinfo.value, position, clist.event) == str(excinfo.value)

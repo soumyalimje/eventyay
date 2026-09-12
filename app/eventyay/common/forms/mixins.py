@@ -1,14 +1,20 @@
+import json
 import logging
-import re
+from datetime import timedelta
 from functools import partial
 
 import dateutil.parser
 from django import forms
+from django.core.exceptions import ValidationError
+from django.utils import timezone
+
 from django.core.files import File
 from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import UploadedFile
+from django.db.models import Q
 from django.utils.crypto import get_random_string
 from django.utils.translation import gettext_lazy as _
+from django_countries.fields import Country, CountryField
 from hierarkey.forms import HierarkeyForm
 from i18nfield.forms import I18nFormField
 
@@ -21,9 +27,31 @@ from eventyay.common.forms.validators import (
 )
 from eventyay.common.forms.widgets import HtmlDateInput, HtmlDateTimeInput
 from eventyay.common.text.phrases import phrases
-from eventyay.base.models.cfp import default_fields
+from eventyay.common.utils.language import localize_event_text
+from phonenumber_field.formfields import PhoneNumberField
+from phonenumber_field.phonenumber import PhoneNumber
+from phonenumbers import NumberParseException
+from phonenumbers.data import _COUNTRY_CODE_TO_REGION_CODE
+from eventyay.base.forms.questions import WrappedPhoneNumberPrefixWidget, guess_country
+from eventyay.base.i18n import get_babel_locale, language
+from eventyay.common.session_video import exclude_session_video_from_cfp_questions
+from eventyay.common.video_embed import get_video_embed_info, parse_video_urls
+from eventyay.helpers.countries import CachedCountries
+from eventyay.helpers.escapejson import escapejson_attr
+from eventyay.base.models import TalkQuestion, TalkQuestionTarget, TalkQuestionVariant
+from eventyay.base.models.cfp import BUILTIN_FIELD_KEYS, normalize_field_order, default_fields
 
 logger = logging.getLogger(__name__)
+
+
+class EventLocalizedModelChoiceField(forms.ModelChoiceField):
+    def label_from_instance(self, obj):
+        return localize_event_text(getattr(obj, 'answer', obj))
+
+
+class EventLocalizedModelMultipleChoiceField(forms.ModelMultipleChoiceField):
+    def label_from_instance(self, obj):
+        return localize_event_text(getattr(obj, 'answer', obj))
 
 
 class ReadOnlyFlag:
@@ -49,6 +77,8 @@ class PublicContent:
         if event and not event.get_feature_flag('show_schedule'):
             return
         for field_name in self.Meta.public_fields:
+            if event and hasattr(event, 'cfp') and not event.cfp.is_field_public(field_name):
+                continue
             field = self.fields.get(field_name)
             if field:
                 field.original_help_text = getattr(field, 'original_help_text', '')
@@ -59,15 +89,19 @@ class PublicContent:
 class RequestRequire:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        count_chars = self.event.cfp.settings['count_length_in'] == 'chars'
+        _cfp = getattr(self.event, 'cfp', None) if hasattr(self.event, 'cfp') else None
+        _cfp_settings = _cfp.settings if _cfp else {}
+        _cfp_fields = _cfp.fields if _cfp else default_fields()
+        count_chars = _cfp_settings.get('count_length_in', 'chars') == 'chars'
+        count_length_in = _cfp_settings.get('count_length_in', 'chars')
         for key in self.Meta.request_require:
-            visibility = self.event.cfp.fields.get(key, default_fields()[key])['visibility']
+            visibility = _cfp_fields.get(key, default_fields()[key])['visibility']
             if visibility == 'do_not_ask':
                 self.fields.pop(key, None)
             elif field := self.fields.get(key):
                 field.required = visibility == 'required'
-                min_value = self.event.cfp.fields.get(key, {}).get('min_length')
-                max_value = self.event.cfp.fields.get(key, {}).get('max_length')
+                min_value = _cfp_fields.get(key, {}).get('min_length')
+                max_value = _cfp_fields.get(key, {}).get('max_length')
                 if min_value or max_value:
                     if min_value and count_chars:
                         field.widget.attrs['minlength'] = min_value
@@ -78,7 +112,7 @@ class RequestRequire:
                             self.validate_field_length,
                             min_length=min_value,
                             max_length=max_value,
-                            count_in=self.event.cfp.settings['count_length_in'],
+                            count_in=count_length_in,
                         )
                     )
                     field.original_help_text = getattr(field, 'original_help_text', '')
@@ -86,7 +120,7 @@ class RequestRequire:
                         '',
                         min_value,
                         max_value,
-                        self.event.cfp.settings['count_length_in'],
+                        count_length_in,
                     )
                     field.help_text = field.original_help_text + ' ' + field.added_help_text
 
@@ -116,7 +150,7 @@ class RequestRequire:
             # Line breaks should only be counted as one character
             length = len(value.replace('\r\n', '\n'))
         else:
-            length = len(re.findall(r'\b\w+\b', value))
+            length = len(value.split())
         if (min_length and min_length > length) or (max_length and max_length < length):
             error_message = RequestRequire.get_help_text('', min_length, max_length, count_in)
             errors = {
@@ -128,16 +162,128 @@ class RequestRequire:
 
 
 class QuestionFieldsMixin:
+    @staticmethod
+    def _resolve_single_choice_initial(initial_object, choices, default_answer):
+        """Return a valid AnswerOption initial, ignoring removed options."""
+        if initial_object:
+            return initial_object.options.filter(pk__in=choices.values_list('pk', flat=True)).first()
+        if default_answer:
+            return choices.filter(answer=default_answer).first()
+        return None
+
+    @staticmethod
+    def _resolve_multiple_choice_initial(initial_object, choices, default_answer):
+        """Return initial values for checkboxes, ignoring removed options.
+
+        Returns a list of valid AnswerOption instances for saved answers.
+        For unsaved answers, ``default_answer`` is passed through unchanged, since
+        it is configured by question settings and consumed directly by form fields.
+        """
+        if initial_object:
+            return list(initial_object.options.filter(pk__in=choices.values_list('pk', flat=True)))
+        if default_answer:
+            return default_answer
+        return []
+
+    def get_question_queryset(self, target, event):
+        qs = TalkQuestion.all_objects.filter(
+            event=event,
+            active=True,
+            is_imported=False,
+            target=target,
+        )
+        return exclude_session_video_from_cfp_questions(qs).order_by('position')
+
+    def inject_questions_into_fields(
+        self,
+        target,
+        event,
+        submission=None,
+        speaker=None,
+        review=None,
+        track=None,
+        submission_type=None,
+        readonly=False,
+    ):
+        """
+        Injects custom question fields into the form, filtered by track/type and pre-filled with answers.
+
+        Args:
+            target (str): TalkQuestionTarget (SUBMISSION/SPEAKER/REVIEWER).
+            event (Event): Event context.
+            submission, speaker, review: Answer contexts.
+            track, submission_type: Visibility filters.
+            readonly (bool): If True, fields are disabled.
+        """
+        questions = self.get_question_queryset(target, event)
+        # Apply filters based on submission context
+        if track:
+            questions = questions.filter(Q(tracks__in=[track]) | Q(tracks__isnull=True))
+        if submission_type:
+            questions = questions.filter(Q(submission_types__in=[submission_type]) | Q(submission_types__isnull=True))
+
+        # Pre-fetch existing answers
+        target_object = None
+        if target == TalkQuestionTarget.SUBMISSION:
+            target_object = submission
+        elif target == TalkQuestionTarget.SPEAKER:
+            target_object = speaker
+        elif target == TalkQuestionTarget.REVIEWER:
+            target_object = review
+
+        answers_by_question = {}
+        if target_object:
+            # Build a lookup dict to avoid scanning all answers for each question
+            for answer in target_object.answers.all():
+                # Preserve the first answer per question to match previous behavior
+                answers_by_question.setdefault(answer.question_id, answer)
+
+        for question in questions.prefetch_related('options'):
+            initial_object = None
+            initial = question.default_answer
+
+            if target_object:
+                answer = answers_by_question.get(question.id)
+                if answer:
+                    initial_object = answer
+                    initial = answer.answer_file if question.variant == TalkQuestionVariant.FILE else answer.answer
+
+            field = self.get_field(
+                question=question,
+                initial=initial,
+                initial_object=initial_object,
+                readonly=readonly,
+            )
+            if field is None:
+                continue
+            field.question = question
+            field.answer = initial_object
+
+            if question.dependency_question_id:
+                field.widget.attrs['data-question-dependency'] = question.dependency_question_id
+                field.widget.attrs['data-question-dependency-values'] = escapejson_attr(json.dumps(question.dependency_values))
+                if question.variant != TalkQuestionVariant.MULTIPLE:
+                    field.widget.attrs['required'] = question.required
+                    field._required = question.required
+                field.required = False
+
+            field_name = f'question_{question.pk}'
+            if field_name not in self.fields:
+                self.fields[field_name] = field
+
     def get_field(self, *, question, initial, initial_object, readonly):
-        from eventyay.base.templatetags.rich_text import rich_text
         from eventyay.base.models import TalkQuestionVariant
+        from eventyay.base.templatetags.rich_text import rich_text
 
         read_only = readonly or question.read_only
-        original_help_text = question.help_text
-        help_text = rich_text(question.help_text)[len('<p>') : -len('</p>')]
+        label_text = localize_event_text(question.question)
+        original_help_text = localize_event_text(question.help_text)
+        help_text = rich_text(original_help_text or '')[len('<p>') : -len('</p>')]
         if question.is_public and self.event.get_feature_flag('show_schedule'):
             help_text += ' ' + str(phrases.base.public_content)
-        count_chars = self.event.cfp.settings['count_length_in'] == 'chars'
+        count_chars = (
+            getattr(getattr(self.event, 'cfp', None), 'settings', {}).get('count_length_in', 'chars') == 'chars'
+        )
         if question.variant == TalkQuestionVariant.BOOLEAN:
             # For some reason, django-bootstrap4 does not set the required attribute
             # itself.
@@ -150,7 +296,7 @@ class QuestionFieldsMixin:
             field = forms.BooleanField(
                 disabled=read_only,
                 help_text=help_text,
-                label=question.question,
+                label=label_text,
                 required=question.required,
                 widget=widget,
                 initial=((initial == 'True') if initial else bool(question.default_answer)),
@@ -161,7 +307,7 @@ class QuestionFieldsMixin:
             field = forms.DecimalField(
                 disabled=read_only,
                 help_text=help_text,
-                label=question.question,
+                label=label_text,
                 required=question.required,
                 min_value=question.min_number,
                 max_value=question.max_number,
@@ -177,9 +323,9 @@ class QuestionFieldsMixin:
                     help_text,
                     question.min_length,
                     question.max_length,
-                    self.event.cfp.settings['count_length_in'],
+                    getattr(getattr(self.event, 'cfp', None), 'settings', {}).get('count_length_in', 'chars'),
                 ),
-                label=question.question,
+                label=label_text,
                 required=question.required,
                 initial=initial,
                 min_length=question.min_length if count_chars else None,
@@ -192,24 +338,81 @@ class QuestionFieldsMixin:
                     RequestRequire.validate_field_length,
                     min_length=question.min_length,
                     max_length=question.max_length,
-                    count_in=self.event.cfp.settings['count_length_in'],
+                    count_in=getattr(getattr(self.event, 'cfp', None), 'settings', {}).get('count_length_in', 'chars'),
                 )
             )
             return field
         if question.variant == TalkQuestionVariant.URL:
             field = forms.URLField(
-                label=question.question,
+                label=label_text,
                 required=question.required,
                 disabled=read_only,
-                help_text=question.help_text,
+                help_text=original_help_text,
                 initial=initial,
             )
             field.original_help_text = original_help_text
             field.widget.attrs['placeholder'] = ''  # XSS
             return field
+        if question.variant == TalkQuestionVariant.PHONE_NUMBER:
+
+            with language(get_babel_locale()):
+                default_country = guess_country(self.event)
+                default_prefix = None
+                if default_country:
+                    for prefix, values in _COUNTRY_CODE_TO_REGION_CODE.items():
+                        if str(default_country) in values:
+                            default_prefix = prefix
+                            break
+                try:
+                    initial_val = PhoneNumber().from_string(initial) if initial else (f'+{default_prefix}.' if default_prefix else None)
+                except NumberParseException:
+                    initial_val = None
+                
+                field = PhoneNumberField(
+                    label=label_text,
+                    required=question.required,
+                    disabled=read_only,
+                    help_text=original_help_text,
+                    initial=initial_val,
+                    widget=WrappedPhoneNumberPrefixWidget(),
+                )
+                field.original_help_text = original_help_text
+                return field
+        if question.variant == TalkQuestionVariant.VIDEO:
+            video_help = original_help_text or _(
+                'Paste YouTube or Vimeo URLs, one per line. '
+                'Publish this field to embed the videos on the public session page.'
+            )
+
+            def validate_video_urls(value):
+                urls = parse_video_urls(value)
+                if value and str(value).strip() and not urls:
+                    raise ValidationError(
+                        _('Please enter valid YouTube or Vimeo URLs, one per line.')
+                    )
+                for url in urls:
+                    if get_video_embed_info(url) is None:
+                        raise ValidationError(
+                            _('Please enter valid YouTube or Vimeo URLs, one per line.')
+                        )
+
+            field = forms.CharField(
+                label=label_text,
+                required=question.required,
+                disabled=read_only,
+                help_text=video_help,
+                initial=initial,
+                widget=forms.Textarea(attrs={'rows': 3}),
+                validators=[validate_video_urls],
+            )
+            field.original_help_text = original_help_text
+            field.widget.attrs['placeholder'] = (
+                'https://www.youtube.com/watch?v=…\nhttps://vimeo.com/…'
+            )
+            return field
         if question.variant == TalkQuestionVariant.TEXT:
             field = forms.CharField(
-                label=question.question,
+                label=label_text,
                 required=question.required,
                 widget=forms.Textarea,
                 disabled=read_only,
@@ -217,7 +420,7 @@ class QuestionFieldsMixin:
                     help_text,
                     question.min_length,
                     question.max_length,
-                    self.event.cfp.settings['count_length_in'],
+                    getattr(getattr(self.event, 'cfp', None), 'settings', {}).get('count_length_in', 'chars'),
                 ),
                 initial=initial,
                 min_length=question.min_length if count_chars else None,
@@ -228,7 +431,7 @@ class QuestionFieldsMixin:
                     RequestRequire.validate_field_length,
                     min_length=question.min_length,
                     max_length=question.max_length,
-                    count_in=self.event.cfp.settings['count_length_in'],
+                    count_in=getattr(getattr(self.event, 'cfp', None), 'settings', {}).get('count_length_in', 'chars'),
                 )
             )
             field.original_help_text = original_help_text
@@ -236,7 +439,7 @@ class QuestionFieldsMixin:
             return field
         if question.variant == TalkQuestionVariant.FILE:
             field = ExtensionFileField(
-                label=question.question,
+                label=label_text,
                 required=question.required,
                 disabled=read_only,
                 help_text=help_text,
@@ -284,31 +487,59 @@ class QuestionFieldsMixin:
             return field
         if question.variant == TalkQuestionVariant.CHOICES:
             choices = question.options.all()
-            field = forms.ModelChoiceField(
+            initial_value = self._resolve_single_choice_initial(
+                initial_object, choices, question.default_answer
+            )
+            field = EventLocalizedModelChoiceField(
                 queryset=choices,
-                label=question.question,
+                label=label_text,
                 required=question.required,
-                empty_label=None,
-                initial=(initial_object.options.first() if initial_object else question.default_answer),
+                empty_label=None if question.required else _('— No selection —'),
+                # Django 6 clears empty_label for RadioSelect unless blank=True.
+                blank=not question.required,
+                initial=initial_value,
                 disabled=read_only,
                 help_text=help_text,
-                widget=(forms.RadioSelect if len(choices) < 4 else forms.Select(attrs={'class': 'enhanced'})),
+                widget=forms.RadioSelect,
+            )
+            field.original_help_text = original_help_text
+            return field
+        if question.variant == TalkQuestionVariant.SELECT:
+            choices = question.options.all()
+            initial_value = self._resolve_single_choice_initial(
+                initial_object, choices, question.default_answer
+            )
+            field = EventLocalizedModelChoiceField(
+                queryset=choices,
+                label=label_text,
+                required=question.required,
+                empty_label=(
+                    None
+                    if question.required and initial_value is not None
+                    else _('— No selection —')
+                ),
+                initial=initial_value,
+                disabled=read_only,
+                help_text=help_text,
+                widget=forms.Select(attrs={'class': 'enhanced'}),
             )
             field.original_help_text = original_help_text
             field.widget.attrs['placeholder'] = ''  # XSS
             return field
         if question.variant == TalkQuestionVariant.MULTIPLE:
             choices = question.options.all()
-            field = forms.ModelMultipleChoiceField(
+            field = EventLocalizedModelMultipleChoiceField(
                 queryset=choices,
-                label=question.question,
+                label=label_text,
                 required=question.required,
                 widget=(
                     forms.CheckboxSelectMultiple
                     if len(choices) < 8
                     else forms.SelectMultiple(attrs={'class': 'enhanced'})
                 ),
-                initial=(initial_object.options.all() if initial_object else question.default_answer),
+                initial=self._resolve_multiple_choice_initial(
+                    initial_object, choices, question.default_answer
+                ),
                 disabled=read_only,
                 help_text=help_text,
             )
@@ -322,7 +553,7 @@ class QuestionFieldsMixin:
             if question.max_date:
                 attrs['data-date-end-date'] = question.max_date.isoformat()
             field = forms.DateField(
-                label=question.question,
+                label=label_text,
                 required=question.required,
                 disabled=read_only,
                 help_text=help_text,
@@ -343,7 +574,7 @@ class QuestionFieldsMixin:
             if question.max_datetime:
                 attrs['max'] = question.max_datetime.isoformat()
             field = forms.DateTimeField(
-                label=question.question,
+                label=label_text,
                 required=question.required,
                 disabled=read_only,
                 help_text=help_text,
@@ -356,6 +587,17 @@ class QuestionFieldsMixin:
                 field.validators.append(MinDateTimeValidator(question.min_datetime))
             if question.max_datetime:
                 field.validators.append(MaxDateTimeValidator(question.max_datetime))
+            return field
+        if question.variant == TalkQuestionVariant.COUNTRY:
+            field = CountryField(countries=CachedCountries).formfield(
+                label=label_text,
+                required=question.required,
+                disabled=read_only,
+                help_text=help_text,
+                initial=initial or None,
+            )
+            field.original_help_text = original_help_text
+            field.widget.attrs['placeholder'] = ''  # XSS
             return field
         return None
 
@@ -405,9 +647,61 @@ class QuestionFieldsMixin:
                 answer.answer_file.save(value.name, value, save=False)
                 answer.answer = 'file://' + value.name
             value = answer.answer
+        elif value is not None and isinstance(value, Country):
+            answer.answer = value.code
         else:
             answer.answer = value
         answer.save()
+
+    def clean(self):
+        cleaned_data = super().clean()
+
+        question_cache = {
+            field.question.pk: field.question
+            for field_name, field in self.fields.items()
+            if field_name.startswith('question_') and hasattr(field, 'question')
+        }
+
+        def question_is_visible(parent_id, dep_values):
+            if parent_id not in question_cache:
+                return False
+            parent_question = question_cache[parent_id]
+            if parent_question.dependency_question_id and not question_is_visible(
+                parent_question.dependency_question_id, parent_question.dependency_values
+            ):
+                return False
+            parent_field_name = f'question_{parent_id}'
+            if parent_field_name not in cleaned_data:
+                return False
+            parent_value = cleaned_data[parent_field_name]
+            if parent_value is None or parent_value == '':
+                return False
+            if isinstance(parent_value, bool):
+                return ('True' in dep_values and parent_value) or ('False' in dep_values and not parent_value)
+            if isinstance(parent_value, str):
+                return parent_value in dep_values
+            if hasattr(parent_value, '__iter__'):
+                return any(
+                    (str(v.pk) if hasattr(v, 'pk') else str(v)) in dep_values
+                    for v in parent_value
+                )
+            if hasattr(parent_value, 'pk'):
+                return str(parent_value.pk) in dep_values
+            return str(parent_value) in dep_values
+
+        for field_name, field in self.fields.items():
+            if not field_name.startswith('question_') or not hasattr(field, 'question'):
+                continue
+            question = field.question
+            if not question.dependency_question_id or not question.required:
+                continue
+            if not question_is_visible(question.dependency_question_id, question.dependency_values):
+                continue
+            value = cleaned_data.get(field_name)
+            if value is None or value == '' or (hasattr(value, '__len__') and len(value) == 0):
+                self.add_error(field_name, forms.ValidationError(_('This field is required.')))
+
+        return cleaned_data
 
 
 class I18nHelpText:
@@ -433,20 +727,28 @@ class JsonSubfieldMixin:
                 self.fields[field].initial = data_dict.get(field)
             else:
                 defaults = self.instance._meta.get_field(path).default()
-                self.fields[field].initial = defaults.get(field)
+                if field in defaults:
+                    self.fields[field].initial = defaults.get(field)
 
     def save(self, *args, **kwargs):
         if getattr(super(), 'save', None):
             instance = super().save(*args, **kwargs)
         else:
             instance = self.instance
+        modified_paths = set()
         for field, path in self.Meta.json_fields.items():
+            # Fields may be conditionally removed (e.g. feature-gated); leave any
+            # stored value untouched rather than overwriting it with None.
+            if field not in self.fields:
+                continue
             # We don't need nested data for now
             data_dict = getattr(instance, path) or {}
             data_dict[field] = self.cleaned_data.get(field)
             setattr(instance, path, data_dict)
+            modified_paths.add(path)
         if kwargs.get('commit', True):
-            instance.save()
+            # Only save the modified JSON fields to avoid overwriting other model fields
+            instance.save(update_fields=list(modified_paths))
         return instance
 
 
@@ -505,3 +807,67 @@ class HierarkeyMixin:
         nonce = get_random_string(length=8)
         suffix = name.split('.')[-1]
         return f'{self.obj._meta.model_name}-{self.attribute_name}/{self.obj.pk}/{name}.{nonce}.{suffix}'
+
+
+class ConfiguredFieldOrderMixin:
+    def order_fields_by_config(self, config_key):
+        _cfp = getattr(self.event, 'cfp', None) if hasattr(self.event, 'cfp') else None
+        fields_config = (_cfp.settings.get('fields_config', {}).get(config_key, []) if _cfp else [])
+        if fields_config:
+            builtin_names = set(BUILTIN_FIELD_KEYS.get(config_key, ()))
+            # Ensure every built-in field is present at its canonical position.
+            # This handles both config-with-no-builtins and partially-populated
+            # configs (e.g. a new built-in added after the config was saved).
+            fields_config = normalize_field_order(fields_config, config_key)
+            configured_names = []
+            for item in fields_config:
+                name = None
+                if isinstance(item, str):
+                    name = item
+                elif isinstance(item, dict):
+                    # Try common keys for field name in configuration dicts
+                    name = item.get('name') or item.get('field')
+                else:
+                    logger.warning('Field configuration item %r is ignored (unknown type)', item)
+
+                if not name:
+                    continue
+
+                # Config stores custom question IDs as bare digit strings
+                # (e.g. '42'), but form fields are named 'question_42'.
+                # Only remap when the entry is not a known built-in field.
+                if name not in builtin_names and name not in self.fields:
+                    question_name = f'question_{name}'
+                    if question_name in self.fields:
+                        name = question_name
+                    else:
+                        logger.warning(
+                            'fields_config[%s] entry %r does not match '
+                            'any form field; skipping.',
+                            config_key, name,
+                        )
+                        continue
+
+                if name in self.fields and name not in configured_names:
+                    configured_names.append(name)
+
+            if configured_names:
+                # Preserve any fields not mentioned in the configuration at the end
+                remaining = [n for n in self.fields if n not in configured_names]
+                self.order_fields(configured_names + remaining)
+
+
+class ScheduledAtValidationMixin:
+    def clean_scheduled_at(self):
+        scheduled_at = self.cleaned_data.get('scheduled_at')
+        if getattr(self, 'draft_save', False):
+            return scheduled_at
+        if scheduled_at is not None:
+            if timezone.is_naive(scheduled_at):
+                scheduled_at = timezone.make_aware(scheduled_at, timezone.get_current_timezone())
+            buffer = timedelta(minutes=1)
+            if scheduled_at < timezone.now() - buffer:
+                raise forms.ValidationError(
+                    _('Scheduled time must not be in the past.')
+                )
+        return scheduled_at

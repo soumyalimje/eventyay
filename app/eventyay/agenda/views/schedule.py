@@ -1,46 +1,141 @@
 import json
 import textwrap
 from contextlib import suppress
-from urllib.parse import unquote
+from datetime import timedelta
+from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 from django.contrib import messages
+from django.core import signing
+from django.core.cache import cache
 from django.http import (
     Http404,
     HttpResponse,
     HttpResponsePermanentRedirect,
     HttpResponseRedirect,
+    JsonResponse,
 )
 from django.urls import resolve, reverse
+from django.utils import timezone
 from django.utils.functional import cached_property
-from django.utils.translation import gettext_lazy as _
+from django.utils.http import urlencode
+from django.utils.translation import get_language, gettext_lazy as _, pgettext_lazy
 from django.views.decorators.cache import cache_page
+from django.views.decorators.http import require_http_methods
 from django.views.generic import TemplateView
 from django_context_decorator import context
 
 from eventyay.agenda.views.utils import (
+    CACHE_TTL,
+    build_schedule_json,
+    build_schedule_meta_json,
+    escape_json_for_script,
     get_schedule_exporter_content,
     get_schedule_exporters,
+    is_public_schedule_empty,
+    load_starred_ics_token,
+    redirect_to_presale_with_warning,
+    starred_sharing_payload,
 )
 from eventyay.common.signals import register_my_data_exporters
+from eventyay.common.urls import get_base_url
+from eventyay.common.views.helpers import build_login_url_with_next
 from eventyay.common.views.mixins import EventPermissionRequired, PermissionRequired
 from eventyay.schedule.ascii import draw_ascii_schedule
 from eventyay.schedule.exporters import ScheduleData
-from eventyay.base.models.submission import SubmissionFavouriteDeprecated
+from eventyay.talk_rules.agenda import require_wip_schedule_access
+from eventyay.talk_rules.submission import are_featured_submissions_visible, can_use_featured_exports
+
+
+# Starred-ICS token timing: grace, fallback, refresh buffer.
+STARRED_ICS_TOKEN_SESSION_KEY = 'my_starred_ics_token'
+STARRED_ICS_TOKEN_GRACE_PERIOD = timedelta(hours=24)
+STARRED_ICS_TOKEN_FALLBACK_LIFETIME = timedelta(seconds=30)
+STARRED_ICS_TOKEN_MIN_VALIDITY = timedelta(seconds=10)
 
 
 class ScheduleMixin:
+    @staticmethod
+    def _version_from_kwargs(kwargs):
+        if version := kwargs.get('version'):
+            return unquote(version)
+        return None
+
+    def ensure_wip_schedule_access(self, kwargs=None, request=None):
+        """WIP preview is restricted to organisers and reviewers with schedule access."""
+        request = request or getattr(self, 'request', None)
+        if request is None:
+            return
+        if self._version_from_kwargs(kwargs or getattr(self, 'kwargs', {})) != 'wip':
+            return
+        require_wip_schedule_access(request)
+
     @cached_property
     def version(self):
         if version := self.kwargs.get('version'):
             return unquote(version)
         return None
 
+    @staticmethod
+    def generate_ics_token(request, user_id):
+        """Generate a signed token for the starred-sessions ICS export.
+
+        Expiry policy:
+        - If the event has not yet ended (plus a 24h grace), expire at event end + 24h.
+        - Otherwise (event end + 24h already passed), fall back to a short-lived token.
+
+        Note:
+        The session key is rotated (so the *session-stored* token is replaced), but there is
+        no server-side revocation list. Previously issued tokens remain valid until their
+        embedded expiry time.
+        """
+        key = STARRED_ICS_TOKEN_SESSION_KEY
+        if key in request.session:
+            del request.session[key]
+
+        expiry_fallback = timezone.now() + STARRED_ICS_TOKEN_FALLBACK_LIFETIME
+        expiry = expiry_fallback
+        event = request.event
+        expiry_event = event.date_to + STARRED_ICS_TOKEN_GRACE_PERIOD
+        if timezone.is_naive(expiry_event):
+            expiry_event = timezone.make_aware(expiry_event, timezone=timezone.get_current_timezone())
+        if expiry_event > timezone.now():
+            expiry = expiry_event
+
+        value = {
+            'user_id': user_id,
+            'exp': int(expiry.timestamp()),
+            'event_id': event.pk,
+        }
+        token = signing.dumps(value, salt='my-starred-ics')
+
+        request.session[key] = token
+        return token
+
+    @staticmethod
+    def check_token_expiry(token, *, event=None):
+        """Check if a token exists and has enough time until expiry.
+
+        Returns:
+        - None if token is invalid
+        - False if token is valid but expiring soon
+        - True if token is valid and not expiring soon
+        """
+        _user_id, expiry_dt = load_starred_ics_token(token, event=event)
+        if not expiry_dt:
+            return None
+        time_until_expiry = expiry_dt - timezone.now()
+        return time_until_expiry >= STARRED_ICS_TOKEN_MIN_VALIDITY
+
     def get_object(self):
         schedule = None
-        if self.version:
+        if self.version == 'wip':
+            schedule = self.request.event.wip_schedule
+        elif self.version:
             with suppress(Exception):
                 schedule = (
-                    self.request.event.schedules.filter(version__iexact=self.version).select_related('event', 'event__organizer').first()
+                    self.request.event.schedules.filter(version__iexact=self.version)
+                    .select_related('event', 'event__organizer')
+                    .first()
                 )
         schedule = schedule or self.request.event.current_schedule
         if schedule:
@@ -73,16 +168,41 @@ class ScheduleMixin:
 class ExporterView(EventPermissionRequired, ScheduleMixin, TemplateView):
     permission_required = 'base.list_schedule'
 
+    def has_permission(self):
+        if super().has_permission():
+            return True
+        if self.request.GET.get('featured') == 'true':
+            return can_use_featured_exports(self.request.user, self.request.event)
+        return False
+
+    def handle_no_permission(self):
+        if self.request.user.is_anonymous:
+            raise Http404()
+        return super().handle_no_permission()
+
+    def dispatch(self, request, *args, **kwargs):
+        self.ensure_wip_schedule_access(kwargs, request)
+        return super().dispatch(request, *args, **kwargs)
+
     def get(self, request, *args, **kwargs):
         url = resolve(self.request.path_info)
-        if url.url_name == 'export':
-            name = url.kwargs.get('name') or unquote(self.request.GET.get('exporter'))
+        url_name = url.url_name or ''
+        base_url_name = url_name[len('versioned-') :] if url_name.startswith('versioned-') else url_name
+
+        if 'name' in url.kwargs and url.kwargs.get('name') is not None:
+            name = url.kwargs['name']
+        elif base_url_name in ['export', 'export-tokenized']:
+            exporter_param = self.request.GET.get('exporter')
+            name = unquote(exporter_param) if exporter_param else ''
         else:
-            name = url.url_name
+            name = base_url_name
+
+        if base_url_name == 'export-tokenized' and name != 'schedule-my.ics':
+            raise Http404()
 
         if name.startswith('export.'):
             name = name[len('export.') :]
-        response = get_schedule_exporter_content(request, name, self.schedule)
+        response = get_schedule_exporter_content(request, name, self.schedule, token=kwargs.get('token'))
         if not response:
             raise Http404()
         return response
@@ -120,9 +240,13 @@ class ScheduleView(PermissionRequired, ScheduleMixin, TemplateView):
         return HttpResponse(response_start + result, content_type='text/plain; charset=utf-8')
 
     def dispatch(self, request, **kwargs):
-        if not self.has_permission() and self.request.user.has_perm(
-            'base.list_featured_submission', self.request.event
-        ):
+        self.ensure_wip_schedule_access(kwargs, request)
+        if self._version_from_kwargs(kwargs) is None and is_public_schedule_empty(request):
+            if request.resolver_match and request.resolver_match.url_name == 'talks':
+                return redirect_to_presale_with_warning(request, _('No published sessions.'))
+            return redirect_to_presale_with_warning(request, _('No published schedule.'))
+
+        if not self.has_permission() and are_featured_submissions_visible(self.request.user, self.request.event):
             messages.success(request, _('Our schedule is not live yet.'))
             return HttpResponseRedirect(self.request.event.urls.featured)
         return super().dispatch(request, **kwargs)
@@ -163,31 +287,216 @@ class ScheduleView(PermissionRequired, ScheduleMixin, TemplateView):
 
     @context
     def exporters(self):
-        return [exporter for exporter in get_schedule_exporters(self.request, public=True) if exporter.show_public]
+        exporters = [exporter for exporter in get_schedule_exporters(self.request, public=True) if exporter.show_public]
+
+        order = {
+            'google-calendar': 0,
+            'webcal': 1,
+            'schedule.ics': 10,
+            'schedule.json': 11,
+            'schedule.xml': 12,
+            'schedule.xcal': 13,
+            'faved.ics': 14,
+            'my-google-calendar': 100,
+            'my-webcal': 101,
+            'schedule-my.ics': 110,
+            'schedule-my.json': 111,
+            'schedule-my.xml': 112,
+            'schedule-my.xcal': 113,
+        }
+
+        def sort_key(exporter):
+            identifier = exporter.identifier
+            if identifier in order:
+                return (order[identifier], exporter.verbose_name, identifier)
+
+            is_my = identifier.startswith('my-') or '-my' in identifier
+            bucket = 50 if not is_my else 150
+            return (bucket, exporter.verbose_name, identifier)
+
+        exporters.sort(key=sort_key)
+
+        export_view_name = 'agenda:export'
+        export_reverse_kwargs = {
+            'organizer': self.request.event.organizer.slug,
+            'event': self.request.event.slug,
+        }
+        if self.version is not None:
+            export_view_name = 'agenda:versioned-export'
+            export_reverse_kwargs['version'] = self.version
+
+        for exporter in exporters:
+            exporter.export_url = reverse(
+                export_view_name,
+                kwargs={
+                    **export_reverse_kwargs,
+                    'name': exporter.identifier,
+                },
+            )
+        return exporters
 
     @context
     def my_exporters(self):
         return list(exporter(self.request.event) for _, exporter in register_my_data_exporters.send(self.request.event))
 
     @context
+    def is_sessions_page(self):
+        return self.request.path.endswith('/sessions/')
+
+    @context
     def show_talk_list(self):
-        return self.request.path.endswith('/sessions/') or self.request.event.display_settings['schedule'] == 'list'
+        return self.is_sessions_page() or self.request.event.display_settings['schedule'] == 'list'
+
+    @context
+    def schedule_data_json(self):
+        """Inline non-enriched schedule JSON for all schedule pages.
+
+        Vue reads this directly and skips the widget endpoint fetch entirely,
+        removing a full round-trip from every page load.  Released schedules are
+        cached for 5 minutes; WIP is never cached (and uses all_talks=True).
+        """
+        return build_schedule_json(self.request, self.schedule)
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        schedule = ctx.get('schedule')
+        version = self.version or (schedule.version if schedule else None)
+        cache_version = schedule.version if schedule else None
+
+        # Cache the entire meta JSON for released schedules (avoids DB + signal dispatch per request).
+        # WIP schedules are never cached so organiser previews are always fresh.
+        if cache_version:
+            language = get_language() or ''
+            meta_cache_key = f'eagenda:meta:{self.request.event.pk}:{cache_version}:{language}'
+            cached_meta = cache.get(meta_cache_key)
+            if cached_meta is not None:
+                ctx['schedule_meta_json'] = cached_meta
+                ctx['schedule_page_version'] = version or ''
+                return ctx
+
+        meta_json = build_schedule_meta_json(self.request.event, schedule)
+        ctx['schedule_meta_json'] = meta_json
+        ctx['schedule_page_version'] = version or ''
+        if cache_version:
+            cache.set(meta_cache_key, meta_json, CACHE_TTL)
+        return ctx
 
 
-@cache_page(60 * 60 * 24)
+@cache_page(60 * 60 * 24, key_prefix='schedule-messages-v4')
 def schedule_messages(request, **kwargs):
-    """This view is cached for a day, as it is small and non-critical, but loaded synchronously."""
+    """Cached for static exports; bump key_prefix when message keys or copy change."""
     strings = {
-        'favs_not_logged_in': _(
-            "You're currently not logged in, so your favourited talks will only be stored locally in your browser."
+        'favs_anonymous_notice': _(
+            'Your favourites can only be saved locally in this browser. '
+            'Please sign in or register to sync starred sessions and use more features. '
+            'Locally saved stars may be lost if you clear your browser data; '
+            'we are not responsible for data loss in this case.'
         ),
-        'favs_not_saved': _('Your favourites could only be saved locally in your browser.'),
+        'favs_not_saved': _(
+            'Could not save favourites in this browser. Please check your browser storage settings.'
+        ),
+        'no_matching_options': _('Sorry, no matching options.'),
+        'view_changelog': _('View Changelog'),
+        'go_to_current_version': _('Go to current version'),
+        'reset_all_filters': _('Reset all filters'),
+        'sort_by': _('Sort'),
+        'sort_by_room': _('By room'),
+        'sort_by_title': _('A–Z'),
+        'sort_by_popularity': _('Most popular'),
+        'fullscreen': _('Fullscreen'),
+        'exit_fullscreen': _('Exit Fullscreen'),
+        'latest': _('Latest'),
+        'version_warning_editable': _(
+            'You are currently viewing the editable schedule version. It may not match the released version.'
+        ),
+        'version_warning_wip': _(
+            'You are currently viewing the unreleased schedule preview. '
+            'It may change at any time and is not visible to the public.'
+        ),
+        'version_warning_old': _('You are currently viewing an older schedule version.'),
+        'join_room': _('Join room'),
+        'join_session': _('Join session'),
+        'view_video': _('View Video'),
+        'watch_live': _('Watch live'),
+        'speaker_fallback': pgettext_lazy('noun', 'Speaker'),
+        'speaker_name_not_provided': _('Speaker name not provided'),
+        'add_to_calendar': _('Add to Calendar'),
+        'public_schedule_only': _(
+            'Only available on the public schedule once a schedule is released and public.'
+        ),
+        'ical': _('iCal'),
+        'json': _('JSON'),
+        'xml': _('XML'),
+        'xcal': _('XCal'),
+        'google_calendar': _('Google Calendar'),
+        'webcal': _('Webcal'),
+        'yes': _('Yes'),
+        'no': _('No'),
+        'no_speakers_found': _('No speakers found.'),
+        'sessions': _('Sessions'),
+        'tracks': _('Tracks'),
+        'speakers': _('Speakers'),
+        'downloads': _('Downloads'),
+        'starred_by': _('Starred by'),
+        'starred': _('Starred'),
+        'show_talk_starrers': _('Share starred sessions'),
+        'show_talk_starrers_tooltip': _(
+            'Make your starred sessions visible to others. You can open someone else\'s starred list only if they have enabled sharing.'
+        ),
+        'export': _('Export'),
+        'exports': _('Exports'),
+        'no_file_provided': _('No file provided'),
+        'no_response': _('No response'),
+        'other_timezones': _('Other Timezones'),
+        'current': _('current'),
+        'print': _('Print'),
+        'list_view': _('List View'),
+        'calendar_view': _('Calendar View'),
+        'search': _('Search'),
+        'featured_speakers': _('Featured Speakers'),
+        'view_profile': _('View speaker profile'),
+        'no_starred_sessions': _('No starred sessions.'),
+        'schedule_do_not_record': _('This session will not be recorded.'),
+        'schedule_room_has_interpretation': _('This room has live interpretation.'),
+        'back': _('Back'),
+        'schedule_pending_secondary': _('Coming soon'),
+        'schedule_speakers_overflow_hint': _('+%(count)s more'),
+        'schedule_speakers_overflow_label': _('+%(count)s more speakers'),
+        'no_schedule_available': _('No schedule has been published yet. Please check back later.'),
     }
     strings = {key: str(value) for key, value in strings.items()}
     return HttpResponse(
-        f'const EVENTYAY_MESSAGES = {json.dumps(strings)};',
+        f'const PRETALX_MESSAGES = {json.dumps(strings)};',
         content_type='application/javascript',
     )
+
+
+@require_http_methods(['GET', 'POST'])
+def starred_sharing_preference(request, event, **kwargs):
+    """Read or update whether the logged-in user shares starred sessions publicly."""
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': str(_('Authentication required'))}, status=403)
+    if not request.user.has_perm('base.list_schedule', request.event):
+        return JsonResponse({'detail': str(_('Permission denied'))}, status=403)
+
+    if request.method == 'GET':
+        response = JsonResponse(starred_sharing_payload(request.user, request.event))
+    else:
+        try:
+            data = json.loads(request.body.decode() or '{}')
+        except json.JSONDecodeError:
+            return JsonResponse({'detail': str(_('Invalid JSON'))}, status=400)
+
+        show_publicly = data.get('show_publicly')
+        if not isinstance(show_publicly, bool):
+            return JsonResponse({'detail': str(_('Expected boolean show_publicly.'))}, status=400)
+
+        request.user.show_publicly = show_publicly
+        request.user.save(update_fields=['show_publicly'])
+        response = JsonResponse(starred_sharing_payload(request.user, request.event))
+
+    response['Cache-Control'] = 'no-store'
+    return response
 
 
 def talk_sort_key(talk):
@@ -225,4 +534,87 @@ class ChangelogView(EventPermissionRequired, TemplateView):
 
     @context
     def schedules(self):
-        return self.request.event.schedules.all().filter(version__isnull=False).select_related('event', 'event__organizer')
+        return (
+            self.request.event.schedules.all().filter(version__isnull=False).select_related('event', 'event__organizer')
+        )
+
+
+class CalendarRedirectView(EventPermissionRequired, ScheduleMixin, TemplateView):
+    """Handles redirects for both Google Calendar and other calendar applications."""
+
+    permission_required = 'base.list_schedule'
+
+    def dispatch(self, request, *args, **kwargs):
+        self.ensure_wip_schedule_access(kwargs, request)
+        return super().dispatch(request, *args, **kwargs)
+
+    def get(self, request, *args, **kwargs):
+        url_name = request.resolver_match.url_name if request.resolver_match else ''
+        is_google = url_name.endswith('export.google-calendar') or url_name.endswith('export.my-google-calendar')
+        is_my = url_name.endswith('export.my-google-calendar') or url_name.endswith('export.my-webcal')
+
+        ics_view_name = 'agenda:export'
+        ics_tokenized_view_name = 'agenda:export-tokenized'
+        reverse_kwargs = {
+            'organizer': self.request.event.organizer.slug,
+            'event': self.request.event.slug,
+        }
+        if self.version is not None:
+            ics_view_name = 'agenda:versioned-export'
+            ics_tokenized_view_name = 'agenda:versioned-export-tokenized'
+            reverse_kwargs['version'] = self.version
+
+        parsed_base = urlparse(get_base_url(request.event))
+        base_url = f'{parsed_base.scheme}://{parsed_base.netloc}'
+
+        if is_my:
+            if not request.user.is_authenticated:
+                return HttpResponseRedirect(build_login_url_with_next(self.request.get_full_path()))
+
+            existing_token = request.session.get(STARRED_ICS_TOKEN_SESSION_KEY)
+            generate_new_token = True
+
+            if existing_token:
+                token_status = self.check_token_expiry(existing_token, event=request.event)
+                if token_status is True:  # Token is valid and not expiring imminently
+                    token = existing_token
+                    generate_new_token = False
+
+            if generate_new_token:
+                token = self.generate_ics_token(request, request.user.id)
+
+            ics_url = urljoin(
+                base_url,
+                reverse(
+                    ics_tokenized_view_name,
+                    kwargs={
+                        **reverse_kwargs,
+                        'name': 'schedule-my.ics',
+                        'token': token,
+                    },
+                ),
+            )
+        else:
+            ics_url = urljoin(
+                base_url,
+                reverse(
+                    ics_view_name,
+                    kwargs={
+                        **reverse_kwargs,
+                        'name': 'schedule.ics',
+                    },
+                ),
+            )
+
+        if request.GET.get('featured') == 'true':
+            ics_url = f'{ics_url}?featured=true'
+
+        if is_google:
+            google_url = f'https://calendar.google.com/calendar/r?{urlencode({"cid": ics_url.replace("https://", "http://")})}'
+            return HttpResponseRedirect(google_url)
+
+        parsed = urlparse(ics_url)
+        webcal_url = urlunparse(('webcal',) + parsed[1:])
+        response = HttpResponse(status=302)
+        response['Location'] = webcal_url
+        return response

@@ -1,4 +1,3 @@
-import sys
 from importlib import import_module
 from urllib.parse import urljoin
 
@@ -8,6 +7,7 @@ from django.urls import Resolver404, get_script_prefix, resolve
 from django.utils.translation import get_language
 from django_scopes import scope
 
+from eventyay.base.meetup import is_meetup_event
 from eventyay.base.models.auth import StaffSession
 from eventyay.base.models.page import Page
 from eventyay.base.settings import GlobalSettingsObject
@@ -15,7 +15,6 @@ from eventyay.control.navigation import (
     get_admin_navigation,
     get_event_navigation,
     get_global_navigation,
-    get_organizer_navigation,
 )
 
 from ..eventyay_common.utils import EventCreatedFor
@@ -27,6 +26,7 @@ from ..helpers.i18n import (
 from ..helpers.plugin_enable import is_video_enabled
 from ..multidomain.urlreverse import get_event_domain
 from .signals import html_head, nav_topbar
+from eventyay.eventyay_common.permissions import get_cached_event_dashboard_access
 
 SessionStore = import_module(settings.SESSION_ENGINE).SessionStore
 
@@ -46,8 +46,12 @@ def _default_context(request):
     except Resolver404:
         return {}
 
-    if not (request.path.startswith(get_script_prefix() + 'control') or 
-            request.path.startswith(get_script_prefix() + 'admin')) or not hasattr(request, 'user'):
+    if not (
+        request.path.startswith(get_script_prefix() + 'control')
+        or request.path.startswith(get_script_prefix() + 'admin')
+        or request.path.startswith(get_script_prefix() + 'teamshifts')
+        or request.path.startswith(get_script_prefix() + 'exhibitors')
+    ) or not hasattr(request, 'user'):
         return {}
     ctx = {
         'url_name': url.url_name,
@@ -59,7 +63,15 @@ def _default_context(request):
     if hasattr(request, 'event') and request.user.is_authenticated:
         for receiver, response in html_head.send(request.event, request=request):
             _html_head.append(response)
-        ctx['talk_edit_url'] = urljoin(settings.TALK_HOSTNAME, f'orga/event/{request.event.slug}')
+        from django.urls import reverse
+        is_meetup = is_meetup_event(request.event)
+        ctx['is_meetup'] = is_meetup
+        ctx['is_meetup_event'] = is_meetup
+        ctx['talk_edit_url'] = reverse(
+            'orga:event.dashboard',
+            kwargs={'organizer': request.event.organizer.slug,
+                    'event': request.event.slug},
+        )
         ctx['is_video_enabled'] = is_video_enabled(request.event)
         ctx['is_talk_event_created'] = False
         if (
@@ -72,6 +84,13 @@ def _default_context(request):
     _js_payment_weekdays_disabled = '[]'
     if getattr(request, 'event', None) and hasattr(request, 'organizer') and request.user.is_authenticated:
         ctx['nav_items'] = get_event_navigation(request)
+
+        access = get_cached_event_dashboard_access(
+            request, request.user, request.organizer, request.event
+        )
+        ctx['has_ticket_access'] = access['has_ticket_access']
+        ctx['has_talk_access'] = access['has_talk_access']
+        ctx['has_video_access'] = access['has_video_access']
 
         if request.event.settings.get('payment_term_weekdays'):
             _js_payment_weekdays_disabled = '[0,6]'
@@ -106,8 +125,6 @@ def _default_context(request):
         if request.GET.get('subevent', ''):
             # Do not use .get() for lazy evaluation
             ctx['selected_subevents'] = request.event.subevents.filter(pk=request.GET.get('subevent'))
-    elif getattr(request, 'organizer', None) and request.user.is_authenticated:
-        ctx['nav_items'] = get_organizer_navigation(request)
     elif request.user.is_authenticated:
         ctx['nav_items'] = get_global_navigation(request)
 
@@ -131,14 +148,11 @@ def _default_context(request):
     ctx['base_path'] = settings.BASE_PATH
 
     ctx['warning_update_available'] = False
-    ctx['warning_update_check_active'] = False
     gs = GlobalSettingsObject()
     ctx['global_settings'] = gs.settings
     if request.user.is_staff:
         if gs.settings.update_check_result_warning:
             ctx['warning_update_available'] = True
-        if not gs.settings.update_check_ack and 'runserver' not in sys.argv:
-            ctx['warning_update_check_active'] = True
 
     if request.user.is_authenticated:
         ctx['staff_session'] = request.user.has_active_staff_session(request.session.session_key)
@@ -146,13 +160,13 @@ def _default_context(request):
             StaffSession.objects.filter(user=request.user, date_end__isnull=False).filter(
                 Q(comment__isnull=True) | Q(comment='')
             )
-            if request.user.is_staff and settings.PRETIX_ADMIN_AUDIT_COMMENTS
+            if request.user.is_staff and settings.EVENTYAY_ADMIN_AUDIT_COMMENTS
             else StaffSession.objects.none()
         )
 
     ctx['talk_hostname'] = settings.TALK_HOSTNAME
 
-    ctx['show_link_in_header_for_all_pages'] = Page.objects.filter(link_in_header=True)
-    ctx['show_link_in_footer_for_all_pages'] = Page.objects.filter(link_in_footer=True)
+    ctx['show_link_in_header_for_all_pages'] = Page.objects.filter(link_in_system=True, link_in_header=True)
+    ctx['show_link_in_footer_for_all_pages'] = Page.objects.filter(link_in_system=True, link_in_footer=True)
 
     return ctx

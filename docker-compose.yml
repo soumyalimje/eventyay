@@ -1,21 +1,33 @@
 name: eventyay-next
 
+x-app-build: &app-build
+  context: ./app
+  # Expose repo root so Dockerfile can read EVY_NPM_DEV from .env.dev at build time.
+  additional_contexts:
+    project_root: .
+
 services:
   web:
-    build: ./app
+    build: *app-build
     platform: linux/amd64
     container_name: eventyay-next-web
     command: python manage.py runserver 0.0.0.0:8000
     volumes:
       - ./app/eventyay:/usr/src/app/eventyay
-      - /usr/src/app/eventyay/static/webapp
-      - /usr/src/app/eventyay/static/global-nav-menu
+      - ./plugins:/usr/src/plugins
+      - /usr/src/app/eventyay/static.dist
+      - /usr/src/app/eventyay/static/video
       - /usr/src/app/eventyay/static/schedule-editor
-      - /usr/src/app/eventyay/webapp/node_modules
-      - /usr/src/app/eventyay/frontend/global-nav-menu/node_modules
-      - /usr/src/app/eventyay/frontend/schedule-editor/node_modules
+      - /usr/src/app/eventyay/webapp/video/node_modules
+      - /usr/src/app/eventyay/webapp/schedule-editor/node_modules
+      - /usr/src/app/eventyay/webapp/schedule/node_modules
+      - /usr/src/plugins/eventyay-checkin/node_modules
     ports:
       - 8000:8000
+      - 8080:8080
+      - 8082:8082
+      - 8085:8085
+      - 8880:8880
     env_file:
       - ./.env.dev
     depends_on:
@@ -23,18 +35,42 @@ services:
       - redis
 
   worker:
-    build: ./app
+    build: *app-build
     platform: linux/amd64
     container_name: eventyay-next-worker
-    entrypoint: celery -A eventyay worker -l info
+    # Dev: one worker on all queues. Production uses worker + worker-heavy (deployment/docker-compose.yml).
+    entrypoint: celery -A eventyay worker -l info -Q default,notifications,longrunning,background
     volumes:
       - ./app/eventyay:/usr/src/app/eventyay
-      - /usr/src/app/eventyay/static/webapp
-      - /usr/src/app/eventyay/static/global-nav-menu
+      - ./plugins:/usr/src/plugins
+      - /usr/src/app/eventyay/static.dist
+      - /usr/src/app/eventyay/static/video
       - /usr/src/app/eventyay/static/schedule-editor
-      - /usr/src/app/eventyay/webapp/node_modules
-      - /usr/src/app/eventyay/frontend/global-nav-menu/node_modules
-      - /usr/src/app/eventyay/frontend/schedule-editor/node_modules
+      - /usr/src/app/eventyay/webapp/video/node_modules
+      - /usr/src/app/eventyay/webapp/schedule-editor/node_modules
+      - /usr/src/app/eventyay/webapp/schedule/node_modules
+      - /usr/src/plugins/eventyay-checkin/node_modules
+    env_file:
+      - ./.env.dev
+    environment:
+      - MPLCONFIGDIR=/tmp/matplotlib
+    depends_on:
+      - db
+      - redis
+
+  beat:
+    build: *app-build
+    platform: linux/amd64
+    container_name: eventyay-next-beat
+    entrypoint: celery -A eventyay beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    volumes:
+      - ./app/eventyay:/usr/src/app/eventyay
+      - /usr/src/app/eventyay/static.dist
+      - /usr/src/app/eventyay/static/video
+      - /usr/src/app/eventyay/static/schedule-editor
+      - /usr/src/app/eventyay/webapp/video/node_modules
+      - /usr/src/app/eventyay/webapp/schedule-editor/node_modules
+      - /usr/src/app/eventyay/webapp/schedule/node_modules
     env_file:
       - ./.env.dev
     environment:
@@ -57,6 +93,7 @@ services:
     image: postgres:15
     platform: linux/amd64
     container_name: eventyay-next-db
+    command: postgres -c max_connections=500
     volumes:
       - postgres_data_dev:/var/lib/postgresql/data/
     env_file:

@@ -1,0 +1,38 @@
+@import 'variables'
+variables()
+normalize-css()
+base()
+@import 'typography'
+typography()
+components()
+scrollbars()
+@import 'themed-buntpapier'
+themed-buntpapier()
+@import 'common-ui'
+
+// Twemoji images rendered by $emojify (room names, chat, etc.)
+img.emoji
+	display: inline-block
+	vertical-align: text-bottom
+	width: 1.15em
+	height: 1.15em
+	&.needs-space
+		margin-right: 0.2em
+
+a
+	color: var(--clr-primary)
+	text-decoration: none
+
+body
+	background-color: transparent
+	font-family: var(--font-family, $font-stack)
+
+html, body, #app
+	margin: 0
+	height: 100%
+	font-family: var(--font-family, $font-stack)
+	// Do not globally hide overflow; individual scroll containers use v-scrollbar
+	overflow: visible
+
+.bunt-scrollbar
+	min-height: 0 // firefox can fuck off into space

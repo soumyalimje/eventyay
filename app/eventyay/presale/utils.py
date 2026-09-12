@@ -1,3 +1,4 @@
+import logging
 import warnings
 from importlib import import_module
 from urllib.parse import urljoin
@@ -13,14 +14,18 @@ from django.views.defaults import permission_denied
 from django_scopes import scope
 
 from eventyay.base.middleware import LocaleMiddleware
-from eventyay.base.models import Event, Organizer
+from eventyay.base.models import Event, GlobalPluginConfig, Organizer
 from eventyay.multidomain.urlreverse import (
     get_event_domain,
     get_organizer_domain,
 )
-from eventyay.presale.signals import process_request, process_response
-
+from eventyay.presale.signals import (
+    process_request,
+    process_response,
+    question_form_fields,
+)
 SessionStore = import_module(settings.SESSION_ENGINE).SessionStore
+logger = logging.getLogger(__name__)
 
 
 @scope(organizer=None)
@@ -104,15 +109,37 @@ def _detect_event(request, require_live=True, require_plugin=None):
                     and request.user.has_event_permission(request.organizer, request.event, request=request)
                 )
                 if not can_access and 'eventyay_event_access_{}'.format(request.event.pk) in request.session:
-                    sparent = SessionStore(request.session.get('eventyay_event_access_{}'.format(request.event.pk)))
+                    parent_session_key = request.session.get('eventyay_event_access_{}'.format(request.event.pk))
+                    sparent = SessionStore(parent_session_key)
                     try:
                         parentdata = sparent.load()
-                    except:
-                        pass
+                    except Exception as exc:
+                        logger.debug(
+                            'Failed to load parent session for event access check',
+                            extra={'event': request.event.pk, 'parent_session_key': parent_session_key},
+                            exc_info=exc,
+                        )
                     else:
                         can_access = 'event_access' in parentdata
 
                 if not can_access:
+                    raise Http404(_('The selected ticket shop is currently not available.'))
+
+            if not request.event.user_can_view_tickets(
+                request.user,
+                request=request,
+            ):
+                blocked_prefixes = (
+                    'event.cart',
+                    'event.checkout',
+                    'event.order',
+                    'event.payment',
+                    'event.redeem',
+                    'event.waitinglist',
+                    'event.seatingplan',
+                    'event.widget',
+                )
+                if url.url_name and url.url_name.startswith(blocked_prefixes):
                     return permission_denied(
                         request,
                         PermissionDenied(_('The selected ticket shop is currently not available.')),
@@ -120,8 +147,12 @@ def _detect_event(request, require_live=True, require_plugin=None):
 
             if require_plugin:
                 is_core = any(require_plugin.startswith(m) for m in settings.CORE_MODULES)
-                if require_plugin not in request.event.get_plugins() and not is_core:
-                    raise Http404(_('This feature is not enabled.'))
+                if not is_core:
+                    if require_plugin in GlobalPluginConfig.get_disabled_modules():
+                        raise Http404(_('This feature is not enabled.'))
+                    if require_plugin not in GlobalPluginConfig.get_platform_managed_modules():
+                        if require_plugin not in request.event.get_plugins():
+                            raise Http404(_('This feature is not enabled.'))
 
             for receiver, response in process_request.send(request.event, request=request):
                 if response:
@@ -203,3 +234,42 @@ def event_view(function=None, require_live=True):
         return fn
 
     return function or noop
+
+
+def build_position_additional_fields(event, position):
+    """
+    Collect plugin question fields (and badge options display) for one position.
+
+    Used by both organizer order detail and buyer cart/order views so badge
+    options stay consistent without duplicating signal wiring.
+    """
+    additional_fields = []
+    seen_field_keys = set()
+    data = position.meta_info_data
+    for _receiver, response in sorted(
+        question_form_fields.send(sender=event, position=position),
+        key=lambda item: str(item[0]),
+    ):
+        if not response:
+            continue
+        for key, value in response.items():
+            answer = data.get('question_form_data', {}).get(key)
+            if hasattr(value, 'get_display_value'):
+                answer = value.get_display_value(answer)
+            additional_fields.append(
+                {
+                    'answer': answer,
+                    'question': value.label,
+                }
+            )
+            seen_field_keys.add(key)
+
+    try:
+        from eventyay.plugins.badges.utils import append_badge_options_additional_field
+    except ImportError:
+        pass
+    else:
+        append_badge_options_additional_field(
+            event, position, additional_fields, present_keys=seen_field_keys
+        )
+    return additional_fields

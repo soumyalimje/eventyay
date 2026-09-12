@@ -3,6 +3,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 import eventyay.presale.views.cart
 import eventyay.presale.views.checkout
+import eventyay.presale.views.contact
 import eventyay.presale.views.event
 import eventyay.presale.views.locale
 import eventyay.presale.views.order
@@ -10,6 +11,7 @@ import eventyay.presale.views.organizer
 import eventyay.presale.views.robots
 import eventyay.presale.views.theme
 import eventyay.presale.views.user
+import eventyay.presale.views.meetup
 import eventyay.presale.views.waiting
 import eventyay.presale.views.widget
 from eventyay.common.urls import OrganizerSlugConverter  # noqa: F401 (registers converter)
@@ -77,6 +79,11 @@ frame_wrapped_urls = [
         eventyay.presale.views.waiting.WaitingView.as_view(),
         name='event.waitinglist',
     ),
+    path(
+        'rsvp/',
+        eventyay.presale.views.meetup.MeetupRsvpView.as_view(),
+        name='event.rsvp',
+    ),
     path('', eventyay.presale.views.event.EventIndex.as_view(), name='event.index'),
 ]
 event_patterns = [
@@ -141,6 +148,16 @@ event_patterns = [
         name='event.order.cancel',
     ),
     re_path(
+        r'^order/(?P<order>[^/]+)/(?P<secret>[A-Za-z0-9]+)/cancel/positions$',
+        eventyay.presale.views.order.OrderPositionCancel.as_view(),
+        name='event.order.cancel.positions',
+    ),
+    re_path(
+        r'^order/(?P<order>[^/]+)/(?P<secret>[A-Za-z0-9]+)/cancel/positions/do$',
+        eventyay.presale.views.order.OrderPositionCancelDo.as_view(),
+        name='event.order.cancel.positions.do',
+    ),
+    re_path(
         r'^order/(?P<order>[^/]+)/(?P<secret>[A-Za-z0-9]+)/cancel/do$',
         eventyay.presale.views.order.OrderCancelDo.as_view(),
         name='event.order.cancel.do',
@@ -196,6 +213,11 @@ event_patterns = [
         name='event.order.position',
     ),
     re_path(
+        r'^ticket/(?P<order>[^/]+)/(?P<position>\d+)/(?P<secret>[A-Za-z0-9]+)/(?P<view_schedule>True|False)/venueless/$',
+        eventyay.presale.views.order.OrderPositionJoin.as_view(),
+        name='event.venueless.join',
+    ),
+    re_path(
         r'^ticket/(?P<order>[^/]+)/(?P<position>\d+)/(?P<secret>[A-Za-z0-9]+)/download/(?P<pid>[0-9]+)/(?P<output>[^/]+)$',
         eventyay.presale.views.order.OrderPositionDownload.as_view(),
         name='event.order.position.download',
@@ -211,6 +233,11 @@ event_patterns = [
         name='event.ical.download',
     ),
     path('auth/', eventyay.presale.views.event.EventAuth.as_view(), name='event.auth'),
+    path(
+        'contact/',
+        eventyay.presale.views.contact.ContactOrganizerView.as_view(),
+        name='event.contact',
+    ),
     path(
         'widget/product_list',
         eventyay.presale.views.widget.WidgetAPIProductList.as_view(),
@@ -239,6 +266,26 @@ organizer_patterns = [
         eventyay.presale.views.organizer.OrganizerIcalDownload.as_view(),
         name='organizer.ical',
     ),
+    re_path(
+        r'^events/export/(?P<export_target>webcal|google-calendar)/$',
+        eventyay.presale.views.organizer.OrganizerCalendarExportRedirectView.as_view(),
+        name='organizer.export',
+    ),
+    path(
+        'events/export/<str:name>/',
+        eventyay.presale.views.organizer.OrganizerExportDownload.as_view(),
+        name='organizer.events.export',
+    ),
+    path(
+        'follow',
+        eventyay.presale.views.organizer.OrganizerFollow.as_view(),
+        name='organizer.follow',
+    ),
+    path(
+        'unfollow',
+        eventyay.presale.views.organizer.OrganizerUnfollow.as_view(),
+        name='organizer.unfollow',
+    ),
     path(
         'widget/product_list',
         eventyay.presale.views.widget.WidgetAPIProductList.as_view(),
@@ -256,6 +303,11 @@ locale_patterns = [
         'locale/set',
         eventyay.presale.views.locale.LocaleSet.as_view(),
         name='locale.set',
+    ),
+    path(
+        'locale/event',
+        eventyay.presale.views.locale.EventLocaleSet.as_view(),
+        name='locale.event',
     ),
     path('robots.txt', eventyay.presale.views.robots.robots_txt, name='robots.txt'),
     path(

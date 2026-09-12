@@ -1,6 +1,6 @@
 from datetime import datetime, time
 
-import pytz
+from zoneinfo import ZoneInfo
 from dateutil.parser import parse
 from django.core.exceptions import PermissionDenied
 from django.db.models import Max, Min, Q
@@ -57,7 +57,7 @@ def serialize_event(e):
         if e.min_from is None:
             dr = pgettext('subevent', 'No dates')
         else:
-            tz = pytz.timezone(e.settings.timezone)
+            tz = ZoneInfo(e.settings.timezone)
             dr = (
                 _('Series:')
                 + ' '
@@ -381,7 +381,7 @@ def variations_select2(request, **kwargs):
 
     q = Q(product__event=request.event)
     for word in query.split():
-        q &= Q(value__icontains=i18ncomp(word)) | Q(product__name__icontains=i18ncomp(ord))
+        q &= Q(value__icontains=i18ncomp(word)) | Q(product__name__icontains=i18ncomp(word))
 
     qs = (
         ProductVariation.objects.filter(q)
@@ -679,16 +679,17 @@ def product_meta_values(request, organizer, event):
     matches = matches.filter(product__event__organizer_id=organizer.pk)
     all_access = (
         request.user.has_active_staff_session(request.session.session_key)
-        or request.user.teams.filter(all_events=True, organizer=organizer, can_change_products=True).exists()
+        or request.user.teams.filter(all_events=True, organizer=organizer, can_change_items=True).exists()
     )
     if not all_access:
-        defaults = matches.filter(
-            event__id__in=request.user.teams.filter(can_change_products=True).values_list('limit_events__id', flat=True)
+        team_events = request.user.teams.filter(organizer=organizer, can_change_items=True).values_list(
+            'limit_events__id', flat=True
+        )
+        defaults = defaults.filter(
+            event__id__in=team_events
         )
         matches = matches.filter(
-            product__event__id__in=request.user.teams.filter(can_change_products=True).values_list(
-                'limit_events__id', flat=True
-            )
+            product__event__id__in=team_events
         )
 
     return JsonResponse(

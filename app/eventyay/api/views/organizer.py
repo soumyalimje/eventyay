@@ -2,10 +2,13 @@ from decimal import Decimal
 
 import django_filters
 from django.db import transaction
+from django.db.models import Count, Exists, OuterRef
 from django.shortcuts import get_object_or_404
 from django.utils.functional import cached_property
+from django.utils.translation import gettext as _
 from django_filters.rest_framework import DjangoFilterBackend, FilterSet
 from django_scopes import scopes_disabled
+from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework import (
     filters,
     mixins,
@@ -25,8 +28,13 @@ from eventyay.api.serializers.organizer import (
     DeviceSerializer,
     GiftCardSerializer,
     GiftCardTransactionSerializer,
+    OrganizerErrorResponseSerializer,
+    OrganizerFollowersResponseSerializer,
+    OrganizerFollowResponseSerializer,
     OrganizerSerializer,
+    OrganizerSetDefaultResponseSerializer,
     OrganizerSettingsSerializer,
+    OrganizerUnfollowResponseSerializer,
     SeatingPlanSerializer,
     TeamAPITokenSerializer,
     TeamInviteSerializer,
@@ -38,6 +46,7 @@ from eventyay.base.models import (
     GiftCard,
     GiftCardTransaction,
     Organizer,
+    OrganizerFollower,
     SeatingPlan,
     Team,
     TeamAPIToken,
@@ -49,6 +58,28 @@ from eventyay.helpers.dicts import merge_dicts
 from eventyay.presale.style import regenerate_organizer_css
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='List Organizers',
+        description='Returns organizers available to the authenticated user or API credential.',
+        tags=['organizers'],
+        responses={
+            200: OrganizerSerializer(many=True),
+            401: OrganizerErrorResponseSerializer,
+            403: OrganizerErrorResponseSerializer,
+        },
+    ),
+    retrieve=extend_schema(
+        summary='Show Organizer',
+        description='Returns an organizer identified by its slug.',
+        tags=['organizers'],
+        responses={
+            200: OrganizerSerializer,
+            401: OrganizerErrorResponseSerializer,
+            403: OrganizerErrorResponseSerializer,
+        },
+    ),
+)
 class OrganizerViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = OrganizerSerializer
     queryset = Organizer.objects.none()
@@ -60,19 +91,127 @@ class OrganizerViewSet(viewsets.ReadOnlyModelViewSet):
     ordering_fields = ('name', 'slug')
 
     def get_queryset(self):
+        follower_subquery = Exists(
+            OrganizerFollower.objects.filter(organizer=OuterRef('pk'), user=self.request.user)
+        ) if self.request.user.is_authenticated else None
+
         if self.request.user.is_authenticated:
             if self.request.user.has_active_staff_session(self.request.session.session_key):
-                return Organizer.objects.all()
+                qs = Organizer.objects.all()
             elif isinstance(self.request.auth, OAuthAccessToken):
-                return Organizer.objects.filter(
+                qs = Organizer.objects.filter(
                     pk__in=self.request.user.teams.values_list('organizer', flat=True)
                 ).filter(pk__in=self.request.auth.organizers.values_list('pk', flat=True))
             else:
-                return Organizer.objects.filter(pk__in=self.request.user.teams.values_list('organizer', flat=True))
+                qs = Organizer.objects.filter(pk__in=self.request.user.teams.values_list('organizer', flat=True))
         elif hasattr(self.request.auth, 'organizer_id'):
-            return Organizer.objects.filter(pk=self.request.auth.organizer_id)
+            qs = Organizer.objects.filter(pk=self.request.auth.organizer_id)
         else:
-            return Organizer.objects.filter(pk=self.request.auth.team.organizer_id)
+            qs = Organizer.objects.filter(pk=self.request.auth.team.organizer_id)
+
+        qs = qs.annotate(_follower_count=Count('followers', distinct=True))
+        if follower_subquery is not None:
+            qs = qs.annotate(_is_following=follower_subquery)
+        return qs
+
+    @extend_schema(
+        summary='Follow Organizer',
+        description='Follows an organizer for an authenticated user with access to it.',
+        tags=['organizers'],
+        auth=[{'cookieAuth': []}, {'oauth2': ['write']}],
+        request=None,
+        responses={
+            200: OrganizerFollowResponseSerializer,
+            401: OrganizerErrorResponseSerializer,
+            403: OrganizerErrorResponseSerializer,
+        },
+    )
+    @action(detail=True, methods=['post'], url_path='follow')
+    def follow(self, request, *args, **kwargs):
+        if not request.user.is_authenticated:
+            return Response({'detail': _('Authentication required.')}, status=status.HTTP_401_UNAUTHORIZED)
+        if not request.user.is_active:
+            return Response({'detail': _('Your account is not active.')}, status=status.HTTP_403_FORBIDDEN)
+        organizer = self.get_object()
+        if not organizer.settings.get('community_follow_enabled', as_type=bool, default=True):
+            return Response(
+                {'detail': _('Following is not enabled for this organizer.')},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        created = OrganizerFollower.objects.get_or_create(user=request.user, organizer=organizer)[1]
+        return Response({'following': True, 'created': created}, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary='Unfollow Organizer',
+        description='Stops following an organizer for an authenticated user with access to it.',
+        tags=['organizers'],
+        auth=[{'cookieAuth': []}, {'oauth2': ['write']}],
+        request=None,
+        responses={
+            200: OrganizerUnfollowResponseSerializer,
+            401: OrganizerErrorResponseSerializer,
+            403: OrganizerErrorResponseSerializer,
+        },
+    )
+    @action(detail=True, methods=['post'], url_path='unfollow')
+    def unfollow(self, request, *args, **kwargs):
+        if not request.user.is_authenticated:
+            return Response({'detail': _('Authentication required.')}, status=status.HTTP_401_UNAUTHORIZED)
+        organizer = self.get_object()
+        deleted = OrganizerFollower.objects.filter(user=request.user, organizer=organizer).delete()[0]
+        return Response({'following': False, 'deleted': deleted > 0}, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary='Set Default Organizer',
+        description='Sets this organizer as the default organizer for the currently authenticated user.',
+        tags=['organizers'],
+        auth=[{'cookieAuth': []}, {'oauth2': ['write']}],
+        request=None,
+        responses={
+            200: OrganizerSetDefaultResponseSerializer,
+            401: OrganizerErrorResponseSerializer,
+            403: OrganizerErrorResponseSerializer,
+        },
+    )
+    @action(detail=True, methods=['post'], url_path='set-default')
+    def set_default(self, request, *args, **kwargs):
+        if not request.user.is_authenticated:
+            return Response({'detail': _('Authentication required.')}, status=status.HTTP_401_UNAUTHORIZED)
+        organizer = self.get_object()
+        if not request.user.teams.filter(organizer=organizer).exists():
+            return Response(
+                {'detail': _('You cannot set an organizer as default if you are not a member.')},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        request.user.default_organizer = organizer
+        request.user.save(update_fields=['default_organizer'])
+        return Response({'status': 'ok', 'default_organizer': organizer.slug}, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary='Show Organizer Follower Status',
+        description=(
+            'Returns the organizer follower count when it is visible and whether '
+            'the authenticated user follows the organizer.'
+        ),
+        tags=['organizers'],
+        responses={
+            200: OrganizerFollowersResponseSerializer,
+            401: OrganizerErrorResponseSerializer,
+            403: OrganizerErrorResponseSerializer,
+        },
+    )
+    @action(detail=True, methods=['get'], url_path='followers')
+    def followers(self, request, *args, **kwargs):
+        organizer = self.get_object()
+        show_count = organizer.settings.get('community_show_follower_count', as_type=bool, default=True)
+        count = OrganizerFollower.objects.filter(organizer=organizer).count() if show_count else None
+        is_following = False
+        if request.user.is_authenticated:
+            is_following = OrganizerFollower.objects.filter(organizer=organizer, user=request.user).exists()
+        return Response({
+            'follower_count': count,
+            'is_following': is_following,
+        })
 
 
 class SeatingPlanViewSet(viewsets.ModelViewSet):

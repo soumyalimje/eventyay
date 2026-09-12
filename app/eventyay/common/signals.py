@@ -7,18 +7,19 @@ import django.dispatch
 from django.apps import apps
 from django.conf import settings
 from django.core.cache import cache
+from django.db import transaction
+from django.dispatch import receiver
 from django.dispatch.dispatcher import NO_RECEIVERS
+from django.utils.timezone import now
+from django_scopes import scopes_disabled
 
 from eventyay.base.models import Event
+from eventyay.base.signals import resolve_app_for_module, check_plugin_active
 
-app_cache = {}
 logger = logging.getLogger(__name__)
 
-
-def _populate_app_cache():
-    apps.check_apps_ready()
-    for app_config in apps.app_configs.values():
-        app_cache[app_config.name] = app_config
+# Batch size for processing scheduled emails to limit transaction size
+MAIL_SEND_BATCH_SIZE = 100
 
 
 class EventPluginSignal(django.dispatch.Signal):
@@ -34,26 +35,15 @@ class EventPluginSignal(django.dispatch.Signal):
             return []
         return receivers[0]
 
-    @staticmethod
-    def _is_active(sender, receiver):
+    def _is_active(self, sender, receiver):
         # Find the Django application this belongs to
-        searchpath = receiver.__module__
-        core_module = any(searchpath.startswith(cm) for cm in settings.CORE_MODULES)
-        # Only fire receivers from active plugins and core modules
-        if core_module:
-            return True
-        # Short out on events without plugins
-        if sender and not sender.plugin_list:
-            return False
-        if sender:
-            app = None
-            while True:
-                app = app_cache.get(searchpath)
-                if '.' not in searchpath or app:  # pragma: no cover
-                    break
-                searchpath, _ = searchpath.rsplit('.', 1)
-            return app and app.name in sender.plugin_list
-        return False
+        module_path = receiver.__module__
+        is_core_module = any(module_path.startswith(cm) for cm in settings.CORE_MODULES)
+        
+        # Resolve the app using thread-safe cached function
+        app = resolve_app_for_module(module_path)
+        
+        return check_plugin_active(sender, app, is_core_module, settings.EVENTYAY_PLUGINS_EXCLUDE, lambda s: s.plugin_list)
 
     def send(self, sender: Event, **named) -> list[tuple[Callable, Any]]:
         """Send signal from sender to all connected receivers that belong to
@@ -68,9 +58,6 @@ class EventPluginSignal(django.dispatch.Signal):
         responses = []
         if not self.receivers or self.sender_receivers_cache.get(sender) is NO_RECEIVERS:
             return responses
-
-        if not app_cache:
-            _populate_app_cache()
 
         for receiver in self.get_live_receivers(sender):
             if self._is_active(sender, receiver):
@@ -95,9 +82,6 @@ class EventPluginSignal(django.dispatch.Signal):
         responses = []
         if not self.receivers or self.sender_receivers_cache.get(sender) is NO_RECEIVERS:
             return []
-
-        if not app_cache:  # pragma: no cover
-            _populate_app_cache()
 
         for receiver in self.get_live_receivers(sender):
             if self._is_active(sender, receiver):
@@ -127,9 +111,6 @@ class EventPluginSignal(django.dispatch.Signal):
         response = named.get(chain_kwarg_name)
         if not self.receivers or self.sender_receivers_cache.get(sender) is NO_RECEIVERS:  # pragma: no cover
             return response
-
-        if not app_cache:  # pragma: no cover
-            _populate_app_cache()
 
         for receiver in self.get_live_receivers(sender):
             if self._is_active(sender, receiver):
@@ -193,6 +174,9 @@ be everything between a minute and a day. The actions you perform should be
 idempotent, meaning it should not make a difference if this is sent out more often
 than expected.
 """
+
+user_menu_items = EventPluginSignal()
+"""Collects extra ``<a class="dropdown-item">`` entries for the user account menu."""
 
 register_data_exporters = EventPluginSignal()
 
@@ -260,3 +244,71 @@ make your locale available to the makemessages command. Otherwise, check that yo
 plugin is enabled in the current event context if your locale should be scoped to
 events with your plugin activated.
 """
+
+user_dashboard_links = django.dispatch.Signal()
+"""
+Sent to collect additional ``<a class="dropdown-item">`` entries for the global
+user dashboard dropdown (the control/orga area header). The sender is the
+``request`` object. Receivers should return an HTML string or empty string.
+"""
+
+
+@receiver(periodic_task, dispatch_uid="process_scheduled_emails")
+@scopes_disabled()
+@minimum_interval(minutes_after_success=1, minutes_running_timeout=5)
+def process_scheduled_emails(sender, **kwargs):
+    """
+    Periodic task to process scheduled emails for both Talk and Tickets components.
+    
+    Uses select_for_update(skip_locked=True) to prevent duplicate processing
+    when multiple workers process the same emails concurrently.
+    
+    Processes emails in batches to reduce lock contention and limit
+    transaction size for better performance and reliability.
+    """
+    from eventyay.plugins.sendmail.models import EmailQueue
+    from eventyay.base.models.mail import QueuedMail
+    from eventyay.common.exceptions import SendMailException
+
+    for _ in range(MAIL_SEND_BATCH_SIZE):
+        with transaction.atomic():
+            mail = (
+                QueuedMail.objects
+                .filter(scheduled_at__isnull=False, scheduled_at__lte=now(), sent__isnull=True, is_draft=False)
+                .select_for_update(skip_locked=True)
+                .order_by('pk')
+                .first()
+            )
+            if mail is None:
+                break
+            try:
+                mail.send()
+                logger.info("[ScheduledMail] QueuedMail ID %s sent successfully.", mail.pk)
+            except SendMailException:
+                logger.exception("[ScheduledMail] Failed to send QueuedMail ID %s", mail.pk)
+            except Exception:
+                logger.exception("[ScheduledMail] Unexpected error sending QueuedMail ID %s", mail.pk)
+                raise
+
+    for _ in range(MAIL_SEND_BATCH_SIZE):
+        with transaction.atomic():
+            mail = (
+                EmailQueue.objects
+                .filter(scheduled_at__isnull=False, scheduled_at__lte=now(), sent_at__isnull=True)
+                .select_for_update(skip_locked=True)
+                .order_by('pk')
+                .first()
+            )
+            if mail is None:
+                break
+            try:
+                sent = mail.send()
+                if sent:
+                    logger.info("[ScheduledMail] EmailQueue ID %s processed.", mail.pk)
+                else:
+                    logger.info("[ScheduledMail] EmailQueue ID %s: no recipients to send to.", mail.pk)
+            except SendMailException:
+                logger.exception("[ScheduledMail] Failed to send EmailQueue ID %s", mail.pk)
+            except Exception:
+                logger.exception("[ScheduledMail] Unexpected error sending EmailQueue ID %s", mail.pk)
+                raise

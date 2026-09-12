@@ -12,8 +12,9 @@ from typing import Any, Dict, List, Union
 
 import dateutil
 import pycountry
-import pytz
+from zoneinfo import ZoneInfo
 from django.conf import settings
+from django.contrib.postgres.indexes import GinIndex
 from django.db import models, transaction
 from django.db.models import (
     Case,
@@ -46,13 +47,16 @@ from phonenumber_field.modelfields import PhoneNumberField
 from phonenumber_field.phonenumber import PhoneNumber
 from phonenumbers import NumberParseException
 
+from eventyay.base.admission_validity import assign_issued_admission_bounds
 from eventyay.base.banlist import banned
 from eventyay.base.decimal import round_decimal
 from eventyay.base.email import get_email_context
 from eventyay.base.i18n import language
+from eventyay.base.meetup import is_meetup_event
 from eventyay.base.models import User
 from eventyay.base.reldate import RelativeDateWrapper
 from eventyay.base.services.locking import NoLockManager
+from eventyay.base.services.system_questions import product_has_system_questions
 from eventyay.base.settings import PERSON_NAME_SCHEMES
 from eventyay.base.signals import order_gracefully_delete
 
@@ -96,10 +100,7 @@ class SecureOrderQuerySet(models.QuerySet):
             raise
 
         order_secret = order.tagged_secret(tag, secret_length) if tag else order.secret
-        valid_digest = hash_compare(order_secret, received_secret)
-        valid_sha1 = tag and hash_compare(hashlib.sha1(order.secret.encode()).hexdigest(), received_secret)
-
-        if not valid_digest and not valid_sha1:
+        if not hash_compare(order_secret, received_secret):
             raise Order.DoesNotExist
 
         return order
@@ -140,9 +141,9 @@ class Order(LockModel, LoggedModel):
     :param secret: A secret string that is required to modify the order
     :type secret: str
     :param datetime: The datetime of the order placement
-    :type datetime: datetime
+    :type datetime: datetime.datetime
     :param expires: The date until this order has to be paid to guarantee the fulfillment
-    :type expires: datetime
+    :type expires: datetime.datetime
     :param total: The total amount of the order, including the payment fee
     :type total: decimal.Decimal
     :param comment: An internal comment that will only be visible to staff, and never displayed to the user
@@ -216,6 +217,13 @@ class Order(LockModel, LoggedModel):
         verbose_name = _('Order')
         verbose_name_plural = _('Orders')
         ordering = ('-datetime',)
+        indexes = [
+            GinIndex(
+                fields=['code'],
+                name='order_code_trgm',
+                opclasses=['gin_trgm_ops'],
+            ),
+        ]
 
     def __str__(self):
         return self.full_code
@@ -260,21 +268,19 @@ class Order(LockModel, LoggedModel):
     def user_has_existing_order(cls, event, email):
         """
         Check if a user (identified by email) already has an existing order for the event.
-        
+
         Args:
             event: The event to check
             email: The user's email address
-            
+
         Returns:
             bool: True if user has existing order, False otherwise
         """
         if not email:
             return False
-            
+
         return cls.objects.filter(
-            event=event,
-            email__iexact=email,
-            status__in=[cls.STATUS_PENDING, cls.STATUS_PAID]
+            event=event, email__iexact=email, status__in=[cls.STATUS_PENDING, cls.STATUS_PAID]
         ).exists()
 
     @property
@@ -477,7 +483,7 @@ class Order(LockModel, LoggedModel):
 
     def set_expires(self, now_dt=None, subevents=None):
         now_dt = now_dt or now()
-        tz = pytz.timezone(self.event.settings.timezone)
+        tz = ZoneInfo(self.event.settings.timezone)
         mode = self.event.settings.get('payment_term_mode')
         if mode == 'days':
             exp_by_date = now_dt.astimezone(tz) + timedelta(
@@ -574,6 +580,143 @@ class Order(LockModel, LoggedModel):
             fee += self.event.settings.cancel_allow_user_paid_keep
         return round_decimal(fee, self.event.currency)
 
+    @cached_property
+    @scopes_disabled()
+    def user_existing_cancellation_fee(self):
+        return self.fees.filter(fee_type=OrderFee.FEE_TYPE_CANCELLATION).aggregate(s=Sum('value'))['s'] or Decimal(
+            '0.00'
+        )
+
+    @cached_property
+    @scopes_disabled()
+    def user_cancelable_positions(self):
+        """
+        Returns all active order positions that can currently be canceled by the user.
+        """
+        from .checkin import Checkin
+
+        if self.cancellation_requests.exists() or not self.cancel_allowed():
+            return []
+
+        if self.status not in (Order.STATUS_PENDING, Order.STATUS_PAID):
+            return []
+
+        if self.user_cancel_deadline and now() > self.user_cancel_deadline:
+            return []
+
+        if self.status == Order.STATUS_PENDING and not self.event.settings.cancel_allow_user:
+            return []
+
+        if self.status == Order.STATUS_PAID:
+            if self.total == Decimal('0.00'):
+                if not self.event.settings.cancel_allow_user:
+                    return []
+            elif not self.event.settings.cancel_allow_user_paid:
+                return []
+
+        positions = list(
+            self.positions.all()
+            .annotate(has_checkin=Exists(Checkin.objects.filter(position_id=OuterRef('pk'))))
+            .select_related('product')
+            .prefetch_related('issued_gift_cards')
+        )
+
+        def is_position_cancelable(op):
+            if not op.product.allow_cancel or op.has_checkin:
+                return False
+            if any(gc.value != op.price for gc in op.issued_gift_cards.all()):
+                return False
+            return True
+
+        addons_by_base = {}
+        for op in positions:
+            if op.addon_to_id:
+                addons_by_base.setdefault(op.addon_to_id, []).append(op)
+
+        per_position_cancelable = {op.pk: is_position_cancelable(op) for op in positions}
+
+        cancelable = []
+        for op in positions:
+            if not per_position_cancelable.get(op.pk, False):
+                continue
+
+            if not op.addon_to_id:
+                addons = addons_by_base.get(op.pk, [])
+                if any(not per_position_cancelable.get(addon.pk, False) for addon in addons):
+                    continue
+
+            cancelable.append(op)
+
+        return cancelable
+
+    @property
+    @scopes_disabled()
+    def user_partial_cancel_allowed(self) -> bool:
+        """
+        Returns whether or not this order can be partially canceled by the user.
+        """
+        if self.event.settings.allow_modifications == 'no':
+            return False
+
+        if self.status == Order.STATUS_PAID and self.total != Decimal('0.00'):
+            # Partial cancellation currently executes immediately.
+            # In approval mode, only full-order cancellation requests are supported.
+            if self.event.settings.cancel_allow_user_paid_require_approval:
+                return False
+
+        return self.count_positions > 1 and bool(self.user_cancelable_positions)
+
+    @cached_property
+    @scopes_disabled()
+    def is_partially_canceled(self) -> bool:
+        if self.count_positions == 0:
+            return False
+        return self.all_positions.count() > self.count_positions
+
+    def user_partial_cancel_fee(self, canceled_total: Decimal) -> Decimal:
+        if canceled_total <= Decimal('0.00'):
+            return Decimal('0.00')
+
+        if self.status != Order.STATUS_PAID or self.total <= Decimal('0.00'):
+            return Decimal('0.00')
+
+        fee = Decimal('0.00')
+
+        # Percentage fee: apply directly to canceled_total
+        if self.event.settings.cancel_allow_user_paid_keep_percentage:
+            fee += (
+                self.event.settings.cancel_allow_user_paid_keep_percentage
+                / Decimal('100.0') * canceled_total
+            )
+
+        # Flat fee and keep-existing-fees: prorate from the remaining uncharged amount
+        flat_base = Decimal('0.00')
+        if self.event.settings.cancel_allow_user_paid_keep_fees:
+            flat_base += (
+                self.fees.filter(
+                    fee_type__in=(
+                        OrderFee.FEE_TYPE_PAYMENT,
+                        OrderFee.FEE_TYPE_SHIPPING,
+                        OrderFee.FEE_TYPE_SERVICE,
+                    ),
+                    canceled=False,
+                ).aggregate(s=Sum('value'))['s']
+                or Decimal('0.00')
+            )
+        if self.event.settings.cancel_allow_user_paid_keep:
+            flat_base += self.event.settings.cancel_allow_user_paid_keep
+
+        if flat_base > Decimal('0.00'):
+            already_charged = self.user_existing_cancellation_fee
+            remaining_to_charge = max(Decimal('0.00'), flat_base - already_charged)
+            if remaining_to_charge > Decimal('0.00'):
+                remaining_total = self.total - already_charged
+                if remaining_total > Decimal('0.00'):
+                    fee += remaining_to_charge * canceled_total / remaining_total
+
+        fee = round_decimal(fee, self.event.currency)
+        return min(canceled_total, fee)
+
     @property
     @scopes_disabled()
     def user_change_allowed(self) -> bool:
@@ -609,7 +752,13 @@ class Order(LockModel, LoggedModel):
         if self.user_change_deadline and now() > self.user_change_deadline:
             return False
 
-        return self.event.settings.change_allow_user_variation and any([op.has_variations for op in positions])
+        legacy_event_setting = self.event.settings.get('change_allow_user_variation', as_type=bool, default=False)
+        return any(
+            [
+                op.has_variations and (op.product.allow_user_variation_change or legacy_event_setting)
+                for op in positions
+            ]
+        )
 
     @property
     @scopes_disabled()
@@ -617,32 +766,11 @@ class Order(LockModel, LoggedModel):
         """
         Returns whether or not this order can be canceled by the user.
         """
-        from .checkin import Checkin
+        positions = self.user_cancelable_positions
+        if not positions:
+            return False
 
-        if self.cancellation_requests.exists() or not self.cancel_allowed():
-            return False
-        positions = list(
-            self.positions.all()
-            .annotate(has_checkin=Exists(Checkin.objects.filter(position_id=OuterRef('pk'))))
-            .select_related('product')
-            .prefetch_related('issued_gift_cards')
-        )
-        cancelable = all([op.product.allow_cancel and not op.has_checkin for op in positions])
-        if not cancelable or not positions:
-            return False
-        for op in positions:
-            for gc in op.issued_gift_cards.all():
-                if gc.value != op.price:
-                    return False
-        if self.user_cancel_deadline and now() > self.user_cancel_deadline:
-            return False
-        if self.status == Order.STATUS_PENDING:
-            return self.event.settings.cancel_allow_user
-        elif self.status == Order.STATUS_PAID:
-            if self.total == Decimal('0.00'):
-                return self.event.settings.cancel_allow_user
-            return self.event.settings.cancel_allow_user_paid
-        return False
+        return len(positions) == self.count_positions
 
     def propose_auto_refunds(self, amount: Decimal, payments: list = None):
         # Algorithm to choose which payments are to be refunded to create the least hassle
@@ -774,7 +902,7 @@ class Order(LockModel, LoggedModel):
         ):
             return False
 
-        if self.event.settings.allow_modifications not in ("order", "attendee"):
+        if self.event.settings.allow_modifications not in ('order', 'attendee'):
             return False
 
         update_deadline = self.modify_deadline()
@@ -795,10 +923,21 @@ class Order(LockModel, LoggedModel):
 
         if self.event.settings.get('invoice_address_asked', as_type=bool):
             return True
-        ask_names = self.event.settings.get('attendee_names_asked', as_type=bool)
         for cp in positions:
-            if (cp.product.admission and ask_names) or cp.product.questions.all():
+            if product_has_system_questions(self.event, cp.product) or cp.product.questions.all():
                 return True
+
+        if 'eventyay.plugins.badges' in self.event.get_plugins():
+            from eventyay.plugins.badges.utils import (
+                get_badge_bundle_option_choices,
+                get_badge_config_position,
+            )
+
+            for cp in positions:
+                if get_badge_config_position(cp) != cp:
+                    continue
+                if get_badge_bundle_option_choices(self.event, cp):
+                    return True
 
         return False  # nothing there to modify
 
@@ -816,9 +955,9 @@ class Order(LockModel, LoggedModel):
             return self.email and self.email.lower() == email.lower()
 
         elif setting == 'attendee':
-            return (
-                self.email and self.email.lower() == email.lower()
-            ) or self.positions.filter(attendee_email__iexact=email).exists()
+            return (self.email and self.email.lower() == email.lower()) or self.positions.filter(
+                attendee_email__iexact=email
+            ).exists()
 
         return False
 
@@ -865,7 +1004,7 @@ class Order(LockModel, LoggedModel):
 
     @property
     def payment_term_last(self):
-        tz = pytz.timezone(self.event.settings.timezone)
+        tz = ZoneInfo(self.event.settings.timezone)
         term_last = self.event.settings.get('payment_term_last', as_type=RelativeDateWrapper)
         if term_last:
             if self.event.has_subevents:
@@ -1020,6 +1159,7 @@ class Order(LockModel, LoggedModel):
         from eventyay.base.services.mail import (
             SendMailException,
             TolerantDict,
+            _stringify_mail_context,
             mail,
             render_mail,
         )
@@ -1037,7 +1177,7 @@ class Order(LockModel, LoggedModel):
 
             try:
                 email_content = render_mail(template, context)
-                subject = subject.format_map(TolerantDict(context))
+                subject = str(subject).format_map(TolerantDict(_stringify_mail_context(context)))
                 mail(
                     recipient,
                     subject,
@@ -1210,7 +1350,7 @@ class QuestionAnswer(models.Model):
             try:
                 d = dateutil.parser.parse(self.answer)
                 if self.orderposition:
-                    tz = pytz.timezone(self.orderposition.order.event.settings.timezone)
+                    tz = ZoneInfo(self.orderposition.order.event.settings.timezone)
                     d = d.astimezone(tz)
                 return date_format(d, 'SHORT_DATETIME_FORMAT')
             except ValueError:
@@ -1261,9 +1401,9 @@ class AbstractPosition(models.Model):
     :param variation: The selected ProductVariation or null, if the product has no variations
     :type variation: ProductVariation
     :param datetime: The datetime this product was put into the cart
-    :type datetime: datetime
+    :type datetime: datetime.datetime
     :param expires: The date until this product is guaranteed to be reserved
-    :type expires: datetime
+    :type expires: datetime.datetime
     :param price: The price of this product
     :type price: decimal.Decimal
     :param attendee_name_parts: The parts of the attendee's name, if entered.
@@ -1348,6 +1488,14 @@ class AbstractPosition(models.Model):
         else:
             return {}
 
+    @property
+    def approval_is_bypassed(self):
+        return bool(self.voucher and self.voucher.allow_ignore_approval)
+
+    @property
+    def requires_approval(self):
+        return bool(self.product.require_approval and not self.approval_is_bypassed)
+
     @meta_info_data.setter
     def meta_info_data(self, d):
         self.meta_info = json.dumps(d)
@@ -1364,16 +1512,21 @@ class AbstractPosition(models.Model):
 
         # We need to clone our question objects, otherwise we will override the cached
         # answers of other products in the same cart if the question objects have been
-        # selected via prefetch_related
+        # selected via prefetch_related.
+        # Inactive questions are always excluded for consistency (checkout and backend).
+        def is_active_question(q):
+            return getattr(q, 'active', True)
+
         if not all:
             if getattr(self.product, 'questions_to_ask', None) is not None:
                 questions = list(copy.copy(q) for q in self.product.questions_to_ask)
             else:
                 questions = list(
-                    copy.copy(q) for q in self.product.questions.filter(ask_during_checkin=False, hidden=False)
+                    copy.copy(q)
+                    for q in self.product.questions.filter(ask_during_checkin=False, hidden=False, active=True)
                 )
         else:
-            questions = list(copy.copy(q) for q in self.product.questions.all())
+            questions = list(copy.copy(q) for q in self.product.questions.filter(active=True))
 
         question_cache = {q.pk: q for q in questions}
 
@@ -1482,9 +1635,9 @@ class OrderPayment(models.Model):
     :param order: The order that is paid
     :type order: Order
     :param created: The creation time of this record
-    :type created: datetime
+    :type created: datetime.datetime
     :param payment_date: The completion time of this payment
-    :type payment_date: datetime
+    :type payment_date: datetime.datetime
     :param provider: The payment provider in use
     :type provider: str
     :param info: Provider-specific meta information (in JSON format)
@@ -1676,6 +1829,9 @@ class OrderPayment(models.Model):
                 )
                 return
 
+            original_state = locked_instance.state
+            original_payment_date = locked_instance.payment_date
+            original_info = locked_instance.info
             locked_instance.state = self.PAYMENT_STATE_CONFIRMED
             locked_instance.payment_date = payment_date or now()
             locked_instance.info = self.info  # required for backwards compatibility
@@ -1728,14 +1884,24 @@ class OrderPayment(models.Model):
             lockfn = self.order.event.lock
 
         with lockfn():
-            self._mark_paid(
-                force,
-                count_waitinglist,
-                user,
-                auth,
-                overpaid=payment_sum - refund_sum > self.order.total,
-                ignore_date=ignore_date,
-            )
+            try:
+                self._mark_paid(
+                    force,
+                    count_waitinglist,
+                    user,
+                    auth,
+                    overpaid=payment_sum - refund_sum > self.order.total,
+                    ignore_date=ignore_date,
+                )
+            except Quota.QuotaExceededException:
+                with transaction.atomic():
+                    locked_instance = OrderPayment.objects.select_for_update().get(pk=self.pk)
+                    locked_instance.state = original_state
+                    locked_instance.payment_date = original_payment_date
+                    locked_instance.info = original_info
+                    locked_instance.save(update_fields=['state', 'payment_date', 'info'])
+                self.refresh_from_db()
+                raise
 
         invoice = None
         if invoice_qualified(self.order):
@@ -1751,11 +1917,19 @@ class OrderPayment(models.Model):
                 )
 
         if send_mail and self.order.sales_channel in self.order.event.settings.mail_sales_channel_placed_paid:
-            self._send_paid_mail(invoice, user, mail_text)
-            if self.order.event.settings.mail_send_order_paid_attendee:
+            if is_meetup_event(self.order.event):
+                self._send_meetup_registration_mail(user)
+                send_attendee_mail = self.order.event.settings.mail_send_meetup_registration_attendee
+                send_attendee_mail_fn = self._send_meetup_registration_mail_attendee
+            else:
+                self._send_paid_mail(invoice, user, mail_text)
+                send_attendee_mail = self.order.event.settings.mail_send_order_paid_attendee
+                send_attendee_mail_fn = self._send_paid_mail_attendee
+
+            if send_attendee_mail:
                 for p in self.order.positions.all():
                     if p.addon_to_id is None and p.attendee_email and p.attendee_email != self.order.email:
-                        self._send_paid_mail_attendee(p, user)
+                        send_attendee_mail_fn(p, user)
 
     def _send_paid_mail_attendee(self, position, user):
         from eventyay.base.services.mail import SendMailException
@@ -1800,6 +1974,49 @@ class OrderPayment(models.Model):
             except SendMailException:
                 logger.exception('Order paid email could not be sent')
 
+    def _send_meetup_registration_mail(self, user):
+        from eventyay.base.services.mail import SendMailException
+
+        with language(self.order.locale, self.order.event.settings.region):
+            email_template = self.order.event.settings.mail_text_meetup_registration
+            email_context = get_email_context(event=self.order.event, order=self.order)
+            email_subject = _('Your registration: %(code)s') % {'code': self.order.code}
+            try:
+                self.order.send_mail(
+                    email_subject,
+                    email_template,
+                    email_context,
+                    'eventyay.event.order.email.meetup_registration',
+                    user,
+                    invoices=[],
+                    attach_tickets=False,
+                    attach_ical=self.order.event.settings.mail_attach_ical,
+                )
+            except SendMailException:
+                logger.exception('Meetup registration email could not be sent')
+
+    def _send_meetup_registration_mail_attendee(self, position, user):
+        from eventyay.base.services.mail import SendMailException
+
+        with language(self.order.locale, self.order.event.settings.region):
+            email_template = self.order.event.settings.mail_text_meetup_registration_attendee
+            email_context = get_email_context(event=self.order.event, order=self.order, position=position)
+            email_subject = _('Your registration: %(code)s') % {'code': self.order.code}
+            try:
+                self.order.send_mail(
+                    email_subject,
+                    email_template,
+                    email_context,
+                    'eventyay.event.order.email.meetup_registration',
+                    user,
+                    invoices=[],
+                    position=position,
+                    attach_tickets=False,
+                    attach_ical=self.order.event.settings.mail_attach_ical,
+                )
+            except SendMailException:
+                logger.exception('Meetup registration email could not be sent to attendee')
+
     @property
     def refunded_amount(self):
         """
@@ -1837,7 +2054,7 @@ class OrderPayment(models.Model):
         :param amount: Amount to refund. If not given, the full payment amount will be used.
         :type amount: Decimal
         :param execution_date: Date of the refund. Defaults to the current time.
-        :type execution_date: datetime
+        :type execution_date: datetime.datetime
         :param info: Additional information, defaults to ``"{}"``.
         :type info: str
         :return: OrderRefund
@@ -1883,9 +2100,9 @@ class OrderRefund(models.Model):
     :param order: The order that is refunded
     :type order: Order
     :param created: The creation time of this record
-    :type created: datetime
+    :type created: datetime.datetime
     :param execution_date: The completion time of this refund
-    :type execution_date: datetime
+    :type execution_date: datetime.datetime
     :param provider: The payment provider in use
     :type provider: str
     :param info: Provider-specific meta information in JSON format
@@ -2174,6 +2391,26 @@ class OrderPosition(AbstractPosition):
     web_secret = models.CharField(max_length=32, default=generate_secret, db_index=True)
     pseudonymization_id = models.CharField(max_length=16, unique=True, db_index=True)
     canceled = models.BooleanField(default=False)
+    admission_valid_from = models.DateTimeField(
+        verbose_name=_('Issued admission valid from'),
+        help_text=_(
+            'Check-in allowed from this time for this ticket (snapshotted from the product '
+            'when the order was placed). If both issued fields are empty, current product '
+            'admission settings are used.'
+        ),
+        null=True,
+        blank=True,
+    )
+    admission_valid_until = models.DateTimeField(
+        verbose_name=_('Issued admission valid until'),
+        help_text=_(
+            'Check-in allowed until this time for this ticket (snapshotted from the product '
+            'when the order was placed). If both issued fields are empty, current product '
+            'admission settings are used.'
+        ),
+        null=True,
+        blank=True,
+    )
 
     all = ScopedManager(organizer='order__event__organizer')
     objects = ActivePositionManager()
@@ -2182,6 +2419,18 @@ class OrderPosition(AbstractPosition):
         verbose_name = _('Order position')
         verbose_name_plural = _('Order positions')
         ordering = ('positionid', 'id')
+        indexes = [
+            GinIndex(
+                fields=['attendee_name_cached'],
+                name='orderpos_name_trgm',
+                opclasses=['gin_trgm_ops'],
+            ),
+            GinIndex(
+                fields=['attendee_email'],
+                name='orderpos_email_trgm',
+                opclasses=['gin_trgm_ops'],
+            ),
+        ]
 
     @cached_property
     def sort_key(self):
@@ -2192,10 +2441,13 @@ class OrderPosition(AbstractPosition):
 
     @cached_property
     def require_checkin_attention(self):
+        variation_attention = (
+            getattr(self.variation, 'checkin_attention', False) if self.variation_id else False
+        )
         return (
             self.order.checkin_attention
             or self.product.checkin_attention
-            or (self.variation_id and self.variation.checkin_attention)
+            or variation_attention
         )
 
     @property
@@ -2205,6 +2457,15 @@ class OrderPosition(AbstractPosition):
         return (self.order.event.settings.ticket_download_addons or not self.addon_to_id) and (
             self.event.settings.ticket_download_nonadm or self.product.admission
         )
+
+    @property
+    def ticket_qrcode_content(self):
+        """Return the JSON-encoded QR code content matching the ticket PDF barcode."""
+        return json.dumps({
+            'event': str(self.order.event),
+            'ticket': self.secret,
+            'lead': self.pseudonymization_id,
+        })
 
     @classmethod
     def transform_cart_positions(cls, cp: List, order) -> list:
@@ -2285,7 +2546,7 @@ class OrderPosition(AbstractPosition):
                 not self.secret
                 or OrderPosition.all.filter(
                     secret=self.secret,
-                    order__event__organizer_id=self.order.event.organizer_id,
+                    order__event=self.order.event,
                 ).exists()
             ):
                 assign_ticket_secret(
@@ -2297,6 +2558,9 @@ class OrderPosition(AbstractPosition):
 
         if not self.pseudonymization_id:
             self.assign_pseudonymization_id()
+
+        if not self.pk:
+            assign_issued_admission_bounds(self)
 
         return super().save(*args, **kwargs)
 

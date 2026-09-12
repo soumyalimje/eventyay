@@ -1,0 +1,155 @@
+{% extends "orga/submission/base.html" %}
+
+{% load compress %}
+{% load filesize %}
+{% load formset_tags %}
+{% load staff_session %}
+{% load i18n %}
+{% load static %}
+{% load rules %}
+
+{% block scripts %}
+    {{ block.super }}
+    {% compress js %}
+        <script defer src="{% static "js/jquery.js" %}"></script>
+        <script defer src="{% static "js/jquery.formset.js" %}"></script>
+        <script defer src="{% static "cfp/js/animateFormset.js" %}"></script>
+        <script defer src="{% static "orga/js/speakers.js" %}"></script>
+        <script defer src="{% static "orga/js/submission_form.js" %}"></script>
+        <script defer src="{% static 'cfp/js/talk_dependencies.js' %}"></script>
+        <script defer src="{% static "orga/js/etherpad.js" %}"></script>
+    {% endcompress %}
+{% endblock scripts %}
+
+{% block submission_content %}
+    {% has_event_perm "base.send_queuedmail" request.user request request.event as can_send_mails %}
+    {% has_event_perm "base.list_all_review" request.user request request.event as can_view_all_reviews %}
+    <form method="post" enctype="multipart/form-data" novalidate>
+        <fieldset>
+            {% if not submission %}
+                {% trans "Create proposal" as header_title %}
+                {% include "common/includes/header_nav.html" with header_title=header_title %}
+            {% endif %}
+
+            {% if submission.access_code %}
+                <div class="alert alert-info"><span></span><span>
+                    {% blocktranslate trimmed %}
+                        This proposal was created using an access code:
+                    {% endblocktranslate %} <a href="{{ submission.access_code.urls.edit }}">{{ submission.access_code.code }}</a>
+                </span></div>
+            {% endif %}
+            {% include "common/forms/errors.html" %}
+            {% csrf_token %}
+
+            {{ form.title.as_field_group }}
+
+            {% if action == "create" %}
+                {{ form.state.as_field_group }}
+                </fieldset>
+                <fieldset>
+                    <legend id="speaker">{% translate "Speaker" context "noun" %}</legend>
+                    {{ new_speaker_form }}
+                </fieldset>
+                <fieldset>
+                    <legend id="proposal">{% translate "Proposal" %}</legend>
+            {% endif %}
+            {% if form.room %}
+                <div id="show-if-state" {% if action == "create" %}class="d-none"{% endif %}>
+                    {{ form.room.as_field_group }}
+                    {{ form.start.as_field_group }}
+                    {{ form.end.as_field_group }}
+                </div>
+            {% endif %}
+            {% if form.instance.median_score != None and can_view_all_reviews %}
+                <div class="form-group row">
+                    <label class="col-md-3 col-form-label">
+                        {% translate "Reviews" %}
+                    </label>
+                    <div class="col-md-9">
+                        <div class="pt-2">
+                            {{ submission.reviews.count }} {% translate "reviews" %}
+                        </div>
+                    </div>
+                </div>
+            {% endif %}
+            {{ form.submission_type.as_field_group }}
+            {% if form.track %}{{ form.track.as_field_group }}{% endif %}
+            {% if form.tags %}{{ form.tags.as_field_group }}{% endif %}
+            {% if form.abstract %}{{ form.abstract.as_field_group }}{% endif %}
+            {% if form.description %}{{ form.description.as_field_group }}{% endif %}
+            {% if form.notes %}{{ form.notes.as_field_group }}{% endif %}
+            {{ form.internal_notes.as_field_group }}
+            {% if form.content_locale %}{{ form.content_locale.as_field_group }}{% endif %}
+            {% if form.do_not_record %}{{ form.do_not_record.as_field_group }}{% endif %}
+            {{ form.is_featured.as_field_group }}
+            {{ form.duration.as_field_group }}
+            {% if form.slot_count %}{{ form.slot_count.as_field_group }}{% endif %}
+            {% if form.image %}{{ form.image.as_field_group }}{% endif %}
+            {% if form.slides %}{{ form.slides.as_field_group }}{% endif %}
+            {% if action != "create" and can_edit and session_videos_enabled %}
+                <div class="form-group row">
+                    <label class="col-md-3 col-form-label" for="session_video_urls">
+                        <span>{% translate "Session videos" %}</span>
+                        <span class="optional">{% translate "Optional" %}</span>
+                    </label>
+                    <div class="col-md-9">
+                        <textarea
+                            class="form-control"
+                            id="session_video_urls"
+                            name="session_video_urls"
+                            rows="3"
+                            autocomplete="off"
+                            placeholder="{% translate "One YouTube or Vimeo URL per line" %}"
+                        >{{ session_video_urls_text }}</textarea>
+                        <small class="form-text text-muted">{% translate "YouTube or Vimeo URLs, one per line." %}</small>
+                    </div>
+                </div>
+            {% endif %}
+            {% if form.etherpad_url %}
+                {{ form.etherpad_url.as_field_group }}
+                {% if not form.etherpad_url.value or action != "create" and request.event.feature_flags.etherpad_auto_generate %}
+                <div class="row mb-3">
+                    <div class="col-md-3"></div>
+                    <div class="col-md-9">
+                        {% if not form.etherpad_url.value %}
+                            <p class="help-block mb-2">{% translate "No Etherpad is configured for this session yet." %}</p>
+                        {% endif %}
+                        {% if action != "create" and request.event.feature_flags.etherpad_auto_generate %}
+                            {% translate "This session already has an Etherpad link. Replace it with a newly generated pad? The existing notes will no longer be linked." as etherpad_replace_confirm %}
+                            <button type="button" class="btn btn-outline-info"
+                                    data-etherpad-generate
+                                    data-url="{{ submission.orga_urls.etherpad_generate }}"
+                                    data-replace-confirm="{{ etherpad_replace_confirm }}"
+                                    data-error-text="{% translate "Could not generate the Etherpad link. Please try again." %}"
+                                    {% if submission.etherpad_url %}data-force="true" data-confirm="{{ etherpad_replace_confirm }}"{% endif %}>
+                                <i class="fa fa-file-text-o"></i>
+                                {% if submission.etherpad_url %}{% translate "Regenerate Etherpad link" %}{% else %}{% translate "Auto-generate Etherpad link" %}{% endif %}
+                            </button>
+                        {% endif %}
+                    </div>
+                </div>
+                {% endif %}
+            {% endif %}
+            {% if action != "create" %}
+                {% include "cfp/includes/submission_resources_form.html" %}
+            {% endif %}
+            {% if questions_form and questions_form.fields %}
+                <div><legend id="custom">{{ phrases.cfp.custom_fields }}</legend></div>
+                {{ questions_form }}
+            {% endif %}
+
+            {% if not form.read_only %}
+                <div class="submit-group panel">
+                    <span></span>
+                    <span>
+                        <button type="submit" class="btn btn-success btn-lg">
+                            <i class="fa fa-check"></i>
+                            {{ phrases.base.save }}
+                        </button>
+                    </span>
+                </div>
+            {% endif %}
+        </fieldset></form>
+
+    <span id="vars" remoteUrl="{{ request.event.organizer.orga_urls.user_search }}"></span>
+{% endblock submission_content %}

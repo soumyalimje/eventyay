@@ -1,15 +1,25 @@
 from rest_framework import serializers
 
+from eventyay.api.serializers.fields import UploadedFileField
 from eventyay.api.serializers.i18n import I18nAwareModelSerializer
 from eventyay.base.models.event import Event
-from eventyay.base.models.room import Room
+from django.conf import settings
+from eventyay.consts import SizeKey
+from eventyay.base.models.room import Room, RoomLinkedSessionsSerializerMixin
 
 
-class RoomSerializer(I18nAwareModelSerializer):
+class RoomSerializer(RoomLinkedSessionsSerializerMixin, I18nAwareModelSerializer):
     module_config = serializers.ListField(
         child=serializers.DictField(), required=False, default=[]
     )
     trait_grants = serializers.DictField(required=False, default={})
+
+    picture = UploadedFileField(
+        required=False,
+        allow_null=True,
+        allowed_types=('image/png', 'image/jpeg', 'image/gif', 'image/webp'),
+        max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
+    )
 
     class Meta:
         model = Room
@@ -23,7 +33,9 @@ class RoomSerializer(I18nAwareModelSerializer):
             "sorting_priority",
             "pretalx_id",
             "schedule_data",
-            # TODO: picture
+            "is_unscheduled",
+            "has_linked_sessions",
+            "picture",
         ]
 
 

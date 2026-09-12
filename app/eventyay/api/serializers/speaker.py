@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from eventyay.common.image import ALLOWED_IMAGE_EXTENSIONS, validate_image
+
 from drf_spectacular.utils import extend_schema_field
 from rest_flex_fields.serializers import FlexFieldsSerializerMixin
 from rest_framework import exceptions
@@ -10,7 +12,7 @@ from rest_framework.serializers import (
     URLField,
 )
 
-from eventyay.api.mixins import PretalxSerializer
+from eventyay.api.mixins import PretalxSerializer, filter_public_speaker_answers
 from eventyay.api.serializers.availability import (
     AvailabilitiesMixin,
     AvailabilitySerializer,
@@ -20,84 +22,168 @@ from eventyay.api.versions import CURRENT_VERSIONS, register_serializer
 from eventyay.base.models.auth import User
 from eventyay.base.models.profile import SpeakerProfile
 from eventyay.base.models.question import TalkQuestionTarget
+from eventyay.common.social_links import serialize_social_link
+from eventyay.talk_rules.orga import can_view_speaker_names, is_reviewer_only_for_event
 
 
 @register_serializer(versions=CURRENT_VERSIONS)
 class SpeakerSerializer(FlexFieldsSerializerMixin, PretalxSerializer):
-    code = CharField(source="user.code", read_only=True)
-    name = CharField(source="user.name")
+    code = CharField(source='user.code', read_only=True)
+    fullname = CharField(source='user.fullname')
     avatar_url = URLField(read_only=True)
     avatar_source = SerializerMethodField()
     avatar_license = SerializerMethodField()
     answers = SerializerMethodField()
     submissions = SerializerMethodField()
+    social_links = SerializerMethodField()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if self.event and not self.event.cfp.request_avatar:
-            self.fields.pop("avatar_url")
+        if not self.event:
+            self.fields.pop('social_links', None)
+            return
+
+        request = self.context.get('request')
+        is_public_view = bool(request and not request.user.has_perm('base.orga_list_speakerprofile', self.event))
+
+        if not self.event.cfp.request_avatar or (is_public_view and not self.event.cfp.public_avatar):
+            self.fields.pop('avatar_url')
+        if is_public_view and not self.event.cfp.public_biography:
+            self.fields.pop('biography', None)
+        if is_public_view and not self.event.cfp.is_field_public('avatar_source'):
+            self.fields.pop('avatar_source', None)
+        if is_public_view and not self.event.cfp.is_field_public('avatar_license'):
+            self.fields.pop('avatar_license', None)
+        if not self.event.cfp.request_social_links or (
+            is_public_view and not self.event.cfp.is_field_public('social_links')
+        ):
+            self.fields.pop('social_links', None)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        if (
+            self.event
+            and request
+            and request.user.has_perm('base.orga_list_speakerprofile', self.event)
+        ):
+            from eventyay.talk_rules.orga import (
+                can_view_speaker_emails,
+                can_view_speaker_names,
+                enforces_hide_speaker_emails,
+                enforces_hide_speaker_names,
+            )
+
+            hide_names = enforces_hide_speaker_names(request.user, self.event) or (
+                is_reviewer_only_for_event(request.user, self.event)
+                and not can_view_speaker_names(request.user, self.event)
+            )
+            hide_emails = enforces_hide_speaker_emails(request.user, self.event) or (
+                is_reviewer_only_for_event(request.user, self.event)
+                and not can_view_speaker_emails(request.user, self.event)
+            )
+
+            if hide_names:
+                data.pop('fullname', None)
+                data.pop('email', None)
+                data.pop('biography', None)
+                data.pop('avatar_url', None)
+                data.pop('social_links', None)
+            elif hide_emails:
+                data.pop('email', None)
+        return data
 
     @staticmethod
     def get_avatar_source(obj):
-        if obj.user.has_avatar and obj.user.avatar_source != "":
+        if obj.user.has_avatar and obj.user.avatar_source != '':
             return obj.user.avatar_source
 
     @staticmethod
     def get_avatar_license(obj):
-        if obj.user.has_avatar and obj.user.avatar_license != "":
+        if obj.user.has_avatar and obj.user.avatar_license != '':
             return obj.user.avatar_license
 
     @extend_schema_field(list[str])
     def get_submissions(self, obj):
-        submissions = self.context.get("submissions")
+        submissions = self.context.get('submissions')
         if not submissions:
             return []
         submissions = submissions.filter(speakers__in=[obj.user])
-        if serializer := self.get_extra_flex_field("submissions", submissions):
+        if serializer := self.get_extra_flex_field('submissions', submissions):
             return serializer.data
-        return submissions.values_list("code", flat=True)
+        return submissions.values_list('code', flat=True)
 
     @extend_schema_field(list[int])
     def get_answers(self, obj):
-        questions = self.context.get("questions", [])
+        request = self.context.get('request')
+        if self.event and request and not request.user.has_perm('base.orga_list_speakerprofile', self.event):
+            public_answers = filter_public_speaker_answers(obj.user, is_public_only=True)
+            if public_answers is not None:
+                if serializer := self.get_extra_flex_field('answers', public_answers):
+                    return serializer.data
+                return [answer.pk for answer in public_answers]
+            qs = obj.answers.filter(
+                question__event=self.event,
+                question__target=TalkQuestionTarget.SPEAKER,
+                question__is_public=True,
+            )
+            if serializer := self.get_extra_flex_field('answers', qs):
+                return serializer.data
+            return qs.values_list('pk', flat=True)
+
+        questions = self.context.get('questions', [])
         qs = obj.answers.filter(
             question__in=questions,
             question__event=self.event,
             question__target=TalkQuestionTarget.SPEAKER,
         )
-        if serializer := self.get_extra_flex_field("answers", qs):
+        if serializer := self.get_extra_flex_field('answers', qs):
             return serializer.data
-        return qs.values_list("pk", flat=True)
+        return qs.values_list('pk', flat=True)
+
+    @extend_schema_field(list[dict])
+    def get_social_links(self, obj):
+        return [serialize_social_link(link) for link in obj.social_links.all()]
 
     def update(self, instance, validated_data):
-        availabilities_data = validated_data.pop("availabilities", None)
+        availabilities_data = validated_data.pop('availabilities', None)
         profile = super().update(instance, validated_data)
         if availabilities_data is not None:
-            self._handle_availabilities(profile, availabilities_data, field="person")
+            self._handle_availabilities(profile, availabilities_data, field='person')
         return profile
 
     class Meta:
         model = SpeakerProfile
-        fields = ("code", "name", "biography", "submissions", "avatar_url", "avatar_source", "avatar_license", "answers")
+        fields = (
+            'code',
+            'fullname',
+            'biography',
+            'submissions',
+            'avatar_url',
+            'avatar_source',
+            'avatar_license',
+            'answers',
+            'social_links',
+        )
         expandable_fields = {
-            "submissions": (
-                "eventyay.api.serializers.submission.SubmissionSerializer",
-                {"read_only": True, "many": True},
+            'submissions': (
+                'eventyay.api.serializers.submission.SubmissionSerializer',
+                {'read_only': True, 'many': True},
             ),
         }
         extra_expandable_fields = {
-            "answers": (
-                "eventyay.api.serializers.question.AnswerSerializer",
+            'answers': (
+                'eventyay.api.serializers.question.AnswerSerializer',
                 {
-                    "many": True,
-                    "read_only": True,
+                    'many': True,
+                    'read_only': True,
                 },
             ),
-            "submissions": (
-                "eventyay.api.serializers.submission.SubmissionSerializer",
+            'submissions': (
+                'eventyay.api.serializers.submission.SubmissionSerializer',
                 {
-                    "many": True,
-                    "read_only": True,
+                    'many': True,
+                    'read_only': True,
                 },
             ),
         }
@@ -105,64 +191,87 @@ class SpeakerSerializer(FlexFieldsSerializerMixin, PretalxSerializer):
 
 @register_serializer(versions=CURRENT_VERSIONS)
 class SpeakerOrgaSerializer(AvailabilitiesMixin, SpeakerSerializer):
-    email = EmailField(source="user.email")
-    timezone = CharField(source="user.timezone", read_only=True)
-    locale = CharField(source="user.locale", read_only=True)
+    email = EmailField(source='user.email')
+    timezone = CharField(source='user.timezone', read_only=True)
+    locale = CharField(source='user.locale', read_only=True)
     availabilities = AvailabilitySerializer(many=True, required=False)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.event:
-            for field in ("avatar", "availabilities"):
+            for field in ('avatar', 'availabilities'):
                 if field not in self.fields:
                     continue
-                if not getattr(self.event.cfp, f"request_{field}"):
+                if not getattr(self.event.cfp, f'request_{field}'):
                     self.fields.pop(field, None)
-                elif getattr(self.event.cfp, f"require_{field}"):
+                elif getattr(self.event.cfp, f'require_{field}'):
                     self.fields[field].required = True
 
     class Meta(SpeakerSerializer.Meta):
         fields = SpeakerSerializer.Meta.fields + (
-            "email",
-            "timezone",
-            "locale",
-            "has_arrived",
-            "availabilities",
+            'email',
+            'timezone',
+            'locale',
+            'has_arrived',
+            'availabilities',
         )
         expandable_fields = {
-            "submissions": (
-                "eventyay.api.serializers.submission.SubmissionSerializer",
-                {"read_only": True, "many": True},
+            'submissions': (
+                'eventyay.api.serializers.submission.SubmissionSerializer',
+                {'read_only': True, 'many': True},
             ),
         }
 
 
 @register_serializer(versions=CURRENT_VERSIONS)
 class SpeakerUpdateSerializer(SpeakerOrgaSerializer):
-    avatar = UploadedFileField(required=False, source="speaker.user")
+    avatar = UploadedFileField(required=False, source='speaker.user')
+
+    def validate_avatar(self, avatar):
+        if not avatar:
+            return avatar
+        extension = Path(avatar.name).suffix.lower()
+        if extension not in ALLOWED_IMAGE_EXTENSIONS:
+            allowed_formats = ', '.join(sorted(ALLOWED_IMAGE_EXTENSIONS))
+            raise exceptions.ValidationError(
+                f"The file type '{extension}' is not supported. Please upload one of: {allowed_formats}."
+            )
+        validate_image(avatar)
+        return avatar
 
     def update(self, instance, validated_data):
-        avatar = validated_data.pop("avatar", None)
-        user_fields = validated_data.pop("user", None) or {}
+        avatar = validated_data.pop('avatar', None)
+        if not avatar and 'speaker' in validated_data and 'user' in validated_data['speaker']:
+            avatar = validated_data['speaker'].pop('user', None)
+        if not avatar and 'user' in validated_data and 'avatar' in validated_data['user']:
+            avatar = validated_data['user'].pop('avatar', None)
+
+        user_fields = validated_data.pop('user', None) or {}
         instance = super().update(instance, validated_data)
         for key, value in user_fields.items():
             setattr(instance.user, key, value)
             instance.user.save(update_fields=[key])
         if avatar:
-            instance.avatar.save(Path(avatar.name).name, avatar, save=False)
-            instance.save(update_fields=("avatar",))
-            instance.user.process_image("avatar", generate_thumbnail=True)
+            old_thumbnails_to_delete = []
+            for field_name in ('avatar_thumbnail', 'avatar_thumbnail_tiny'):
+                thumbnail = getattr(instance.user, field_name, None)
+                if thumbnail and thumbnail.name:
+                    old_thumbnails_to_delete.append(thumbnail)
+
+            instance.user.avatar_thumbnail = None
+            instance.user.avatar_thumbnail_tiny = None
+            instance.user.avatar.save(Path(avatar.name).name, avatar, save=True)
+            instance.user.process_image('avatar', generate_thumbnail=True)
+
+            for thumbnail in old_thumbnails_to_delete:
+                thumbnail.delete(save=False)
         return instance
 
     def validate_email(self, value):
         value = value.lower()
-        if (
-            User.objects.exclude(pk=self.instance.pk)
-            .filter(email__iexact=value)
-            .exists()
-        ):
-            raise exceptions.ValidationError("Email already exists in system.")
+        if User.objects.exclude(pk=self.instance.pk).filter(email__iexact=value).exists():
+            raise exceptions.ValidationError('Email already exists in system.')
         return value
 
     class Meta(SpeakerOrgaSerializer.Meta):
-        fields = SpeakerOrgaSerializer.Meta.fields + ("avatar",)
+        fields = SpeakerOrgaSerializer.Meta.fields + ('avatar',)

@@ -15,7 +15,7 @@ class OrganizerUpdateForm(OrganizerForm):
         self.domain = kwargs.pop('domain', False)
         self.change_slug = kwargs.pop('change_slug', False)
         kwargs.setdefault('initial', {})
-        self.instance = kwargs['instance']
+        self.instance = kwargs.get('instance')
         if self.domain and self.instance:
             initial_domain = self.instance.domains.filter(event__isnull=True).first()
             if initial_domain:
@@ -24,13 +24,26 @@ class OrganizerUpdateForm(OrganizerForm):
         super().__init__(*args, **kwargs)
         if not self.change_slug:
             self.fields['slug'].widget.attrs['readonly'] = 'readonly'
-        if self.domain:
-            self.fields['domain'] = forms.CharField(
-                max_length=255,
-                label=_('Custom domain'),
-                required=False,
-                help_text=_('You need to configure the custom domain in the webserver beforehand.'),
-            )
+        if self.user and self.user.is_authenticated and self.instance:
+            is_default = bool(self.user.get_default_organizer() == self.instance)
+            if 'set_as_default' in self.fields and 'set_as_default' not in self.initial:
+                self.fields['set_as_default'].initial = is_default
+
+    def clean_set_as_default(self):
+        val = self.cleaned_data.get('set_as_default')
+        if val and self.user and self.instance:
+            if not self.user.teams.filter(organizer=self.instance).exists():
+                raise forms.ValidationError(_('You cannot set an organizer as default if you are not a member.'))
+        return val
+        # Custom domain feature is temporarily disabled.
+        # Uncomment when the feature is ready for re-enablement.
+        # if self.domain:
+        #     self.fields['domain'] = forms.CharField(
+        #         max_length=255,
+        #         label=_('Custom domain'),
+        #         required=False,
+        #         help_text=_('You need to configure the custom domain in the webserver beforehand.'),
+        #     )
 
     def clean_domain(self):
         d = self.cleaned_data['domain']

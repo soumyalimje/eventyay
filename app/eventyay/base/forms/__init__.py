@@ -1,18 +1,26 @@
 import logging
+import os
 
 import i18nfield.forms
 from django import forms
+from django.conf import settings
+from django.core.files import File
+from django.core.files.uploadedfile import SimpleUploadedFile, UploadedFile
 from django.core.validators import URLValidator
 from django.forms.models import ModelFormMetaclass
 from django.utils.crypto import get_random_string
+from django.utils.html import escape
+from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 from formtools.wizard.views import SessionWizardView
 from hierarkey.forms import HierarkeyForm
 from i18nfield.strings import LazyI18nString
 
 from eventyay.base.reldate import RelativeDateField, RelativeDateTimeField
-
+from eventyay.common.urls import is_http_url
+from eventyay.helpers.image_optimize import optimize_uploaded_image
 from .validators import PlaceholderValidator  # NOQA
+
 
 logger = logging.getLogger(__name__)
 
@@ -64,29 +72,113 @@ class SettingsForm(i18nfield.forms.I18nFormMixin, HierarkeyForm):
         self.locales = self.obj.settings.get('locales') if self.obj else kwargs.pop('locales', None)
         kwargs['attribute_name'] = 'settings'
         kwargs['locales'] = self.locales
-        kwargs['initial'] = self.obj.settings.freeze()
-        super().__init__(*args, **kwargs)
+        kwargs['initial'] = self.get_initial_settings()
+        original_freeze = None
+
+        def freeze_with_safe_initial():
+            return kwargs['initial'].copy()
+
+        if self.obj:
+            original_freeze = self.obj.settings.freeze
+            object.__setattr__(self.obj.settings, 'freeze', freeze_with_safe_initial)
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            if self.obj and original_freeze:
+                object.__setattr__(self.obj.settings, 'freeze', original_freeze)
         for fname in self.auto_fields:
             kwargs = DEFAULTS[fname].get('form_kwargs', {})
             if callable(kwargs):
                 kwargs = kwargs()
             kwargs.setdefault('required', False)
-            field = DEFAULTS[fname]['form_class'](**kwargs)
+            form_class = DEFAULTS[fname]['form_class']
+            field = form_class(**kwargs)
             if isinstance(field, i18nfield.forms.I18nFormField):
                 field.widget.enabled_locales = self.locales
+            if fname == 'primary_font':
+                from eventyay.base.models import Event  # noqa: PLC0415
+                if isinstance(self.obj, Event):
+                    inherited_font = None
+                    if hasattr(self.obj, 'organizer'):
+                        inherited_font = self.obj.organizer.settings.get('primary_font')
+                    if not inherited_font:
+                        inherited_font = 'Open Sans'
+                    field.choices = [('', _('Default (Inherit: {})').format(inherited_font))] + list(field.choices)
+                    if 'primary_font' not in self.obj.settings._cache():
+                        self.initial['primary_font'] = ''
+                    field.widget.obj = self.obj
             self.fields[fname] = field
+            if fname not in self.initial or self.initial[fname] is None:
+                default_value = DEFAULTS[fname].get('default')
+                if default_value:
+                    self.initial[fname] = default_value
         for k, f in self.fields.items():
             if isinstance(f, (RelativeDateTimeField, RelativeDateField)):
                 f.set_event(self.obj)
+
+    def get_initial_settings(self):
+        if not self.obj:
+            return {}
+
+        return self.build_initial_settings(self.obj.settings)
+
+    def build_initial_settings(self, settings_proxy):
+        initial = {}
+        if settings_proxy._parent:
+            initial.update(
+                self.build_initial_settings(getattr(settings_proxy._parent, settings_proxy._h.attribute_name))
+            )
+
+        for key, default in settings_proxy._h.defaults.items():
+            initial[key] = self.get_initial_setting_value(settings_proxy, key, default.type, default.value)
+
+        for key in settings_proxy._cache():
+            declared_type = settings_proxy._h.get_declared_type(key)
+            initial[key] = self.get_initial_setting_value(settings_proxy, key, declared_type)
+
+        return initial
+
+    def get_initial_setting_value(self, settings_proxy, key, declared_type, default=None):
+        if declared_type is File:
+            value = settings_proxy.get(key, as_type=str, default=default)
+            if isinstance(value, str) and is_http_url(value):
+                return value
+        return settings_proxy.get(key, as_type=declared_type, default=default)
+
+    def clean(self):
+        cleaned_data = super().clean()
+        
+        for k, v in list(cleaned_data.items()):
+            if isinstance(v, UploadedFile) and k in {
+                'invoice_logo_image', 'startpage_header_image',
+            }:
+                try:
+                    opt = optimize_uploaded_image(v, k)
+                    orig_name = os.path.splitext(v.name or 'upload')[0]
+                    new_name = f'{orig_name}.{opt.optimized_ext}'
+                    cleaned_data[k] = SimpleUploadedFile(
+                        name=new_name,
+                        content=opt.optimized.read(),
+                        content_type=getattr(v, 'content_type', None)
+                    )
+                except (ValueError, OSError) as e:
+                    self.add_error(k, str(e))
+                    if hasattr(v, 'seek'):
+                        v.seek(0)
+        return cleaned_data
 
     def save(self):
         for k, v in self.cleaned_data.items():
             if isinstance(self.fields.get(k), SecretKeySettingsField) and self.cleaned_data.get(k) == SECRET_REDACTED:
                 self.cleaned_data[k] = self.initial[k]
+
+        if self.cleaned_data.get('primary_font') == '':
+            self.cleaned_data['primary_font'] = None
+
         return super().save()
 
     def get_new_filename(self, name: str) -> str:
-        from eventyay.base.models import Event
+        from eventyay.base.models import Event  # noqa: PLC0415
 
         nonce = get_random_string(length=8)
         if isinstance(self.obj, Event):
@@ -133,7 +225,9 @@ class SecretKeySettingsWidget(forms.TextInput):
             attrs = {}
         attrs.update(
             {
-                'autocomplete': 'new-password'  # see https://bugs.chromium.org/p/chromium/issues/detail?id=370363#c7
+                'autocomplete': 'new-password',  # see https://bugs.chromium.org/p/chromium/issues/detail?id=370363#c7
+                'type': 'password',
+                'class': (attrs.get('class', '') + ' secret-key-input').strip(),
             }
         )
         super().__init__(attrs)
@@ -141,7 +235,26 @@ class SecretKeySettingsWidget(forms.TextInput):
     def get_context(self, name, value, attrs):
         if value:
             value = SECRET_REDACTED
-        return super().get_context(name, value, attrs)
+        context = super().get_context(name, value, attrs)
+        return context
+
+    def render(self, name, value, attrs=None, renderer=None):
+        output = super().render(name, value, attrs, renderer)
+        show_label = str(_('Show secret key'))
+        hide_label = str(_('Hide secret key'))
+        toggle_html = (
+            '<div class="secret-key-wrapper">'
+            f'{output}'
+            '<button type="button" class="secret-toggle" '
+            f'aria-label="{show_label}" '
+            f'data-label-show="{show_label}" '
+            f'data-label-hide="{hide_label}" '
+            'aria-pressed="false">'
+            '<i class="fa fa-eye"></i>'
+            '</button>'
+            '</div>'
+        )
+        return mark_safe(toggle_html)
 
 
 class SecretKeySettingsField(forms.CharField):
@@ -159,21 +272,47 @@ class SecretKeySettingsField(forms.CharField):
 
 
 class I18nMarkdownTextarea(i18nfield.forms.I18nTextarea):
-    def format_output(self, rendered_widgets, id_) -> str:
-        markdown_note = _('You can use {name} in this field.').format(
-            name='<a href="https://en.wikipedia.org/wiki/Markdown" target="_blank">Markdown</a>'
-        )
-        rendered_widgets.append(f'<div class="i18n-field-markdown-note">{markdown_note}</div>')
-        return super().format_output(rendered_widgets, id_)
+    def __init__(self, attrs=None, **kwargs):
+        attrs = attrs.copy() if attrs is not None else {}
+        attrs.setdefault('data-markdown-field', 'true')
+        super().__init__(attrs=attrs, **kwargs)
+
+    def render(self, name, value, attrs=None, renderer=None):
+        if not isinstance(value, dict):
+            value = self.decompress(value)
+
+        output = []
+        id_ = attrs.get('id') if attrs else None
+        lang_dict = dict(settings.LANGUAGES)
+        for i, widget in enumerate(self.widgets):
+            locale_code = self.locales[i]
+            human_locale_name = str(lang_dict.get(locale_code, locale_code))
+            widget_value = value.get(locale_code, '') if isinstance(value, dict) else ''
+
+            final_attrs_widget = (attrs or {}).copy()
+            if id_:
+                final_attrs_widget['id'] = f'{id_}_{i}'
+                final_attrs_widget['title'] = human_locale_name
+                final_attrs_widget.setdefault('placeholder', human_locale_name)
+
+            textarea_html = widget.render(f'{name}_{i}', widget_value, final_attrs_widget, renderer=renderer)
+
+            wrapped_html = f'''
+            <div class="i18n-textarea-wrapper" data-lang="{escape(locale_code)}">
+                {textarea_html}
+            </div>
+            '''
+            output.append(wrapped_html)
+
+        return mark_safe(f'<div class="i18n-form-group" id="{escape(id_) if id_ else ""}">{  "".join(output) }</div>')
 
 
 class I18nAutoExpandingTextarea(i18nfield.forms.I18nTextarea):
-
     def __init__(self, attrs=None, **kwargs):
         default_attrs = {
             'class': 'form-control auto-expanding-textarea',
             'data-auto-expand': 'true',
-            'style': 'min-height: 320px; max-height: 400px; overflow-y: auto; resize: vertical; transition: height 0.2s ease-in-out; box-sizing: border-box;'
+            'style': 'min-height: 320px; max-height: 400px; overflow-y: auto; resize: vertical; transition: height 0.2s ease-in-out; box-sizing: border-box;',
         }
         if attrs:
             if 'class' in attrs:

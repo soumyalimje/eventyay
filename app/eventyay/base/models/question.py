@@ -6,9 +6,11 @@ from django_scopes import ScopedManager
 from i18nfield.fields import I18nCharField
 
 from eventyay.base.models import Choices
+from eventyay.base.models.fields import MultiStringField
 from eventyay.common.text.path import path_with_hash
 from eventyay.common.text.phrases import phrases
 from eventyay.common.urls import EventUrls
+from eventyay.helpers.countries import get_country_name
 from eventyay.talk_rules.agenda import is_agenda_visible
 from eventyay.talk_rules.event import can_change_event_settings
 from eventyay.talk_rules.person import is_reviewer
@@ -35,24 +37,32 @@ class TalkQuestionVariant(Choices):
     STRING = 'string'
     TEXT = 'text'
     URL = 'url'
+    VIDEO = 'video'
     DATE = 'date'
     DATETIME = 'datetime'
     BOOLEAN = 'boolean'
     FILE = 'file'
     CHOICES = 'choices'
     MULTIPLE = 'multiple_choice'
+    SELECT = 'select'
+    COUNTRY = 'country'
+    PHONE_NUMBER = 'tel'
 
     valid_choices = [
         (NUMBER, _('Number')),
         (STRING, _('Text (one-line)')),
         (TEXT, _('Multi-line text')),
         (URL, _('URL')),
+        (VIDEO, _('Video link')),
         (DATE, _('Date')),
         (DATETIME, _('Date and time')),
-        (BOOLEAN, _('Yes/No')),
+        (BOOLEAN, _('Confirmation')),
         (FILE, _('File upload')),
         (CHOICES, _('Radio button (Choose one option)')),
         (MULTIPLE, _('Checkbox (Choose one or several options)')),
+        (SELECT, _('Select (one option)')),
+        (COUNTRY, _('Country List')),
+        (PHONE_NUMBER, _('Phone number')),
     ]
 
 
@@ -101,9 +111,9 @@ class TalkQuestion(OrderedModel, PretalxModel):
     TalkQuestions can have many types, which offers a flexible framework to give organisers
     the opportunity to get all the information they need.
 
-    :param variant: Can be any of 'number', 'string', 'text', 'boolean',
-        'file', 'choices', or 'multiple_choice'. Defined in the
-        ``TalkQuestionVariant`` class.
+    :param variant: Can be any of 'number', 'string', 'text', 'url', 'video',
+        'date', 'datetime', 'boolean', 'file', 'choices', 'multiple_choice',
+        'select', 'country', or 'tel'. Defined in the ``TalkQuestionVariant`` class.
     :param target: Can be any of 'submission', 'speaker', or 'reviewer'.
         Defined in the ``TalkQuestionTarget`` class.
     :param deadline: Datetime field. This field is required for 'after deadline' and 'freeze after' options of
@@ -165,7 +175,7 @@ class TalkQuestion(OrderedModel, PretalxModel):
         verbose_name=_('Session Types'),
         blank=True,
     )
-    question = I18nCharField(max_length=800, verbose_name=_('Label'))
+    question = I18nCharField(max_length=800, verbose_name=_('Custom question'))
     help_text = I18nCharField(
         null=True,
         blank=True,
@@ -181,7 +191,7 @@ class TalkQuestion(OrderedModel, PretalxModel):
         help_text=_('Inactive fields will no longer be shown.'),
     )
     contains_personal_data = models.BooleanField(
-        default=True,
+        default=False,
         verbose_name=_('Responses contain personal data'),
         help_text=_('If a user deletes their account, responses containing personal data will be removed, too.'),
     )
@@ -236,6 +246,18 @@ class TalkQuestion(OrderedModel, PretalxModel):
             'to allow speakers explicit consent before publishing information.'
         ),
     )
+    is_imported = models.BooleanField(
+        default=False,
+        verbose_name=_('Imported field'),
+        help_text=_('Imported fields are managed automatically and hidden from normal form configuration.'),
+    )
+    import_key = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name=_('Import key'),
+    )
     is_visible_to_reviewers = models.BooleanField(
         default=True,
         verbose_name=_('Show answers to reviewers'),
@@ -243,6 +265,19 @@ class TalkQuestion(OrderedModel, PretalxModel):
             'Should responses to this field be shown to reviewers? This is helpful if you want to collect '
             'personal information, but use anonymous reviews.'
         ),
+    )
+    dependency_question = models.ForeignKey(
+        'TalkQuestion',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='dependent_questions',
+        verbose_name=_('Custom field dependency'),
+        help_text=_('This field will only be shown if the selected field has one of the specified values.'),
+    )
+    dependency_values = MultiStringField(
+        default=list,
+        verbose_name=_('Dependency values'),
     )
     objects = ScopedManager(event='event', _manager_class=TalkQuestionManager)
     all_objects = ScopedManager(event='event', _manager_class=AllTalkQuestionManager)
@@ -252,6 +287,13 @@ class TalkQuestion(OrderedModel, PretalxModel):
     class Meta:
         ordering = ('position', 'id')
         rules_permissions = QUESTION_PERMISSIONS
+        constraints = [
+            models.UniqueConstraint(
+                fields=('event', 'target', 'import_key'),
+                condition=models.Q(import_key__isnull=False) & ~models.Q(import_key=''),
+                name='unique_import_question_per_event_target',
+            )
+        ]
 
     @property
     def log_parent(self):
@@ -275,6 +317,7 @@ class TalkQuestion(OrderedModel, PretalxModel):
 
     class urls(EventUrls):
         """URL patterns for question views."""
+
         base = '{self.event.cfp.urls.questions}{self.pk}/'
         edit = '{base}edit/'
         delete = '{base}delete/'
@@ -424,7 +467,7 @@ class Answer(PretalxModel):
 
     @property
     def answer_string(self):
-        if self.question.variant in ('number', 'string', 'text', 'url'):
+        if self.question.variant in ('number', 'string', 'text', 'url', 'video', 'tel'):
             return self.answer or ''
         if self.question.variant == 'boolean':
             if self.boolean_answer is True:
@@ -434,8 +477,10 @@ class Answer(PretalxModel):
             return ''
         if self.question.variant == 'file':
             return self.answer_file.url if self.answer_file else ''
-        if self.question.variant in ('choices', 'multiple_choice'):
+        if self.question.variant in ('choices', 'multiple_choice', 'select'):
             return ', '.join(str(option.answer) for option in self.options.all())
+        if self.question.variant == TalkQuestionVariant.COUNTRY:
+            return get_country_name(self.answer) or self.answer or ''
 
     @property
     def is_answered(self):

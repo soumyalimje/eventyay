@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from pathlib import Path
 
 from django.conf import settings
@@ -6,21 +7,22 @@ from django.core.files.uploadedfile import UploadedFile
 from django.forms import CharField, FileField, RegexField, ValidationError
 from django.utils.translation import gettext_lazy as _
 
+from i18nfield.forms import I18nFormField
+from i18nfield.strings import LazyI18nString
+
 from eventyay.common.forms.widgets import (
     ClearableBasenameFileInput,
+    EmailEditorWidget,
+    I18nEmailEditorWidget,
+    I18nRichTextWidget,
     ImageInput,
     PasswordConfirmationInput,
     PasswordStrengthInput,
+    RichTextWidget,
 )
+from eventyay.common.sanitizers import sanitize_email_html, sanitize_rich_text
+from eventyay.common.image import IMAGE_EXTENSIONS, validate_image
 from eventyay.common.templatetags.filesize import filesize
-
-IMAGE_EXTENSIONS = {
-    '.png': ['image/png', '.png'],
-    '.jpg': ['image/jpeg', '.jpg'],
-    '.jpeg': ['image/jpeg', '.jpeg'],
-    '.gif': ['image/gif', '.gif'],
-    '.svg': ['image/svg+xml', '.svg'],
-}
 
 
 class GlobalValidator:
@@ -63,7 +65,7 @@ class SizeFileInput:
     def get_size_warning(max_size=None, fallback=True):
         if not max_size and fallback:
             max_size = settings.FILE_UPLOAD_DEFAULT_LIMIT
-        return _('Please do not upload files larger than {size}!').format(size=filesize(max_size))
+        return _('The upload limit is {size}.').format(size=filesize(max_size))
 
     def validate(self, value):
         super().validate(value)
@@ -117,6 +119,128 @@ class ExtensionFileField(ExtensionFileInput, SizeFileInput, FileField):
 class ImageField(ExtensionFileInput, SizeFileInput, FileField):
     widget = ImageInput
     extensions = IMAGE_EXTENSIONS
+
+    def clean(self, value, initial=None):
+        value = super().clean(value, initial)
+        if value:
+            validate_image(value)
+        return value
+
+
+class RichTextField(CharField):
+    """A CharField that uses the Tiptap rich text editor widget.
+
+    Sanitizes the submitted HTML server-side using ``sanitize_rich_text``
+    before returning the cleaned value.  Safe tags: p, br, strong, b, em,
+    i, u, ul, ol, li, a (http/https only), blockquote.
+    """
+
+    widget = RichTextWidget
+
+    def clean(self, value: str) -> str:
+        value = super().clean(value)
+        return sanitize_rich_text(value) if value else value
+
+
+class I18nRichTextFormField(I18nFormField):
+    """I18n form field for rich text using the Tiptap richtext editor.
+
+    Sanitizes each locale value with the provided sanitizer (defaults to ``sanitize_rich_text``)
+    after validation.
+    """
+
+    widget = I18nRichTextWidget
+
+    def __init__(self, *args, sanitizer=None, **kwargs):
+        self.sanitizer = sanitizer or sanitize_rich_text
+        kwargs.setdefault('widget', I18nRichTextWidget)
+        super().__init__(*args, **kwargs)
+
+    def clean(self, value):
+        result = super().clean(value)
+        if isinstance(result, LazyI18nString):
+            if isinstance(result.data, dict):
+                return LazyI18nString(
+                    {locale: self.sanitizer(text) if text else text for locale, text in result.data.items()}
+                )
+            elif isinstance(result.data, str):
+                return LazyI18nString(self.sanitizer(result.data) if result.data else result.data)
+        elif isinstance(result, str):
+            return self.sanitizer(result) if result else result
+        return result
+
+
+class EmailBodyField(CharField):
+    """A CharField for email body editing using the Tiptap email editor profile.
+
+    The email profile extends the rich text profile with a placeholder
+    variable insertion menu.  HTML is sanitized with ``sanitize_email_html``
+    which uses a slightly broader tag set than ``RichTextField`` but does
+    not inject ``rel`` attributes that may confuse email clients.
+
+    Args:
+        placeholders: Names of template variables available for insertion,
+            e.g. ``['attendee_name', 'event_name', 'order_code']``.
+        preview_url: Optional URL for the email preview AJAX endpoint.
+    """
+
+    def __init__(
+        self,
+        *args,
+        placeholders: Sequence[str] | None = None,
+        preview_url: str = '',
+        **kwargs,
+    ) -> None:
+        if 'widget' not in kwargs:
+            kwargs['widget'] = EmailEditorWidget(placeholders=placeholders, preview_url=preview_url)
+        super().__init__(*args, **kwargs)
+
+    def clean(self, value: str) -> str:
+        value = super().clean(value)
+        return sanitize_email_html(value) if value else value
+
+
+class I18nEmailBodyFormField(I18nFormField):
+    """I18n form field for Message center email bodies using the Tiptap email editor.
+
+    Sanitizes each locale value with ``sanitize_email_html`` after validation.
+
+    Args:
+        placeholders: Names of template variables available for insertion,
+            e.g. ``['attendee_name', 'event_name', 'order_code']``.
+        preview_url: Optional URL for the email preview AJAX endpoint.
+    """
+
+    widget = I18nEmailEditorWidget
+
+    def __init__(
+        self,
+        *args,
+        placeholders: Sequence[str] | None = None,
+        preview_url: str = '',
+        **kwargs,
+    ) -> None:
+        widget_kwargs = kwargs.pop('widget_kwargs', {})
+        if placeholders is not None:
+            widget_kwargs.setdefault('placeholders', placeholders)
+        if preview_url:
+            widget_kwargs.setdefault('preview_url', preview_url)
+        kwargs['widget_kwargs'] = widget_kwargs
+        kwargs.setdefault('widget', I18nEmailEditorWidget)
+        super().__init__(*args, **kwargs)
+
+    def clean(self, value):
+        result = super().clean(value)
+        if isinstance(result, LazyI18nString):
+            if isinstance(result.data, dict):
+                return LazyI18nString(
+                    {locale: sanitize_email_html(text) if text else text for locale, text in result.data.items()}
+                )
+            elif isinstance(result.data, str):
+                return LazyI18nString(sanitize_email_html(result.data) if result.data else result.data)
+        elif isinstance(result, str):
+            return sanitize_email_html(result) if result else result
+        return result
 
 
 class ColorField(RegexField):

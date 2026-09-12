@@ -1,16 +1,16 @@
 import logging
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 from django.contrib import messages
 from django.http import Http404
 from django.shortcuts import redirect
-from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.utils.translation import gettext_lazy as _
 from django.views.generic import View
 
 from eventyay.base.services.cart import CartError
 from eventyay.base.signals import validate_cart
+from eventyay.common.views.helpers import build_login_url_with_next
 from eventyay.multidomain.urlreverse import eventreverse
 from eventyay.presale.checkoutflow import get_checkout_flow
 from eventyay.presale.views import (
@@ -44,16 +44,26 @@ class CheckoutView(View):
             logger.info('Redirecting to %s as presale is not running.', new_url)
             return self.redirect(new_url)
 
-        # Check if login is required for checkout
         if request.event.settings.require_registered_account_for_tickets and not request.user.is_authenticated:
+            storage = messages.get_messages(request)
+            has_success = False
+            other_messages = []
+            for msg in storage:
+                if msg.level == messages.SUCCESS:
+                    has_success = True
+                else:
+                    other_messages.append((msg.level, str(msg)))
+            storage.used = True
+            for level, text in other_messages:
+                messages.add_message(request, level, text)
+            if has_success:
+                request.session['pending_cart_success'] = True
             messages.info(request, _('Please log in to complete your order.'))
-            # Build the current checkout URL to return to after login
-            # Use request.path instead of get_full_path() to prevent open redirect attacks
-            next_url = request.path
-            login_url = reverse('eventyay_common:auth.login')
-            redirect_url = f'{login_url}?{urlencode({"next": next_url})}'
             logger.info('Redirecting to login as require_registered_account_for_tickets is enabled.')
-            return redirect(redirect_url)
+            return redirect(build_login_url_with_next(request.path))
+
+        if request.session.pop('pending_cart_success', False):
+            messages.success(request, _('The products have been successfully added to your cart.'))
 
         cart_error = None
         try:

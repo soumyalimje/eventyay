@@ -3,37 +3,71 @@ from collections import Counter
 from operator import itemgetter
 
 from dateutil import rrule
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.syndication.views import Feed
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Count as DbCount, Prefetch, Q
+from django.db.models.functions import TruncDate
 from django.forms.models import BaseModelFormSet, inlineformset_factory
-from django.http import Http404, HttpResponse
+from django.http import Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.utils import feedgenerator
 from django.utils.functional import cached_property
 from django.utils.http import url_has_allowed_host_and_scheme
-from django.utils.translation import gettext_lazy as _
+from django.utils.translation import gettext, gettext_lazy as _
 from django.views.generic import FormView, ListView, TemplateView, UpdateView, View
 from django_context_decorator import context
+from urllib.parse import urlencode
 
-from eventyay.talk_rules.agenda import is_agenda_submission_visible
+from eventyay.base.models import (
+    Answer,
+    Feedback,
+    LogEntry,
+    Resource,
+    ResourceKind,
+    Submission,
+    SubmissionComment,
+    SubmissionStates,
+    Tag,
+    TalkQuestionTarget,
+    User,
+)
+from eventyay.base.models.base import CachedFile
+from eventyay.base.models.mail import MailTemplateRoles
+from eventyay.base.models.profile import SpeakerProfile
+from eventyay.base.services.etherpad import (
+    EtherpadConfigurationError,
+    EtherpadError,
+    generate_pad_for_submission,
+)
+from eventyay.base.services.orderimport import parse_csv
+from eventyay.base.services.talkimport import import_submissions
+from eventyay.base.views.tasks import AsyncAction
 from eventyay.common.exceptions import SubmissionError
 from eventyay.common.forms.fields import SizeFileInput
-from eventyay.base.models import LogEntry
+from eventyay.common.session_video import (
+    get_submission_video_url,
+    prefetch_submission_video_urls,
+    session_videos_enabled as event_session_videos_enabled,
+    set_submission_video_urls,
+    video_urls_from_prefetched_submission,
+)
+from eventyay.common.video_embed import parse_video_urls
 from eventyay.common.text.phrases import phrases
-from eventyay.common.views.generic import CreateOrUpdateView
-from eventyay.common.views.generic import OrgaCRUDView
+from eventyay.common.views.generic import CreateOrUpdateView, OrgaCRUDView
 from eventyay.common.views.mixins import (
     ActionConfirmMixin,
     ActionFromUrl,
     EventPermissionRequired,
+    ImportProcessRedirectMixin,
     PaginationMixin,
     PermissionRequired,
     Sortable,
 )
-from eventyay.base.models.mail import MailTemplateRoles
+from eventyay.consts import SizeKey
+from eventyay.orga.forms.importers import SessionImportProcessForm
 from eventyay.orga.forms.submission import (
     AddSpeakerForm,
     AddSpeakerInlineForm,
@@ -41,28 +75,21 @@ from eventyay.orga.forms.submission import (
     SubmissionForm,
     SubmissionStateChangeForm,
 )
-from eventyay.base.models import User
-from eventyay.talk_rules.person import is_only_reviewer
 from eventyay.submission.forms import (
-    TalkQuestionsForm,
     ResourceForm,
     SubmissionCommentForm,
     SubmissionFilterForm,
     TagForm,
+    TalkQuestionsForm,
 )
-from eventyay.base.models import (
-    Feedback,
-    Resource,
-    Submission,
-    SubmissionComment,
-    SubmissionStates,
-    Tag,
-)
+from eventyay.talk_rules.agenda import is_agenda_submission_visible
+from eventyay.talk_rules.person import is_only_reviewer
 from eventyay.talk_rules.submission import (
     annotate_assigned,
     get_reviewer_tracks,
     limit_for_reviewers,
 )
+from eventyay.talk_rules.tracks import apply_track_limit, user_has_track_limits
 
 
 class SubmissionViewMixin(PermissionRequired):
@@ -116,6 +143,8 @@ class ReviewerSubmissionFilter:
         )
         if self.is_only_reviewer:
             queryset = limit_for_reviewers(queryset, self.request.event, self.request.user, self.limit_tracks)
+        elif user_has_track_limits(self.request.event, self.request.user):
+            queryset = apply_track_limit(queryset, self.request.event, self.request.user)
         if for_review or 'is_reviewer' in self.request.user.get_permissions_for_event(self.request.event):
             queryset = annotate_assigned(queryset, self.request.event, self.request.user)
         return queryset
@@ -162,7 +191,8 @@ class SubmissionStateChange(SubmissionViewMixin, FormView):
             messages.info(
                 self.request,
                 _(
-                    'Somebody else was faster than you: this proposal was already in the state you wanted to change it to.'
+                    'Somebody else was faster than you: '
+                    'this proposal was already in the state you wanted to change it to.'
                 ),
             )
             return redirect(self.get_success_url())
@@ -229,6 +259,41 @@ class SubmissionSpeakersDelete(SubmissionViewMixin, View):
         return redirect(submission.orga_urls.speakers)
 
 
+class SubmissionEtherpadGenerate(SubmissionViewMixin, View):
+    permission_required = 'base.update_submission'
+
+    def post(self, request, *args, **kwargs):
+        submission = self.object
+        is_ajax = request.headers.get('x-requested-with') == 'XMLHttpRequest'
+
+        def fail(message, status=400):
+            if is_ajax:
+                return JsonResponse({'error': str(message)}, status=status)
+            messages.error(request, message)
+            return redirect(submission.orga_urls.edit)
+
+        if not request.event.get_feature_flag('etherpad_enabled'):
+            return fail(_('Etherpad is not enabled for this event.'))
+
+        force = request.POST.get('force') == 'true'
+        try:
+            url = generate_pad_for_submission(request.event, submission, force=force)
+        except (EtherpadConfigurationError, EtherpadError) as exc:
+            return fail(exc)
+
+        submission.etherpad_url = url
+        submission.save(update_fields=['etherpad_url'])
+        submission.log_action(
+            'eventyay.submission.etherpad.generate',
+            person=request.user,
+            orga=True,
+        )
+        if is_ajax:
+            return JsonResponse({'url': url})
+        messages.success(request, _('An Etherpad link has been generated for this session.'))
+        return redirect(submission.orga_urls.edit)
+
+
 class SubmissionSpeakers(ReviewerSubmissionFilter, SubmissionViewMixin, FormView):
     template_name = 'orga/submission/speakers.html'
     permission_required = 'base.orga_list_speakerprofile'
@@ -238,13 +303,42 @@ class SubmissionSpeakers(ReviewerSubmissionFilter, SubmissionViewMixin, FormView
     @cached_property
     def speakers(self):
         submission = self.object
+        speakers_qs = submission.speakers.all().prefetch_related(
+            Prefetch(
+                'profiles',
+                queryset=SpeakerProfile.objects.filter(event=submission.event).prefetch_related('availabilities'),
+                to_attr='_event_profiles',
+            ),
+            Prefetch(
+                'answers',
+                queryset=Answer.objects.filter(
+                    question__event=submission.event,
+                    question__is_visible_to_reviewers=True,
+                    question__target=TalkQuestionTarget.SPEAKER,
+                )
+                .select_related('question')
+                .order_by('question__position'),
+                to_attr='_reviewer_answers',
+            ),
+            Prefetch(
+                'submissions',
+                queryset=Submission.objects.filter(event=submission.event),
+                to_attr='_event_submissions',
+            ),
+        )
         return [
             {
                 'user': speaker,
                 'profile': speaker.event_profile(submission.event),
-                'other_submissions': speaker.submissions.filter(event=submission.event).exclude(code=submission.code),
+                'other_submissions': [s for s in speaker._event_submissions if s.code != submission.code],
+                'email': speaker.email,
+                'avatar': speaker.avatar,
+                'avatar_url': speaker.get_avatar_url(event=submission.event),
+                'avatar_source': speaker.avatar_source,
+                'avatar_license': speaker.avatar_license,
+                'reviewer_answers': speaker._reviewer_answers,
             }
-            for speaker in submission.speakers.all()
+            for speaker in speakers_qs
         ]
 
     def form_valid(self, form):
@@ -253,6 +347,7 @@ class SubmissionSpeakers(ReviewerSubmissionFilter, SubmissionViewMixin, FormView
                 email=email,
                 name=form.cleaned_data.get('name'),
                 locale=form.cleaned_data.get('locale'),
+                biography=form.cleaned_data.get('biography'),
                 user=self.request.user,
             )
             messages.success(self.request, _('The speaker has been added to the proposal.'))
@@ -263,6 +358,7 @@ class SubmissionSpeakers(ReviewerSubmissionFilter, SubmissionViewMixin, FormView
         kwargs = super().get_form_kwargs()
         kwargs['event'] = self.request.event
         kwargs['require_name'] = True
+        kwargs['include_biography'] = True
         return kwargs
 
     def get_success_url(self):
@@ -272,8 +368,7 @@ class SubmissionSpeakers(ReviewerSubmissionFilter, SubmissionViewMixin, FormView
 class SubmissionContent(ActionFromUrl, ReviewerSubmissionFilter, SubmissionViewMixin, CreateOrUpdateView):
     model = Submission
     form_class = SubmissionForm
-    template_name = 'orga/submission/content.html'
-    permission_required = 'base.orga_list_submission'
+    template_name = 'orga/submission/content_edit.html'
 
     def get_object(self):
         try:
@@ -307,7 +402,9 @@ class SubmissionContent(ActionFromUrl, ReviewerSubmissionFilter, SubmissionViewM
         return formset_class(
             self.request.POST if self.request.method == 'POST' else None,
             files=self.request.FILES if self.request.method == 'POST' else None,
-            queryset=(submission.resources.all() if submission else Resource.objects.none()),
+            queryset=(
+                submission.resources.exclude(kind=ResourceKind.SLIDES) if submission else Resource.objects.none()
+            ),
             prefix='resource',
         )
 
@@ -323,6 +420,8 @@ class SubmissionContent(ActionFromUrl, ReviewerSubmissionFilter, SubmissionViewM
                 data=self.request.POST if self.request.method == 'POST' else None,
                 event=self.request.event,
                 prefix='speaker',
+                include_biography=True,
+                draft_save=self.request.POST.get('state') == SubmissionStates.DRAFT,
             )
 
     @cached_property
@@ -335,6 +434,7 @@ class SubmissionContent(ActionFromUrl, ReviewerSubmissionFilter, SubmissionViewM
             'target': 'submission',
             'submission': submission,
             'event': self.request.event,
+            'include_session_video': False,
             'for_reviewers': (
                 not self.request.user.has_perm('base.orga_update_submission', self.request.event)
                 and self.request.user.has_perm('base.list_review', self.request.event)
@@ -349,6 +449,41 @@ class SubmissionContent(ActionFromUrl, ReviewerSubmissionFilter, SubmissionViewM
     @context
     def questions_form(self):
         return self._questions_form
+
+    @context
+    @cached_property
+    def session_videos_enabled(self):
+        return event_session_videos_enabled(self.request.event)
+
+    @context
+    @cached_property
+    def session_video_urls(self):
+        if not event_session_videos_enabled(self.request.event):
+            return []
+        submission = self.get_object()
+        if not submission:
+            return []
+        stored = get_submission_video_url(submission)
+        return [line for line in stored.splitlines() if line.strip()] if stored else []
+
+    @context
+    @cached_property
+    def session_video_urls_text(self):
+        return '\n'.join(self.session_video_urls)
+
+    def _save_session_video_urls(self, submission):
+        if not event_session_videos_enabled(self.request.event):
+            return True
+        if not self.request.user.has_perm('base.orga_update_submission', self.request.event):
+            return True
+        raw = self.request.POST.get('session_video_urls', '')
+        urls = [line.strip() for line in raw.splitlines() if line.strip()]
+        try:
+            set_submission_video_urls(submission, urls)
+        except ValueError as exc:
+            messages.error(self.request, str(exc))
+            return False
+        return True
 
     def save_formset(self, obj):
         if not self._formset.is_valid():
@@ -367,6 +502,7 @@ class SubmissionContent(ActionFromUrl, ReviewerSubmissionFilter, SubmissionViewM
                 form.instance.pk = None
             elif form.has_changed():
                 form.instance.submission = obj
+                form.instance.kind = ResourceKind.GENERIC
                 form.save()
                 change_data = {key: form.cleaned_data.get(key) for key in form.changed_data}
                 change_data['id'] = form.instance.pk
@@ -383,6 +519,7 @@ class SubmissionContent(ActionFromUrl, ReviewerSubmissionFilter, SubmissionViewM
         ]
         for form in extra_forms:
             form.instance.submission = obj
+            form.instance.kind = ResourceKind.GENERIC
             form.save()
             obj.log_action(
                 'eventyay.submission.resource.create',
@@ -395,7 +532,7 @@ class SubmissionContent(ActionFromUrl, ReviewerSubmissionFilter, SubmissionViewM
 
     def get_permission_required(self):
         if 'code' in self.kwargs:
-            return ['base.orga_list_submission']
+            return ['base.orga_update_submission']
         return ['base.create_submission']
 
     @property
@@ -411,29 +548,29 @@ class SubmissionContent(ActionFromUrl, ReviewerSubmissionFilter, SubmissionViewM
     @transaction.atomic()
     def form_valid(self, form):
         created = not self.object
-        self.object = form.instance
-        self._questions_form.submission = self.object
+        self._questions_form.submission = form.instance
         if not self._questions_form.is_valid():
             messages.error(self.request, phrases.base.error_saving_changes)
             return self.get(self.request, *self.args, **self.kwargs)
+        if created and not self.new_speaker_form.is_valid():
+            messages.error(self.request, phrases.base.error_saving_changes)
+            return self.form_invalid(form)
+
+        self.object = form.instance
         form.instance.event = self.request.event
         form.save()
         self._questions_form.save()
+        if not self._save_session_video_urls(form.instance):
+            return self.get(self.request, *self.args, **self.kwargs)
 
         if created:
-            if not self.new_speaker_form.is_valid():
-                if self.new_speaker_form.errors:
-                    for field, errors in self.new_speaker_form.errors.items():
-                        for error in errors:
-                            messages.error(self.request, f'{field}: {error}')
-                        break  # Only show errors for the first field
-                return self.form_invalid(form)
-            elif email := self.new_speaker_form.cleaned_data['email']:
+            if email := self.new_speaker_form.cleaned_data['email']:
                 form.instance.add_speaker(
                     email=email,
                     name=self.new_speaker_form.cleaned_data['name'],
                     locale=self.new_speaker_form.cleaned_data.get('locale'),
                     user=self.request.user,
+                    biography=self.new_speaker_form.cleaned_data.get('biography'),
                 )
         else:
             formset_result = self.save_formset(form.instance)
@@ -444,6 +581,9 @@ class SubmissionContent(ActionFromUrl, ReviewerSubmissionFilter, SubmissionViewM
             action = 'eventyay.submission.' + ('create' if created else 'update')
             form.instance.log_action(action, person=self.request.user, orga=True)
             self.request.event.cache.set('rebuild_schedule_export', True, None)
+            if 'is_featured' in form.changed_data:
+                from eventyay.agenda.views.utils import clear_schedule_caches
+                clear_schedule_caches(self.request.event, submission=form.instance)
         return redirect(self.get_success_url())
 
     def get_form_kwargs(self):
@@ -460,6 +600,34 @@ class SubmissionContent(ActionFromUrl, ReviewerSubmissionFilter, SubmissionViewM
     @cached_property
     def can_edit(self):
         return self.object and self.request.user.has_perm('base.orga_update_submission', self.request.event)
+
+
+class SubmissionContentView(SubmissionContent):
+    template_name = 'orga/submission/content.html'
+    http_method_names = ['get', 'head', 'options']
+
+    def get_permission_required(self):
+        if 'code' in self.kwargs:
+            return ['base.orga_list_submission']  # View permission for reviewers
+        return ['base.create_submission']
+
+    @context
+    def available_tags_json(self):
+        tags = []
+        for tag in self.request.event.tags.all().order_by('tag'):
+            description = tag.description
+            if description is not None and not isinstance(description, str):
+                description = str(description)
+            tags.append(
+                {
+                    'id': tag.id,
+                    'tag': tag.tag,
+                    'color': tag.color,
+                    'foreground_color': tag.foreground_color,
+                    'description': description or '',
+                }
+            )
+        return tags
 
 
 class BaseSubmissionList(Sortable, ReviewerSubmissionFilter, PaginationMixin, ListView):
@@ -531,6 +699,29 @@ class SubmissionList(EventPermissionRequired, BaseSubmissionList):
                 return len(self.limit_tracks) > 1
             return self.request.event.tracks.all().count() > 1
 
+    @context
+    def session_videos_enabled(self):
+        return event_session_videos_enabled(self.request.event)
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if event_session_videos_enabled(self.request.event):
+            return prefetch_submission_video_urls(qs, self.request.event)
+        return qs
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        submissions = ctx.get('submissions') or ctx.get('object_list') or []
+        enabled = event_session_videos_enabled(self.request.event)
+        for submission in submissions:
+            if enabled:
+                urls = video_urls_from_prefetched_submission(submission)
+            else:
+                urls = []
+            submission.session_video_urls = urls
+            submission.session_video_urls_json = json.dumps(urls)
+        return ctx
+
 
 class FeedbackList(SubmissionViewMixin, PaginationMixin, ListView):
     template_name = 'orga/submission/feedback_list.html'
@@ -564,7 +755,57 @@ class ToggleFeatured(SubmissionViewMixin, View):
     def post(self, *args, **kwargs):
         self.object.is_featured = not self.object.is_featured
         self.object.save(update_fields=['is_featured'])
+        from eventyay.agenda.views.utils import clear_schedule_caches
+        clear_schedule_caches(self.request.event, submission=self.object)
         return HttpResponse()
+
+
+class SubmissionVideoLink(SubmissionViewMixin, View):
+    """Create/update/clear canonical session video links from the overview table."""
+
+    permission_required = 'base.orga_update_submission'
+
+    def get_permission_object(self):
+        return self.object or self.request.event
+
+    def post(self, request, *args, **kwargs):
+        if not event_session_videos_enabled(self.request.event):
+            return JsonResponse(
+                {'ok': False, 'error': gettext('Session videos are disabled for this event.')},
+                status=403,
+            )
+        try:
+            payload = json.loads(request.body.decode() or '{}')
+        except json.JSONDecodeError:
+            payload = request.POST
+        if not hasattr(payload, 'get'):
+            payload = {}
+        if 'urls' in payload:
+            raw_urls = payload.get('urls') or []
+            if isinstance(raw_urls, str):
+                urls = parse_video_urls(raw_urls)
+            elif isinstance(raw_urls, list):
+                urls = [str(item).strip() for item in raw_urls if str(item).strip()]
+            else:
+                urls = []
+        else:
+            urls = parse_video_urls(payload.get('url', '') or '')
+        try:
+            stored = set_submission_video_urls(self.object, urls)
+        except ValueError as exc:
+            return JsonResponse({'ok': False, 'error': str(exc)}, status=400)
+
+        from eventyay.agenda.views.utils import clear_schedule_caches
+
+        clear_schedule_caches(self.request.event, submission=self.object)
+        return JsonResponse(
+            {
+                'ok': True,
+                'urls': stored,
+                'url': '\n'.join(stored),
+                'has_video': bool(stored),
+            }
+        )
 
 
 class ApplyPending(SubmissionViewMixin, View):
@@ -606,7 +847,7 @@ class Anonymise(SubmissionViewMixin, UpdateView):
 
 class SubmissionHistory(SubmissionViewMixin, ListView):
     template_name = 'orga/submission/history.html'
-    permission_required = 'base.administrator_user'
+    permission_required = 'base.orga_update_submission'
     paginate_by = 200
     context_object_name = 'log_entries'
 
@@ -671,16 +912,30 @@ class SubmissionFeed(PermissionRequired, Feed):
         return item.created
 
 
-class SubmissionStats(EventPermissionRequired, TemplateView):
-    template_name = 'orga/submission/stats.html'
-    permission_required = 'base.orga_list_submission'
+class SubmissionStatsMixin:
+    @context
+    @cached_property
+    def can_view_submission_stats(self):
+        return self.request.user.has_perm('base.orga_list_submission', self.request.event)
 
     @context
+    @cached_property
     def show_submission_types(self):
+        if not self.can_view_submission_stats:
+            return False
         return self.request.event.submission_types.all().count() > 1
 
     @context
+    @cached_property
+    def show_tracks(self):
+        if not self.can_view_submission_stats:
+            return False
+        return bool(self.request.event.get_feature_flag('use_tracks'))
+
+    @context
     def id_mapping(self):
+        if not self.can_view_submission_stats:
+            return '{}'
         data = {
             'type': {
                 str(submission_type): submission_type.id
@@ -690,15 +945,14 @@ class SubmissionStats(EventPermissionRequired, TemplateView):
         }
         if self.show_tracks:
             data['track'] = {str(track): track.id for track in self.request.event.tracks.all()}
+        locales_dict = dict(self.request.event.named_content_locales)
+        data['language'] = {locales_dict.get(code, code): code for code in self.request.event.content_locales}
         return json.dumps(data)
 
     @context
-    @cached_property
-    def show_tracks(self):
-        return self.request.event.get_feature_flag('use_tracks') and self.request.event.tracks.all().count() > 1
-
-    @context
     def timeline_annotations(self):
+        if not self.can_view_submission_stats:
+            return json.dumps({'deadlines': []})
         deadlines = [
             (
                 submission_type.deadline.astimezone(self.request.event.tz).strftime('%Y-%m-%d'),
@@ -706,7 +960,7 @@ class SubmissionStats(EventPermissionRequired, TemplateView):
             )
             for submission_type in self.request.event.submission_types.filter(deadline__isnull=False)
         ]
-        if self.request.event.cfp.deadline:
+        if hasattr(self.request.event, 'cfp') and self.request.event.cfp.deadline:
             deadlines.append(
                 (
                     self.request.event.cfp.deadline.astimezone(self.request.event.tz).strftime('%Y-%m-%d'),
@@ -717,29 +971,35 @@ class SubmissionStats(EventPermissionRequired, TemplateView):
 
     @cached_property
     def raw_submission_timeline_data(self):
-        talk_ids = list(
-            map(str, self.request.event.submissions.exclude(state=SubmissionStates.DELETED).values_list('id', flat=True))
+        if not self.can_view_submission_stats:
+            return []
+        rows = (
+            self.request.event.submissions
+            .exclude(state=SubmissionStates.DELETED)
+            .filter(created__isnull=False)
+            .annotate(date=TruncDate('created', tzinfo=self.request.event.tz))
+            .values('date')
+            .annotate(count=DbCount('id'))
+            .order_by('date')
         )
-        data = Counter(
-            log.timestamp.astimezone(self.request.event.tz).date()
-            for log in LogEntry.objects.filter(
-                event=self.request.event,
-                action_type='eventyay.submission.create',
-                content_type=ContentType.objects.get_for_model(Submission),
-                object_id__in=talk_ids,
-            )
+        if not rows:
+            return []
+
+        dates = {row['date']: row['count'] for row in rows if row['date']}
+        if not dates:
+            return []
+
+        min_date = min(dates.keys())
+        max_date = max(dates.keys())
+        date_range = rrule.rrule(
+            rrule.DAILY,
+            count=(max_date - min_date).days + 1,
+            dtstart=min_date,
         )
-        dates = data.keys()
-        if len(dates) > 1:
-            date_range = rrule.rrule(
-                rrule.DAILY,
-                count=(max(dates) - min(dates)).days + 1,
-                dtstart=min(dates),
-            )
-            return sorted(
-                ({'x': date.date().isoformat(), 'y': data.get(date.date(), 0)} for date in date_range),
-                key=lambda x: x['x'],
-            )
+        return [
+            {'x': date.date().isoformat(), 'y': dates.get(date.date(), 0)}
+            for date in date_range
+        ]
 
     @context
     def submission_timeline_data(self):
@@ -748,23 +1008,21 @@ class SubmissionStats(EventPermissionRequired, TemplateView):
         return ''
 
     @context
-    def total_submission_timeline_data(self):
-        if self.raw_submission_timeline_data:
-            result = [{'x': 0, 'y': 0}]
-            for point in self.raw_submission_timeline_data:
-                result.append({'x': point['x'], 'y': result[-1]['y'] + point['y']})
-            return json.dumps(result[1:])
-        return ''
-
-    @context
     @cached_property
     def submission_state_data(self):
-        counter = Counter(
-            submission.get_state_display()
-            for submission in Submission.all_objects.exclude(state=SubmissionStates.DRAFT).filter(
-                event=self.request.event
-            )
+        if not self.can_view_submission_stats:
+            return ''
+        rows = (
+            Submission.all_objects
+            .exclude(state=SubmissionStates.DRAFT)
+            .filter(event=self.request.event)
+            .values('state')
+            .annotate(count=DbCount('id'))
         )
+        state_labels = dict(SubmissionStates.get_choices())
+        counter = {str(state_labels.get(row['state'], row['state'])): row['count'] for row in rows if row['count']}
+        if not counter:
+            return ''
         return json.dumps(
             sorted(
                 [{'label': label, 'value': value} for label, value in counter.items()],
@@ -774,10 +1032,24 @@ class SubmissionStats(EventPermissionRequired, TemplateView):
 
     @context
     def submission_type_data(self):
-        counter = Counter(
-            str(submission.submission_type)
-            for submission in Submission.objects.filter(event=self.request.event).select_related('submission_type')
+        if not self.can_view_submission_stats:
+            return ''
+        rows = (
+            Submission.objects
+            .filter(event=self.request.event)
+            .values('submission_type_id')
+            .annotate(count=DbCount('id'))
         )
+        types_dict = {
+            st.id: str(st)
+            for st in self.request.event.submission_types.all()
+        }
+        counter = {
+            types_dict[row['submission_type_id']]: row['count']
+            for row in rows if row['submission_type_id'] in types_dict and row['count']
+        }
+        if not counter:
+            return ''
         return json.dumps(
             sorted(
                 [{'label': label, 'value': value} for label, value in counter.items()],
@@ -787,11 +1059,25 @@ class SubmissionStats(EventPermissionRequired, TemplateView):
 
     @context
     def submission_track_data(self):
+        if not self.can_view_submission_stats:
+            return ''
         if self.request.event.get_feature_flag('use_tracks'):
-            counter = Counter(
-                str(submission.track)
-                for submission in Submission.objects.filter(event=self.request.event).select_related('track')
+            rows = (
+                Submission.objects
+                .filter(event=self.request.event, track__isnull=False)
+                .values('track_id')
+                .annotate(count=DbCount('id'))
             )
+            tracks_dict = {
+                tr.id: str(tr.name)
+                for tr in self.request.event.tracks.all()
+            }
+            counter = {
+                tracks_dict[row['track_id']]: row['count']
+                for row in rows if row['track_id'] in tracks_dict and row['count']
+            }
+            if not counter:
+                return ''
             return json.dumps(
                 sorted(
                     [{'label': label, 'value': value} for label, value in counter.items()],
@@ -801,32 +1087,67 @@ class SubmissionStats(EventPermissionRequired, TemplateView):
         return ''
 
     @context
+    def submission_language_data(self):
+        if not self.can_view_submission_stats:
+            return ''
+        locales_dict = dict(self.request.event.named_content_locales)
+        rows = (
+            Submission.objects
+            .filter(event=self.request.event)
+            .values('content_locale')
+            .annotate(count=DbCount('id'))
+        )
+        counter = {
+            str(locales_dict.get(row['content_locale'], row['content_locale'])): row['count']
+            for row in rows if row['content_locale'] and row['count']
+        }
+        if not counter:
+            return ''
+        return json.dumps(
+            sorted(
+                [{'label': label, 'value': value} for label, value in counter.items()],
+                key=itemgetter('label'),
+            )
+        )
+
+    @context
     def talk_timeline_data(self):
-        talk_ids = list(
-            map(str, self.request.event.submissions.filter(state__in=SubmissionStates.accepted_states)
-                .values_list('id', flat=True))
+        if not self.can_view_submission_stats:
+            return ''
+        rows = (
+            self.request.event.submissions
+            .filter(state__in=SubmissionStates.accepted_states, created__isnull=False)
+            .annotate(date=TruncDate('created', tzinfo=self.request.event.tz))
+            .values('date')
+            .annotate(count=DbCount('id'))
+            .order_by('date')
         )
-        data = Counter(
-            log.timestamp.astimezone(self.request.event.tz).date().isoformat()
-            for log in LogEntry.objects.filter(
-                event=self.request.event,
-                action_type='eventyay.submission.create',
-                content_type=ContentType.objects.get_for_model(Submission),
-                object_id__in=talk_ids,
-            )
-        )
-        if len(data.keys()) > 1:
-            return json.dumps(
-                [{'x': point['x'], 'y': data.get(point['x'][:10], 0)} for point in self.raw_submission_timeline_data]
-            )
+        if not rows:
+            return ''
+
+        data = {row['date'].isoformat(): row['count'] for row in rows if row['date']}
+        if data:
+            if self.raw_submission_timeline_data:
+                return json.dumps(
+                    [{'x': point['x'], 'y': data.get(point['x'][:10], 0)} for point in self.raw_submission_timeline_data]
+                )
+            return json.dumps([{'x': date, 'y': count} for date, count in sorted(data.items())])
         return ''
 
     @context
     def talk_state_data(self):
-        counter = Counter(
-            submission.get_state_display()
-            for submission in self.request.event.submissions.filter(state__in=SubmissionStates.accepted_states)
+        if not self.can_view_submission_stats:
+            return ''
+        rows = (
+            self.request.event.submissions
+            .filter(state__in=SubmissionStates.accepted_states)
+            .values('state')
+            .annotate(count=DbCount('id'))
         )
+        state_labels = dict(SubmissionStates.get_choices())
+        counter = {str(state_labels.get(row['state'], row['state'])): row['count'] for row in rows if row['count']}
+        if not counter:
+            return ''
         return json.dumps(
             sorted(
                 [{'label': label, 'value': value} for label, value in counter.items()],
@@ -836,12 +1157,24 @@ class SubmissionStats(EventPermissionRequired, TemplateView):
 
     @context
     def talk_type_data(self):
-        counter = Counter(
-            str(submission.submission_type)
-            for submission in self.request.event.submissions.filter(
-                state__in=SubmissionStates.accepted_states
-            ).select_related('submission_type')
+        if not self.can_view_submission_stats:
+            return ''
+        rows = (
+            self.request.event.submissions
+            .filter(state__in=SubmissionStates.accepted_states)
+            .values('submission_type_id')
+            .annotate(count=DbCount('id'))
         )
+        types_dict = {
+            st.id: str(st)
+            for st in self.request.event.submission_types.all()
+        }
+        counter = {
+            types_dict[row['submission_type_id']]: row['count']
+            for row in rows if row['submission_type_id'] in types_dict and row['count']
+        }
+        if not counter:
+            return ''
         return json.dumps(
             sorted(
                 [{'label': label, 'value': value} for label, value in counter.items()],
@@ -851,13 +1184,25 @@ class SubmissionStats(EventPermissionRequired, TemplateView):
 
     @context
     def talk_track_data(self):
+        if not self.can_view_submission_stats:
+            return ''
         if self.request.event.get_feature_flag('use_tracks'):
-            counter = Counter(
-                str(submission.track)
-                for submission in self.request.event.submissions.filter(
-                    state__in=SubmissionStates.accepted_states
-                ).select_related('track')
+            rows = (
+                self.request.event.submissions
+                .filter(state__in=SubmissionStates.accepted_states, track__isnull=False)
+                .values('track_id')
+                .annotate(count=DbCount('id'))
             )
+            tracks_dict = {
+                tr.id: str(tr.name)
+                for tr in self.request.event.tracks.all()
+            }
+            counter = {
+                tracks_dict[row['track_id']]: row['count']
+                for row in rows if row['track_id'] in tracks_dict and row['count']
+            }
+            if not counter:
+                return ''
             return json.dumps(
                 sorted(
                     [{'label': label, 'value': value} for label, value in counter.items()],
@@ -865,6 +1210,30 @@ class SubmissionStats(EventPermissionRequired, TemplateView):
                 )
             )
         return ''
+
+    @context
+    def talk_language_data(self):
+        if not self.can_view_submission_stats:
+            return ''
+        locales_dict = dict(self.request.event.named_content_locales)
+        rows = (
+            self.request.event.submissions
+            .filter(state__in=SubmissionStates.accepted_states)
+            .values('content_locale')
+            .annotate(count=DbCount('id'))
+        )
+        counter = {
+            str(locales_dict.get(row['content_locale'], row['content_locale'])): row['count']
+            for row in rows if row['content_locale'] and row['count']
+        }
+        if not counter:
+            return ''
+        return json.dumps(
+            sorted(
+                [{'label': label, 'value': value} for label, value in counter.items()],
+                key=itemgetter('label'),
+            )
+        )
 
 
 class AllFeedbacksList(EventPermissionRequired, PaginationMixin, ListView):
@@ -875,7 +1244,106 @@ class AllFeedbacksList(EventPermissionRequired, PaginationMixin, ListView):
     paginate_by = 25
 
     def get_queryset(self):
-        return Feedback.objects.order_by('-pk').select_related('talk').filter(talk__event=self.request.event)
+        qs = Feedback.objects.order_by('-pk').select_related('talk', 'author').filter(talk__event=self.request.event)
+        
+        tab = self.request.GET.get('tab', 'published')
+        if tab == 'published':
+            qs = qs.filter(status='published', is_public=True)
+        elif tab == 'pending':
+            qs = qs.filter(status='pending', is_public=True)
+        elif tab == 'hidden':
+            qs = qs.filter(status='hidden', is_public=True)
+        elif tab == 'anonymous':
+            qs = qs.filter(is_public=False)
+            
+        return qs
+        
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['current_tab'] = self.request.GET.get('tab', 'published')
+        context['banned_user_ids'] = list(self.request.event.banned_users.values_list('id', flat=True))
+        return context
+
+class FeedbackBulkAction(EventPermissionRequired, View):
+    permission_required = 'base.orga_update_submission'
+
+    def post(self, request, *args, **kwargs):
+        action = request.POST.get('action')
+        feedback_ids = request.POST.getlist('feedback_ids')
+        
+        if not feedback_ids:
+            messages.warning(request, _('No items selected.'))
+            next_url = request.GET.get('next')
+            if next_url and url_has_allowed_host_and_scheme(next_url, allowed_hosts={request.get_host()}, require_https=request.is_secure()):
+                return redirect(next_url)
+            return redirect(request.event.orga_urls.feedback)
+            
+        feedbacks = Feedback.objects.filter(pk__in=feedback_ids, talk__event=request.event)
+        
+        if action == 'approve':
+            count = feedbacks.filter(status='pending').update(status='published')
+            messages.success(request, _('Successfully approved %d feedback(s).') % count)
+        elif action == 'hide':
+            count = feedbacks.exclude(status='hidden').update(status='hidden')
+            messages.success(request, _('Successfully hid %d feedback(s).') % count)
+        elif action == 'delete':
+            count = feedbacks.exclude(status='deleted').update(status='deleted')
+            messages.success(request, _('Successfully deleted %d feedback(s).') % count)
+
+        next_url = request.GET.get('next')
+        if next_url and url_has_allowed_host_and_scheme(next_url, allowed_hosts={request.get_host()}, require_https=request.is_secure()):
+            return redirect(next_url)
+        return redirect(request.event.orga_urls.feedback)
+
+class FeedbackUpdateStatus(EventPermissionRequired, View):
+    permission_required = 'base.orga_update_submission'
+
+    def get(self, request, *args, **kwargs):
+        feedback = get_object_or_404(Feedback, pk=self.kwargs['pk'], talk__event=request.event)
+        action = request.GET.get('action')
+        if action == 'delete':
+            from django.shortcuts import render
+            return render(request, 'orga/submission/feedback_delete.html', {'object': feedback})
+        next_url = request.GET.get('next')
+        if next_url and url_has_allowed_host_and_scheme(next_url, allowed_hosts={request.get_host()}, require_https=request.is_secure()):
+            return redirect(next_url)
+        return redirect(request.event.orga_urls.feedback)
+
+    def post(self, request, *args, **kwargs):
+        feedback = get_object_or_404(Feedback, pk=self.kwargs['pk'], talk__event=request.event)
+        action = request.POST.get('action')
+        
+        if action == 'approve' and feedback.status == 'pending':
+            feedback.status = 'published'
+            feedback.save()
+            messages.success(request, _('Feedback approved.'))
+        elif action == 'hide' and feedback.status != 'hidden':
+            feedback.status = 'hidden'
+            feedback.save()
+            messages.success(request, _('Feedback hidden.'))
+        elif action == 'delete':
+            feedback.status = 'deleted'
+            feedback.save()
+            messages.success(request, _('Feedback deleted.'))
+        elif action == 'ban':
+            if feedback.author:
+                request.event.banned_users.add(feedback.author)
+                feedback.status = 'hidden'
+                feedback.save()
+                messages.success(request, _('User banned successfully.'))
+            else:
+                messages.error(request, _('Cannot ban anonymous user.'))
+        elif action == 'unban':
+            if feedback.author:
+                request.event.banned_users.remove(feedback.author)
+                messages.success(request, _('User unbanned successfully.'))
+            else:
+                messages.error(request, _('Cannot unban anonymous user.'))
+            
+        next_url = request.GET.get('next')
+        if next_url and url_has_allowed_host_and_scheme(next_url, allowed_hosts={request.get_host()}, require_https=request.is_secure()):
+            return redirect(next_url)
+        return redirect(request.event.orga_urls.feedback)
 
 
 class TagView(OrgaCRUDView):
@@ -974,3 +1442,111 @@ class ApplyPendingBulk(EventPermissionRequired, BaseSubmissionList):
     @context
     def next(self):
         return self.request.GET.get('next')
+
+
+class SubmissionImportProcessView(ImportProcessRedirectMixin, EventPermissionRequired, AsyncAction, FormView):
+    permission_required = 'base.update_event'
+    template_name = 'orga/submission/import_process.html'
+    form_class = SessionImportProcessForm
+    task = import_submissions
+    known_errortypes = ['ImportExecutionError']
+    IMPORT_FILENAME = 'session_import.csv'
+
+    import_process_url_name = 'settings.import_export.submissions_import_process'
+    import_page_url_name = 'import_export_settings'
+    import_target = 'session'
+
+    @cached_property
+    def import_settings_url(self):
+        base = self.request.event.orga_urls.import_export_settings
+        query = urlencode({'import_target': self.import_target})
+        return f'{base}?{query}#tab-import'
+
+    def dispatch(self, request, *args, **kwargs):
+        if 'async_id' in request.GET and settings.HAS_CELERY:
+            return super().dispatch(request, *args, **kwargs)
+        try:
+            _ = self.file
+        except Http404:
+            messages.error(request, _('The uploaded CSV file is missing or expired. Please upload it again.'))
+            return redirect(self.import_settings_url)
+        return super().dispatch(request, *args, **kwargs)
+
+    @cached_property
+    def file(self):
+        return get_object_or_404(
+            CachedFile,
+            pk=self.kwargs.get('file'),
+            filename=self.IMPORT_FILENAME,
+            session_key=self.request.session.session_key,
+        )
+
+    @cached_property
+    def parsed(self):
+        return parse_csv(self.file.file, settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_CSV])
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs['headers'] = self.parsed.fieldnames if self.parsed else []
+        kwargs['event'] = self.request.event
+        kwargs['initial'] = self.request.event.settings.submission_import_settings
+        return kwargs
+
+    @context
+    def preview_rows(self):
+        if not self.parsed:
+            return []
+        rows = []
+        headers = self.parsed.fieldnames or []
+        for i, row in enumerate(self.parsed):
+            if i >= 5:
+                break
+            rows.append([row.get(h, '') for h in headers])
+        return rows
+
+    @context
+    def headers(self):
+        return self.parsed.fieldnames if self.parsed else []
+
+    def get(self, request, *args, **kwargs):
+        if 'async_id' in request.GET and settings.HAS_CELERY:
+            return self.get_result(request)
+        if not self.parsed:
+            messages.error(request, _('Could not parse the uploaded CSV file.'))
+            return redirect(self.import_settings_url)
+        return FormView.get(self, request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
+        if not self.parsed:
+            messages.error(request, _('Could not parse the uploaded CSV file.'))
+            return redirect(self.import_settings_url)
+        return FormView.post(self, request, *args, **kwargs)
+
+    def form_valid(self, form):
+        self.request.event.settings.submission_import_settings = form.cleaned_data
+        return self.do(
+            self.request.event.pk,
+            str(self.file.id),
+            form.cleaned_data,
+            self.request.LANGUAGE_CODE,
+            self.request.user.pk,
+        )
+
+    def get_success_url(self, value):
+        return self.import_settings_url
+
+    def get_error_url(self):
+        return self.import_settings_url
+
+    def get_success_message(self, value):
+        if isinstance(value, dict):
+            msg = _('Session import complete: {created} created, {updated} updated, {skipped} skipped.').format(
+                created=value.get('created', 0),
+                updated=value.get('updated', 0),
+                skipped=value.get('skipped', 0),
+            )
+            errors = value.get('errors', [])
+            if errors:
+                msg += ' ' + _('Errors: {errors}').format(errors='; '.join(str(e) for e in errors[:10]))
+            return msg
+        return _('The session import was successful.')

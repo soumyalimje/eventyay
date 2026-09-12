@@ -2,14 +2,8 @@
 {% load i18n %}
 {% load bootstrap3 %}
 {% block inside %}
-    <nav id="event-nav" class="header-nav">
-        <div class="navigation">
-            <div class="navigation-title">
-                <h1>{% trans "Cancellation settings" %}</h1>
-            </div>
-            {% include "pretixcontrol/event/component_link.html" %}
-        </div>
-    </nav>
+    {% trans "Cancellation settings" as header_title %}
+    {% include "common/includes/header_nav.html" with header_title=header_title header_component_link="pretixcontrol/event/component_link.html" %}
     <form action="" method="post" class="form-horizontal" enctype="multipart/form-data">
         {% csrf_token %}
         {% bootstrap_form_errors form %}
@@ -36,13 +30,10 @@
                 {% if not gets_notification %}
                     <div class="alert alert-warning">
                         {% blocktrans trimmed %}
-                            If a user requests cancels a paid order and the money can not be refunded automatically, e.g.
-                            due to the selected payment method, you will need to take manual action. However, you have
-                            currently turned off notifications for this event.
+                            If a user requests to cancel a paid order and the money cannot be refunded automatically (e.g.,
+                            due to the selected payment method), you will need to take manual action. Please ensure you have
+                            notifications enabled to be alerted of such requests.
                         {% endblocktrans %}
-                        <a href="{% url "control:user.settings.notifications" %}" class="btn btn-default">
-                            {% trans "Change notification settings" %}
-                        </a>
                     </div>
                 {% endif %}
             </fieldset>
@@ -50,10 +41,9 @@
                 <legend>{% trans "Order changes" %}</legend>
                 <div class="alert alert-info">
                     {% blocktrans trimmed %}
-                        Allowing users to change their order is a feature under development. Therefore, currently only specific changes (such as changing the variation of a product) are possible. More options might be added later.
+                        Allowing users to change their order is a feature under development. Variation changes are configured per product in the product's "Variations" section.
                     {% endblocktrans %}
                 </div>
-                {% bootstrap_field form.change_allow_user_variation layout="control" %}
                 {% bootstrap_field form.change_allow_user_price layout="control" %}
                 {% bootstrap_field form.change_allow_user_until layout="control" %}
             </fieldset>

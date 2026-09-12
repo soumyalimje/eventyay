@@ -9,17 +9,20 @@ from channels.layers import get_channel_layer
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import Count, Max, OuterRef, Subquery, Q
-from pytz import common_timezones
+from django.db.models import Count, Max, OuterRef, Q, Subquery
+from eventyay.timezones import common_timezones
 from rest_framework import serializers
 
-from eventyay.base.models.room import Room
-from eventyay.base.models.event import Event
-from eventyay.base.models.room import RoomConfigSerializer, RoomView
-from eventyay.core.permissions import Permission
-# Add missing imports for models referenced in this module
-from eventyay.base.models.chat import Channel
 from eventyay.base.models.audit import AuditLog
+from eventyay.base.models.chat import Channel, ChatEvent, Membership
+from eventyay.base.models.event import Event
+from eventyay.base.models.room import Room, RoomConfigSerializer, RoomView
+from eventyay.base.services.room_creation_gate import (
+    SERVER_BACKED_ROOM_MODULE_TYPES,
+    user_can_create_server_backed_room_during_development,
+)
+from eventyay.base.services.video_theme import build_video_theme_for_event
+from eventyay.core.permissions import Permission
 
 
 class EventConfigSerializer(serializers.Serializer):
@@ -34,15 +37,10 @@ class EventConfigSerializer(serializers.Serializer):
     video_player = serializers.DictField(allow_null=True)
     timezone = serializers.ChoiceField(choices=[(a, a) for a in common_timezones])
     connection_limit = serializers.IntegerField(allow_null=True)
-    available_permissions = serializers.SerializerMethodField("_available_permissions")
-    profile_fields = serializers.JSONField()
-    social_logins = serializers.ListSerializer(
-        child=serializers.CharField(), required=False, allow_empty=True
-    )
-    iframe_blockers = serializers.JSONField()
-    track_exhibitor_views = serializers.BooleanField()
-    track_room_views = serializers.BooleanField()
-    track_event_views = serializers.BooleanField()
+    iframe_blockers = serializers.JSONField(required=False, allow_null=True)
+    track_room_views = serializers.BooleanField(required=False)
+    track_event_views = serializers.BooleanField(required=False)
+    live_features = serializers.DictField(required=False)
     onsite_traits = serializers.JSONField(
         required=False,
         allow_null=False,
@@ -57,39 +55,13 @@ class EventConfigSerializer(serializers.Serializer):
     def _available_permissions(self, *args):
         return [d.value for d in Permission]
 
-    def validate_social_logins(self, val):
-        known = ("gravatar", "twitter", "linkedin")
-        if any(v not in known for v in val):
-            raise ValidationError("Invalid value for social_logins")
-
-        if "twitter" in val and not settings.TWITTER_CLIENT_ID:
-            raise ValidationError(
-                "Twitter login can't be enabled since there's no Twitter API keys set for this "
-                "Eventyay installation."
-            )
-
-        if "linkedin" in val and not settings.LINKEDIN_CLIENT_ID:
-            raise ValidationError(
-                "LinkedIn login can't be enabled since there's no LinkedIn API keys set for this "
-                "Eventyay installation."
-            )
-
-        return val
-
 
 @database_sync_to_async
 def _get_event(event_id):
-    """Retrieve Event by primary key or slug.
-    Frontend passes <event_identifier> in /video/<event_identifier>/ and websocket /ws/event/<event_identifier>/.
-    Previously only numeric primary key worked; now also accept slug.
-    """
-    # Try numeric ID first if it looks like one
+    """Retrieve Event by primary key or slug."""
     if isinstance(event_id, str) and event_id.isdigit():
-        evt = Event.objects.filter(id=int(event_id)).first()
-        if evt:
-            return evt
-    # Fallback: match by slug OR (string) id (covers atypical string PK setups)
-    return Event.objects.filter(Q(slug=event_id) | Q(id=event_id)).first()
+        return Event.objects.filter(Q(slug=event_id) | Q(id=int(event_id))).first()
+    return Event.objects.filter(slug=event_id).first()
 
 
 async def get_event(event_id):
@@ -98,25 +70,33 @@ async def get_event(event_id):
 
 
 def get_rooms(event, user):
-    qs = (
-        event.rooms.filter(deleted=False)
-        .prefetch_related("channel")
-        .annotate(
-            current_roomviews=Subquery(
-                RoomView.objects.filter(room_id=OuterRef("pk"), end__isnull=True)
-                .values("room_id")
-                .order_by()
-                .annotate(
-                    # Count('user_id', distinct=True) would be more accurate, but might be slow, and we don't need accurate
-                    c=Count("user_id")
+    from django_scopes import scope
+
+    with scope(event=event):
+        qs = (
+            event.rooms.filter(deleted=False)
+            .with_has_linked_sessions()
+            .order_by('sorting_priority', 'id')
+            .prefetch_related("channel")
+            .annotate(
+                current_roomviews=Subquery(
+                    RoomView.objects.filter(room_id=OuterRef("pk"), end__isnull=True)
+                    .values("room_id")
+                    .order_by()
+                    .annotate(
+                        c=Count("user_id", distinct=True)
+                    )
+                    .values("c")
                 )
-                .values("c")
             )
         )
-    )
-    if user:
-        qs = qs.with_permission(event=event, user=user)
-    return list(qs)
+        if user:
+            qs = qs.with_permission(event=event, user=user)
+        rooms_list = list(qs)
+        live_features = (getattr(event, 'config', None) or {}).get('live_features', {})
+        if not live_features.get('chat_rooms', False):
+            rooms_list = [r for r in rooms_list if not is_chat_channel_room(r)]
+        return rooms_list
 
 
 @database_sync_to_async
@@ -162,7 +142,119 @@ async def notify_schedule_change(event_id):
     )
 
 
-def get_room_config(room, permissions):
+def serialize_stream_schedule(current):
+    """Serialize a StreamSchedule instance for API/websocket payloads."""
+    from eventyay.base.services import room as room_service
+
+    serializer = getattr(room_service, 'serialize_current_stream', None)
+    if serializer is not None:
+        return serializer(current)
+
+    def isoformat(value):
+        return value.isoformat() if value else None
+
+    return {
+        'id': current.pk,
+        'room': current.room_id,
+        'title': current.title,
+        'url': current.url,
+        'start_time': isoformat(current.start_time),
+        'end_time': isoformat(current.end_time),
+        'stream_type': current.stream_type,
+        'config': current.config,
+        'created_at': isoformat(current.created_at),
+        'updated_at': isoformat(current.updated_at),
+    }
+
+
+def get_room_current_stream_data(room, current=None):
+    """Return current stream payload for websocket room config.
+
+    Uses Redis-backed cache when available (#4992); falls back to a direct DB
+    lookup so this PR can merge independently.
+    """
+    if current is not None:
+        return serialize_stream_schedule(current)
+
+    from eventyay.base.services import room as room_service
+
+    getter = getattr(room_service, 'get_cached_current_stream_data', None)
+    if getter is not None:
+        return getter(room)
+    current = room.get_current_stream()
+    if not current:
+        return None
+    return serialize_stream_schedule(current)
+
+
+def batch_room_current_stream_data(rooms):
+    """Return current stream payloads for many rooms using one DB query."""
+    from django.utils.timezone import now
+
+    from eventyay.base.models.stream_schedule import StreamSchedule
+
+    room_ids = [room.pk for room in rooms]
+    if not room_ids:
+        return {}
+
+    at_time = now()
+    schedules = StreamSchedule.objects.filter(
+        room_id__in=room_ids,
+        start_time__lte=at_time,
+        end_time__gt=at_time,
+    ).order_by('room_id', 'start_time')
+
+    active_by_room = {}
+    for schedule in schedules:
+        if schedule.room_id not in active_by_room:
+            active_by_room[schedule.room_id] = schedule
+
+    return {
+        room_id: serialize_stream_schedule(schedule)
+        for room_id, schedule in active_by_room.items()
+    }
+
+
+_UNSET = object()
+
+_MEDIA_MODULE_TYPES = frozenset({
+    'livestream.native',
+    'livestream.youtube',
+    'call.bigbluebutton',
+    'call.janus',
+    'call.zoom',
+    'call.jitsi',
+    'networking.roulette',
+    'page.landing',
+})
+
+
+def is_chat_channel_room(room):
+    modules = room.module_config or []
+    if not isinstance(modules, list) or not modules:
+        return False
+    types = [module.get('type') for module in modules if isinstance(module, dict)]
+    return 'chat.native' in types and not any(module_type in _MEDIA_MODULE_TYPES for module_type in types)
+
+
+def count_chat_participants(channel_id):
+    member_ids = Membership.objects.filter(
+        channel_id=channel_id,
+        user_id__isnull=False,
+    ).values_list("user_id", flat=True)
+    sender_ids = ChatEvent.objects.filter(
+        channel_id=channel_id,
+        sender_id__isnull=False,
+    ).values_list("sender_id", flat=True)
+    return len(set(member_ids) | set(sender_ids))
+
+
+def get_room_config(room, permissions, *, current_stream=_UNSET):
+    str_permissions = [p if isinstance(p, str) else getattr(p, "value", p) for p in permissions]
+    if current_stream is _UNSET:
+        stream_data = get_room_current_stream_data(room)
+    else:
+        stream_data = current_stream
     room_config = {
         "id": str(room.id),
         "name": room.name,
@@ -170,22 +262,42 @@ def get_room_config(room, permissions):
         "picture": room.picture.url if room.picture else None,
         "import_id": room.import_id,
         "pretalx_id": room.pretalx_id,
-        "permissions": [p for p in permissions if not p.startswith("event:")],
+        "permissions": [p for p in str_permissions if not p.startswith("event:")],
         "force_join": room.force_join,
         "modules": [],
         "schedule_data": room.schedule_data or None,
+        "currentStream": stream_data,
     }
 
-    if hasattr(room, "current_roomviews"):
-        # set actual viewer count instead of approximate text
-        room_config["users"] = room.current_roomviews
+    if is_chat_channel_room(room):
+        try:
+            room_config["users"] = count_chat_participants(room.channel.id)
+        except Channel.DoesNotExist:
+            room_config["users"] = 0
+    elif hasattr(room, "current_roomviews"):
+        room_config["users"] = room.current_roomviews or 0
+    else:
+        room_config["users"] = 0
 
     for module in room.module_config:
         module_config = copy.deepcopy(module)
         if module["type"] == "call.bigbluebutton":
             module_config["config"] = {}
-        elif module["type"] == "chat.native" and getattr(room, "channel", None):
-            module_config["channel_id"] = str(room.channel.id)
+        elif module["type"] == "call.jitsi":
+            cfg = module_config.get("config")
+            if isinstance(cfg, dict):
+                cfg.pop("domain", None)
+                cfg.pop("jwt_enabled", None)
+                cfg.pop("app_id", None)
+                cfg.pop("key_id", None)
+                cfg.pop("app_secret", None)
+        elif module["type"] == "chat.native":
+            # Strip webhook secrets — these are server-side only
+            cfg = module_config.get("config")
+            if isinstance(cfg, dict):
+                cfg.pop("webhook_hmac_secret", None)
+            if getattr(room, "channel", None):
+                module_config["channel_id"] = str(room.channel.id)
         room_config["modules"].append(module_config)
     return room_config
 
@@ -193,17 +305,31 @@ def get_room_config(room, permissions):
 def get_event_config_for_user(event, user):
     permissions = event.get_all_permissions(user)
     cfg = event.config or {}
+    # Only expose schedule import-related pretalx config keys to the frontend.
+    # (The legacy eventyay-talk connection keys like domain/event/connected/pushed were removed.)
+    pretalx_cfg = (cfg.get("pretalx") or {})
+    pretalx_public = {k: pretalx_cfg.get(k) for k in ("url", "conftool") if k in pretalx_cfg}
+
     world_block = {
         "id": str(event.id),
         "title": getattr(event, "title", getattr(event, "name", "")),
         "slug": getattr(event, "slug", str(event.id)),
-        "pretalx": cfg.get("pretalx", {}),
-        "profile_fields": cfg.get("profile_fields", []),
-        "social_logins": cfg.get("social_logins", []),
-        "iframe_blockers": cfg.get(
-            "iframe_blockers",
-            {"default": {"enabled": False, "policy_url": None}},
-        ),
+        "organizer_slug": getattr(event.organizer, "slug", None) if hasattr(event, "organizer") and event.organizer else None,
+        "timezone": event.settings.timezone,
+        "date_from": event.date_from.isoformat() if event.date_from else None,
+        "date_to": event.date_to.isoformat() if event.date_to else None,
+        "visible_logo_url": event.visible_logo_url,
+        "visible_header_image_url": event.visible_header_image_url,
+        "pretalx": pretalx_public,
+        "track_event_views": cfg.get("track_event_views", True),
+        "track_video_event_views": cfg.get("track_event_views", True),
+        "live_features": {
+            "chat_rooms": False,
+            "kiosks": False,
+            "direct_messaging": False,
+            "announcements": True,
+            **(cfg.get("live_features") or {}),
+        },
         "onsite_traits": cfg.get("onsite_traits", []),
     }
     # Build permission strings and include world:* aliases for event:* permissions for frontend compatibility
@@ -214,8 +340,16 @@ def get_event_config_for_user(event, user):
     for p in event_perm_values:
         if p == "event.view":
             world_aliases.append("world:view")
+        elif p == "event.update":
+            world_aliases.append("world:update")
         elif p.startswith("event:"):
             world_aliases.append("world:" + p[len("event:"):])
+        elif p == "world:view":
+            world_aliases.append("event.view")
+        elif p == "world:update":
+            world_aliases.append("event.update")
+        elif p.startswith("world:"):
+            world_aliases.append("event:" + p[len("world:"):])
     merged_permissions = sorted(set(event_perm_values) | set(world_aliases))
 
     result = {
@@ -227,9 +361,14 @@ def get_event_config_for_user(event, user):
     }
 
     rooms = get_rooms(event, user)
+    stream_data_by_room = batch_room_current_stream_data(rooms)
     for room in rooms:
         result["rooms"].append(
-            get_room_config(room, permissions[event] | permissions[room])
+            get_room_config(
+                room,
+                permissions[event] | permissions[room],
+                current_stream=stream_data_by_room.get(room.pk),
+            )
         )
     return result
 
@@ -279,7 +418,74 @@ def _create_room(data, with_channel=False, permission_preset="public", creator=N
 
 async def create_room(event, data, creator):
     types = {m["type"] for m in data.get("modules", [])}
-    if "chat.native" in types:
+    livestream_types = {
+        "livestream.native",
+        "livestream.youtube",
+    }
+    livestream_modules = [
+        m for m in data.get("modules", []) if m.get("type") in livestream_types
+    ]
+
+    if types & SERVER_BACKED_ROOM_MODULE_TYPES:
+        if not await user_can_create_server_backed_room_during_development(creator):
+            raise ValidationError(
+                "This user is not allowed to create a room of this type.",
+                code="denied",
+            )
+
+    if livestream_modules:
+        allowed_stage_types = livestream_types | {"chat.native"}
+        if len(livestream_modules) != 1 or types - allowed_stage_types:
+            raise ValidationError(
+                f"The dynamic creation of rooms with the modules {types} is currently not allowed.",
+                code="invalid",
+            )
+        if not await event.has_permission_async(
+            user=creator, permission=Permission.EVENT_ROOMS_CREATE_STAGE
+        ):
+            raise ValidationError(
+                "This user is not allowed to create a room of this type.",
+                code="denied",
+            )
+
+        module = livestream_modules[0]
+        config = module.get("config", {}) or {}
+        playback_mode = config.get("playback_mode") or "always_on"
+        if playback_mode not in {"schedule_driven", "always_on"}:
+            raise ValidationError(
+                "Invalid stage playback mode.",
+                code="invalid",
+            )
+
+        clean_config = {"playback_mode": playback_mode}
+        if playback_mode == "always_on":
+            if module["type"] == "livestream.native":
+                clean_config["hls_url"] = config.get("hls_url", "")
+            elif module["type"] == "livestream.youtube":
+                clean_config["ytid"] = config.get("ytid", "")
+                for key in (
+                    "enablePrivacyEnhancedMode",
+                    "loop",
+                    "modestBranding",
+                    "hideControls",
+                    "noRelated",
+                    "disableKb",
+                    "showInfo",
+                ):
+                    if config.get(key):
+                        clean_config[key] = True
+        module["config"] = clean_config
+
+        if "chat.native" in types:
+            m = [m for m in data.get("modules", []) if m["type"] == "chat.native"][0]
+            m["config"] = {"volatile": m.get("config", {}).get("volatile", False)}
+    elif types == {"chat.native"}:
+        live_features = (event.config or {}).get("live_features", {})
+        if not live_features.get("chat_rooms", False):
+            raise ValidationError(
+                "Chat rooms are currently disabled.",
+                code="chat_rooms_disabled",
+            )
         if not await event.has_permission_async(
             user=creator, permission=Permission.EVENT_ROOMS_CREATE_CHAT
         ):
@@ -300,16 +506,30 @@ async def create_room(event, data, creator):
         m = [m for m in data.get("modules", []) if m["type"] == "call.bigbluebutton"][0]
         m["config"] = event.config.get("bbb_defaults", {})
         m["config"].pop("secret", None)  # legacy
-    elif "livestream.native" in types:
+    elif types == {"call.jitsi"}:
+        m = [m for m in data.get("modules", []) if m["type"] == "call.jitsi"][0]
+        config = m.get("config", {})
+        if not isinstance(config, dict):
+            config = {}
+        m["config"] = {
+            "prefer_server": config.get("prefer_server", ""),
+            "start_with_audio_muted": config.get(
+                "start_with_audio_muted", False
+            ),
+            "start_with_video_muted": config.get(
+                "start_with_video_muted", False
+            ),
+        }
+    elif types == {"call.janus"}:
         if not await event.has_permission_async(
-            user=creator, permission=Permission.EVENT_ROOMS_CREATE_STAGE
+            user=creator, permission=Permission.EVENT_ROOMS_CREATE_BBB
         ):
             raise ValidationError(
                 "This user is not allowed to create a room of this type.",
                 code="denied",
             )
-        m = [m for m in data.get("modules", []) if m["type"] == "livestream.native"][0]
-        m["config"] = {"hls_url": m.get("config", {}).get("hls_url", "")}
+        m = [m for m in data.get("modules", []) if m["type"] == "call.janus"][0]
+        m["config"] = {}
     elif types == set():
         if not await event.has_permission_async(
             user=creator, permission=Permission.ROOM_UPDATE
@@ -351,7 +571,9 @@ async def create_room(event, data, creator):
 async def get_room_config_for_user(room: str, event_id: str, user):
     room = await get_room(id=room, event_id=event_id)
     permissions = await database_sync_to_async(room.event.get_all_permissions)(user)
-    return get_room_config(room, permissions[room] | permissions[room.event])
+    return await database_sync_to_async(get_room_config)(
+        room, permissions[room] | permissions[room.event]
+    )
 
 
 @database_sync_to_async
@@ -361,7 +583,7 @@ def generate_tokens(event, number, traits, days, by_user, long=False):
     secret = jwt_config["secret"]
     audience = jwt_config["audience"]
     issuer = jwt_config["issuer"]
-    iat = datetime.datetime.utcnow()
+    iat = datetime.datetime.now(datetime.timezone.utc)
     exp = iat + datetime.timedelta(days=days)
     result = []
     bulk_create = []
@@ -405,29 +627,29 @@ def _config_serializer(event, *args, **kwargs):
     cfg = event.config or {}
     return EventConfigSerializer(
         instance={
-            "theme": cfg.get("theme", {}),
+            "theme": build_video_theme_for_event(event),
             "title": getattr(event, "title", getattr(event, "name", "")),
             "locale": event.locale,
             "date_locale": cfg.get("date_locale", "en-ie"),
             "roles": event.roles,
             "bbb_defaults": bbb_defaults,
-            "track_exhibitor_views": cfg.get("track_exhibitor_views", True),
             "track_room_views": cfg.get("track_room_views", True),
-            "track_event_views": cfg.get("track_event_views", False),
+            "track_event_views": cfg.get("track_event_views", True),
+            "live_features": {
+                "chat_rooms": False,
+                "kiosks": False,
+                "direct_messaging": False,
+                "announcements": True,
+                **(cfg.get("live_features") or {}),
+            },
             "pretalx": cfg.get("pretalx", {}),
             "video_player": cfg.get("video_player"),
             "timezone": event.timezone,
             "trait_grants": event.trait_grants,
             "connection_limit": cfg.get("connection_limit", 0),
-            "profile_fields": cfg.get("profile_fields", []),
-            "social_logins": cfg.get("social_logins", []),
             "onsite_traits": cfg.get("onsite_traits", []),
             "conftool_url": cfg.get("conftool_url", ""),
             "conftool_password": cfg.get("conftool_password", ""),
-            "iframe_blockers": cfg.get(
-                "iframe_blockers",
-                {"default": {"enabled": False, "policy_url": None}},
-            ),
         },
         *args,
         **kwargs,

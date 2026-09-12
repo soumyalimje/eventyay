@@ -6,6 +6,7 @@ from django.utils.translation import gettext_lazy as _
 from eventyay.base.forms import I18nModelForm
 from eventyay.base.models.organizer import Organizer, OrganizerBillingModel
 from eventyay.base.models.vouchers import InvoiceVoucher
+from eventyay.base.services.turnstile import TurnstileValidationMixin
 from eventyay.helpers.countries import CachedCountries, get_country_name
 from eventyay.helpers.stripe_utils import (
     create_stripe_customer,
@@ -13,14 +14,37 @@ from eventyay.helpers.stripe_utils import (
 )
 
 
-class OrganizerForm(I18nModelForm):
+class OrganizerForm(TurnstileValidationMixin, I18nModelForm):
+    turnstile_action = 'organizer_create'
     error_messages = {
         'duplicate_slug': _('This slug is already in use. Please choose a different one.'),
     }
 
+    set_as_default = forms.BooleanField(
+        label=_('Set as my default organizer'),
+        required=False,
+        help_text=_('Make this organizer your default account for creating events.'),
+    )
+
     class Meta:
         model = Organizer
         fields = ['name', 'slug']
+
+    def __init__(self, *args, user=None, request=None, **kwargs):
+        self.user = user
+        self.request = request
+        super().__init__(*args, **kwargs)
+        if self.user and self.user.is_authenticated:
+            has_default = bool(self.user.get_default_organizer())
+            if 'set_as_default' not in self.initial:
+                self.fields['set_as_default'].initial = not has_default
+        else:
+            self.fields.pop('set_as_default', None)
+
+    def clean(self):
+        if not getattr(self.instance, 'pk', None):
+            self.clean_turnstile()
+        return super().clean()
 
     def clean_slug(self):
         slug = self.cleaned_data['slug']
@@ -128,7 +152,8 @@ class BillingSettingsForm(forms.ModelForm):
         label=_('Tax ID (e.g., VAT, GST)'),
         help_text=_(
             'If you are located in the EU, please provide your VAT ID. '
-            'Without this, we will need to charge VAT on our services and will not be able to issue reverse charge invoices.'
+            'Without this, we will need to charge VAT on our services '
+            'and will not be able to issue reverse charge invoices.'
         ),
         max_length=255,
         widget=forms.TextInput(attrs={'placeholder': ''}),

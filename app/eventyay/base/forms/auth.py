@@ -10,23 +10,51 @@ from django.contrib.auth.password_validation import (
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 
+from eventyay.base.auth import SPAM_ACCOUNT_ERROR
 from eventyay.base.models import User
+from eventyay.base.services.turnstile import (
+    TurnstileValidationMixin,
+    record_failed_login_attempt,
+    reset_failed_login_attempts,
+)
 from eventyay.helpers.dicts import move_to_end
 from eventyay.helpers.http import get_client_ip
 
 
-class LoginForm(forms.Form):
+PASSWORD_COMPLEXITY_ERROR = _('Password must be at least 8 characters and include a letter, a number, and a special character.')
+
+
+def validate_password_complexity(password):
+    """
+    Validate password complexity with explicit checks
+    Requirements:
+    - At least 8 characters
+    - Contains at least one letter, one digit, and one special character
+    """
+    if not isinstance(password, str) or not password:
+        raise forms.ValidationError(PASSWORD_COMPLEXITY_ERROR, code='password_complexity')
+
+    has_letter = any(ch.isalpha() for ch in password)
+    has_digit = any(ch.isdigit() for ch in password)
+    has_special = any(not ch.isalnum() for ch in password)
+    if len(password) < 8 or not (has_letter and has_digit and has_special):
+        raise forms.ValidationError(PASSWORD_COMPLEXITY_ERROR, code='password_complexity')
+
+
+class LoginForm(TurnstileValidationMixin, forms.Form):
     """
     Base class for authenticating users. Extend this to get a form that accepts
     username/password logins.
     """
 
+    turnstile_action = 'login'
     keep_logged_in = forms.BooleanField(label=_('Keep me logged in'), required=False)
 
     error_messages = {
         'invalid_login': _('This combination of credentials is not known to our system.'),
         'rate_limit': _('For security reasons, please wait 5 minutes before you try again.'),
         'inactive': _('This account is inactive.'),
+        'spam': SPAM_ACCOUNT_ERROR,
     }
 
     def __init__(self, backend, request=None, *args, **kwargs):
@@ -38,6 +66,8 @@ class LoginForm(forms.Form):
         self.user_cache = None
         self.backend = backend
         super().__init__(*args, **kwargs)
+        if backend is None:
+            return
         for k, f in backend.login_form_fields.items():
             self.fields[k] = f
 
@@ -62,9 +92,10 @@ class LoginForm(forms.Form):
         if client_ip.is_private:
             # This is the private IP of the server, web server not set up correctly
             return None
-        return 'pretix_login_{}'.format(hashlib.sha1(str(client_ip).encode()).hexdigest())
+        return f'pretix_login_{hashlib.sha1(str(client_ip).encode()).hexdigest()}'
 
     def clean(self):
+        self.clean_turnstile()
         if all(k in self.cleaned_data for k, f in self.fields.items() if f.required):
             if self.ratelimit_key:
                 from django_redis import get_redis_connection
@@ -78,9 +109,11 @@ class LoginForm(forms.Form):
                 if self.ratelimit_key:
                     rc.incr(self.ratelimit_key)
                     rc.expire(self.ratelimit_key, 300)
+                record_failed_login_attempt(self.request)
                 raise forms.ValidationError(self.error_messages['invalid_login'], code='invalid_login')
             else:
                 self.confirm_login_allowed(self.user_cache)
+                reset_failed_login_attempts(self.request)
 
         return self.cleaned_data
 
@@ -100,12 +133,18 @@ class LoginForm(forms.Form):
                 self.error_messages['inactive'],
                 code='inactive',
             )
+        if user.is_spam:
+            raise forms.ValidationError(
+                self.error_messages['spam'],
+                code='spam',
+            )
 
     def get_user(self):
         return self.user_cache
 
 
-class RegistrationForm(forms.Form):
+class RegistrationForm(TurnstileValidationMixin, forms.Form):
+    turnstile_action = 'registration'
     error_messages = {
         'duplicate_email': _('You already registered with that email address, please use the login form.'),
         'pw_mismatch': _('Please enter the same password twice'),
@@ -131,12 +170,14 @@ class RegistrationForm(forms.Form):
     )
     keep_logged_in = forms.BooleanField(label=_('Keep me logged in'), required=False)
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, request=None, **kwargs):
+        self.request = request
         super().__init__(*args, **kwargs)
         if not settings.EVENTYAY_LONG_SESSIONS:
             self.fields.pop('keep_logged_in', None)
 
     def clean(self):
+        self.clean_turnstile()
         password1 = self.cleaned_data.get('password', '')
         password2 = self.cleaned_data.get('password_repeat')
 
@@ -152,6 +193,7 @@ class RegistrationForm(forms.Form):
     def clean_password(self):
         password1 = self.cleaned_data.get('password', '')
         user = User(email=self.cleaned_data.get('email'))
+        validate_password_complexity(password1)
         if validate_password(password1, user=user) is not None:
             raise forms.ValidationError(_(password_validators_help_texts()), code='pw_invalid')
         return password1
@@ -194,21 +236,28 @@ class PasswordRecoverForm(forms.Form):
             user = User.objects.get(id=self.user_id)
         except User.DoesNotExist:
             user = None
+        validate_password_complexity(password1)
         if validate_password(password1, user=user) is not None:
             raise forms.ValidationError(_(password_validators_help_texts()), code='pw_invalid')
         return password1
 
 
-class PasswordForgotForm(forms.Form):
+class PasswordForgotForm(TurnstileValidationMixin, forms.Form):
+    turnstile_action = 'password_reset'
     email = forms.EmailField(
         label=_('E-mail'),
     )
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, request=None, **kwargs):
         if 'event' in kwargs:
             # Backwards compatibility
             del kwargs['event']
+        self.request = request
         super().__init__(*args, **kwargs)
+
+    def clean(self):
+        self.clean_turnstile()
+        return super().clean()
 
     def clean_email(self):
         return self.cleaned_data['email'].lower()
@@ -218,6 +267,7 @@ class ReauthForm(forms.Form):
     error_messages = {
         'invalid_login': _('This combination of credentials is not known to our system.'),
         'inactive': _('This account is inactive.'),
+        'spam': SPAM_ACCOUNT_ERROR,
     }
 
     def __init__(self, backend, user, request=None, *args, **kwargs):
@@ -250,4 +300,9 @@ class ReauthForm(forms.Form):
             raise forms.ValidationError(
                 self.error_messages['inactive'],
                 code='inactive',
+            )
+        if user.is_spam:
+            raise forms.ValidationError(
+                self.error_messages['spam'],
+                code='spam',
             )

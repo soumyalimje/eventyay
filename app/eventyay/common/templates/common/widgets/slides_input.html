@@ -1,0 +1,71 @@
+{% load i18n filesize static %}
+
+{% if widget.current_resources %}
+  <div class='mb-3'>
+    <div class='font-weight-bold mb-2'>{% translate 'Current slides' %}</div>
+    {% for resource in widget.current_resources %}
+      <div class='border rounded px-3 py-2 mb-2'>
+        <div>
+          {% if resource.link %}
+            <a href='{{ resource.link }}' target='_blank' rel='noopener'>{{ resource.link }}</a>
+          {% else %}
+            <a href='{{ resource.url }}' target='_blank' rel='noopener'>{{ resource.filename }}</a>
+          {% endif %}
+        </div>
+        {% if not widget.attrs.disabled %}
+          <div class='form-check mt-2'>
+            <input class='form-check-input' type='checkbox' name='{{ widget.clear_name }}' value='{{ resource.pk }}' id='{{ widget.name }}_clear_{{ resource.pk }}'>
+            <label class='form-check-label' for='{{ widget.name }}_clear_{{ resource.pk }}'>
+              {% translate 'Remove this slide' %}
+            </label>
+          </div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+{% endif %}
+
+{% if not widget.attrs.disabled %}
+  <div class="slides-input-widget" data-id="{{ widget.files_id }}" data-is-re-render="{% if widget.is_re_render %}true{% else %}false{% endif %}">
+    <div>
+      <label class='btn btn-default mb-0 slides-file-label' for='{{ widget.files_id }}'>
+        {% translate 'Choose file' %}
+      </label>
+      <input
+        type='file'
+        name='{{ widget.files_name }}'
+        id='{{ widget.files_id }}'
+        class='sr-only sr-only-focusable'
+        accept='.pdf,application/pdf'
+        {% if widget.max_size %}data-maxsize='{{ widget.max_size }}'{% endif %}
+        {% if widget.max_items != 1 %}multiple{% endif %}>
+      <span id='{{ widget.files_id }}_label' class='ml-2 text-muted slides-filename-label'>
+        {% translate 'No file chosen' %}
+      </span>
+      <div id='{{ widget.files_id }}_error' class='text-danger mt-1 slides-error-msg' style='display: none;'>
+        {% if widget.max_size %}
+          {% blocktranslate with size=widget.max_size|filesize %}The upload limit is {{ size }}.{% endblocktranslate %}
+        {% endif %}
+      </div>
+      <div id='{{ widget.files_id }}_storage_warning' class='text-warning mt-1 slides-storage-warning' style='display: none;'>
+        {% translate 'Note: This file is too large to be saved in the browser’s temporary storage. If the form has other errors, you will need to re-select it before submitting.' %}
+      </div>
+    </div>
+    <script src="{% static 'common/js/slides_input.js' %}" defer></script>
+    <small class='form-text text-muted mt-2'>
+      {% if widget.max_items %}
+        {% if widget.current_count %}
+          {% blocktranslate count count=widget.remaining_items %}You can add {{ count }} more slide entry.{% plural %}You can add {{ count }} more slide entries.{% endblocktranslate %}
+        {% else %}
+          {% blocktranslate count count=widget.max_items %}You can keep up to {{ count }} slide entry in total.{% plural %}You can keep up to {{ count }} slide entries in total.{% endblocktranslate %}
+        {% endif %}
+      {% else %}
+        {% translate 'You can upload PDF files.' %}
+      {% endif %}
+      {% translate 'Only PDF is supported right now.' %}
+      {% if widget.max_size %}
+        {% blocktranslate with size=widget.max_size|filesize %}The upload limit is {{ size }}.{% endblocktranslate %}
+      {% endif %}
+    </small>
+  </div>
+{% endif %}

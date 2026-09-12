@@ -1,15 +1,15 @@
 import sys
 import uuid
 from collections import Counter, OrderedDict
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, DecimalException
-from typing import Tuple
 
 import dateutil.parser
-import pytz
+import datetime
+from zoneinfo import ZoneInfo
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.validators import RegexValidator
+from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models
 from django.db.models import Q
 from django.utils import formats
@@ -125,7 +125,7 @@ class SubEventProduct(models.Model):
 
     subevent = models.ForeignKey('SubEvent', on_delete=models.CASCADE)
     product = models.ForeignKey('Product', on_delete=models.CASCADE)
-    price = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    price = models.DecimalField(max_digits=13, decimal_places=2, null=True, blank=True)
     disabled = models.BooleanField(default=False, verbose_name=_('Disable product for this date'))
 
     def delete(self, *args, **kwargs):
@@ -154,7 +154,7 @@ class SubEventProductVariation(models.Model):
 
     subevent = models.ForeignKey('SubEvent', on_delete=models.CASCADE)
     variation = models.ForeignKey('ProductVariation', on_delete=models.CASCADE)
-    price = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    price = models.DecimalField(max_digits=13, decimal_places=2, null=True, blank=True)
     disabled = models.BooleanField(default=False)
 
     def delete(self, *args, **kwargs):
@@ -166,6 +166,13 @@ class SubEventProductVariation(models.Model):
         super().save(*args, **kwargs)
         if self.subevent:
             self.subevent.event.cache.clear()
+
+
+def default_product_available_until(event):
+    """
+    Return the default ``available_until`` value for newly created products.
+    """
+    return event.date_to
 
 
 def filter_available(qs, channel='web', voucher=None, allow_addons=False):
@@ -206,7 +213,44 @@ class ProductQuerySetManager(ScopedManager(organizer='event__organizer').__class
         return filter_available(self.get_queryset(), channel, voucher, allow_addons)
 
 
-class Product(LoggedModel):
+class AdmissionValidityBoundMixin(models.Model):
+    """Shared fixed-window and offset fields for product/variation admission validity."""
+
+    admission_valid_from = models.DateTimeField(
+        verbose_name=_('Admission valid from'),
+        help_text=_('Used when admission validity mode is "Fixed start and end".'),
+        null=True,
+        blank=True,
+    )
+    admission_valid_until = models.DateTimeField(
+        verbose_name=_('Admission valid until'),
+        help_text=_('Used when admission validity mode is "Fixed start and end".'),
+        null=True,
+        blank=True,
+    )
+    admission_valid_from_offset_minutes = models.IntegerField(
+        verbose_name=_('Admission valid from offset (minutes)'),
+        help_text=_(
+            'For event or date-based validity: minutes after the window start when check-in becomes allowed.'
+        ),
+        null=True,
+        blank=True,
+    )
+    admission_valid_until_offset_minutes = models.IntegerField(
+        verbose_name=_('Admission valid until offset (minutes)'),
+        help_text=_(
+            'For event or date-based validity: minutes after the window start when check-in stops. '
+            'Leave empty to use the window end.'
+        ),
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        abstract = True
+
+
+class Product(AdmissionValidityBoundMixin, LoggedModel):
     """
     An product is a thing which can be sold. It belongs to an event and may or may not belong to a category.
     Product was previously named 'Item' or referenced as 'items' internally due to historic reasons.
@@ -230,9 +274,9 @@ class Product(LoggedModel):
     :param picture: A product picture to be shown next to the product description
     :type picture: File
     :param available_from: The date this product goes on sale
-    :type available_from: datetime
+    :type available_from: datetime.datetime
     :param available_until: The date until when the product is on sale
-    :type available_until: datetime
+    :type available_until: datetime.datetime
     :param require_voucher: If set to ``True``, this product can only be bought using a voucher.
     :type require_voucher: bool
     :param hide_without_voucher: If set to ``True``, this product is only visible and available when a voucher is used.
@@ -305,19 +349,41 @@ class Product(LoggedModel):
             'variations. If a variation does not have a special price or if you do not have variations, '
             'this price will be used.'
         ),
-        max_digits=7,
+        max_digits=13,
         decimal_places=2,
         null=True,
+        validators=[MinValueValidator(Decimal('0.00'))],
     )
     free_price = models.BooleanField(
         default=False,
         verbose_name=_('Free price input'),
         help_text=_(
-            'If this option is active, your users can choose the price themselves. The price configured above '
-            'is then interpreted as the minimum price a user has to enter. You could use this e.g. to collect '
-            'additional donations for your event. This is currently not supported for products that are '
-            'bought as an add-on to other products.'
+            'If this option is active, your users can choose the price themselves. The minimum '
+            'and maximum prices can be configured below. If not configured, the default price '
+            'is used as the minimum. You could use this e.g. to collect additional donations for '
+            'your event. This is currently not supported for products that are bought as an add-on '
+            'to other products.'
         ),
+    )
+    free_price_min = models.DecimalField(
+        verbose_name=_('Minimum price'),
+        help_text=_(
+            'The minimum price a user has to enter. If left empty, the default price will be used as the minimum.'
+        ),
+        max_digits=13,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    free_price_max = models.DecimalField(
+        verbose_name=_('Maximum price'),
+        help_text=_(
+            'The maximum price a user can enter. If left empty, there is no upper limit.'
+        ),
+        max_digits=13,
+        decimal_places=2,
+        null=True,
+        blank=True,
     )
     tax_rule = models.ForeignKey(
         'TaxRule',
@@ -330,6 +396,24 @@ class Product(LoggedModel):
         verbose_name=_('Is an admission ticket'),
         help_text=_('Whether or not buying this product allows a person to enter your event'),
         default=False,
+    )
+    ADMISSION_VALIDITY_MODE_NONE = ''
+    ADMISSION_VALIDITY_MODE_FIXED = 'fixed'
+    ADMISSION_VALIDITY_MODE_SUBEVENT = 'subevent'
+    ADMISSION_VALIDITY_MODE_EVENT = 'event'
+    ADMISSION_VALIDITY_MODE_CHOICES = (
+        (ADMISSION_VALIDITY_MODE_NONE, _('No check-in time restriction')),
+        (ADMISSION_VALIDITY_MODE_FIXED, _('Fixed start and end')),
+        (ADMISSION_VALIDITY_MODE_SUBEVENT, _('Valid during assigned event date')),
+        (ADMISSION_VALIDITY_MODE_EVENT, _('Valid during entire event')),
+    )
+    admission_validity_mode = models.CharField(
+        verbose_name=_('Admission validity mode'),
+        help_text=_('How check-in validity is determined for tickets of this product.'),
+        max_length=20,
+        choices=ADMISSION_VALIDITY_MODE_CHOICES,
+        blank=True,
+        default=ADMISSION_VALIDITY_MODE_NONE,
     )
     generate_tickets = models.BooleanField(
         verbose_name=_('Generate tickets'),
@@ -421,6 +505,13 @@ class Product(LoggedModel):
             'If this is unchecked, orders containing this product can not be canceled by users but only by you.'
         ),
     )
+    allow_user_variation_change = models.BooleanField(
+        verbose_name=_('Allow customers to change product variations'),
+        default=False,
+        help_text=_(
+            'If this is checked, customers can switch between variations of this product in their order details.'
+        ),
+    )
     min_per_order = models.IntegerField(
         verbose_name=_('Minimum amount per order'),
         null=True,
@@ -453,7 +544,7 @@ class Product(LoggedModel):
         verbose_name=_('Original price'),
         blank=True,
         null=True,
-        max_digits=7,
+        max_digits=13,
         decimal_places=2,
         help_text=_(
             'If set, this will be displayed next to the current price to show that the current price is a '
@@ -694,6 +785,51 @@ class Product(LoggedModel):
             if from_date > until_date:
                 raise ValidationError(_("The product's availability cannot end before it starts."))
 
+    @staticmethod
+    def clean_admission_valid(valid_from, valid_until):
+        if valid_from is not None and valid_until is not None and valid_from > valid_until:
+            raise ValidationError(_('Admission validity cannot end before it starts.'))
+
+    @staticmethod
+    def clean_admission_validity(
+        mode, valid_from, valid_until, offset_from=None, offset_until=None, event=None
+    ):
+        effective_mode = mode or Product.ADMISSION_VALIDITY_MODE_NONE
+        if effective_mode == ProductVariation.ADMISSION_VALIDITY_MODE_INHERIT:
+            # Inherit uses product mode at resolve-time; only validate provided fields here.
+            effective_mode = Product.ADMISSION_VALIDITY_MODE_NONE
+        if effective_mode == Product.ADMISSION_VALIDITY_MODE_NONE and (valid_from or valid_until):
+            effective_mode = Product.ADMISSION_VALIDITY_MODE_FIXED
+        if effective_mode == Product.ADMISSION_VALIDITY_MODE_FIXED:
+            Product.clean_admission_valid(valid_from, valid_until)
+        for offset in (offset_from, offset_until):
+            if offset is not None and offset < 0:
+                raise ValidationError(_('Admission validity offsets cannot be negative.'))
+        if offset_from is not None and offset_until is not None and offset_from > offset_until:
+            raise ValidationError(_('Admission validity offset cannot end before it starts.'))
+        if (
+            effective_mode == Product.ADMISSION_VALIDITY_MODE_EVENT
+            and event is not None
+            and event.date_from
+            and event.date_to
+            and offset_until is not None
+            and event.date_from + timedelta(minutes=offset_until) > event.date_to
+        ):
+            raise ValidationError(
+                _('Admission validity until offset cannot extend past the event end.')
+            )
+
+    @staticmethod
+    def clean_admission_validity_data(data, event=None):
+        Product.clean_admission_validity(
+            data.get('admission_validity_mode'),
+            data.get('admission_valid_from'),
+            data.get('admission_valid_until'),
+            data.get('admission_valid_from_offset_minutes'),
+            data.get('admission_valid_until_offset_minutes'),
+            event=event,
+        )
+
     @property
     def meta_data(self):
         data = {p.name: p.default for p in self.event.product_meta_properties.all()}
@@ -705,7 +841,7 @@ class Product(LoggedModel):
         return OrderedDict((k, v) for k, v in sorted(data.items(), key=lambda k: k[0]))
 
 
-class ProductVariation(models.Model):
+class ProductVariation(AdmissionValidityBoundMixin, models.Model):
     """
     A variation of a product. For example, if your product is 'T-Shirt'
     then an example for a variation would be 'T-Shirt XL'.
@@ -739,21 +875,42 @@ class ProductVariation(models.Model):
     position = models.PositiveIntegerField(default=0, verbose_name=_('Position'))
     default_price = models.DecimalField(
         decimal_places=2,
-        max_digits=7,
+        max_digits=13,
         null=True,
         blank=True,
         verbose_name=_('Default price'),
+        validators=[MinValueValidator(Decimal('0.00'))],
     )
     original_price = models.DecimalField(
         verbose_name=_('Original price'),
         blank=True,
         null=True,
-        max_digits=7,
+        max_digits=13,
         decimal_places=2,
         help_text=_(
             'If set, this will be displayed next to the current price to show that the current price is a '
             'discounted one. This is just a cosmetic setting and will not actually impact pricing.'
         ),
+    )
+    ADMISSION_VALIDITY_MODE_INHERIT = 'inherit'
+    ADMISSION_VALIDITY_MODE_CHOICES = (
+        (ADMISSION_VALIDITY_MODE_INHERIT, _('Same as product')),
+        (Product.ADMISSION_VALIDITY_MODE_NONE, _('No check-in time restriction')),
+        (Product.ADMISSION_VALIDITY_MODE_FIXED, _('Fixed start and end')),
+        (Product.ADMISSION_VALIDITY_MODE_SUBEVENT, _('Valid during assigned event date')),
+        (Product.ADMISSION_VALIDITY_MODE_EVENT, _('Valid during entire event')),
+    )
+    admission_validity_mode = models.CharField(
+        verbose_name=_('Admission validity mode'),
+        help_text=_(
+            'Use "Same as product" to inherit the product mode and overlay only the '
+            'variation fields you set. Choose "No check-in time restriction" to explicitly '
+            'clear a product-level restriction for this variation.'
+        ),
+        max_length=20,
+        choices=ADMISSION_VALIDITY_MODE_CHOICES,
+        blank=False,
+        default=ADMISSION_VALIDITY_MODE_INHERIT,
     )
 
     objects = ScopedManager(organizer='product__event__organizer')
@@ -859,7 +1016,7 @@ class ProductVariation(models.Model):
         include_bundled=False,
         trust_parameters=False,
         fail_on_no_quotas=False,
-    ) -> Tuple[int, int]:
+    ) -> tuple[int, int]:
         """
         This method is used to determine whether this ProductVariation is currently
         available for sale in terms of quotas.
@@ -1053,14 +1210,14 @@ class ProductBundle(models.Model):
     def describe(self):
         if self.count == 1:
             if self.bundled_variation_id:
-                return '{} – {}'.format(self.bundled_product.name, self.bundled_variation.value)
+                return f'{self.bundled_product.name} – {self.bundled_variation.value}'
             else:
                 return self.bundled_product.name
         else:
             if self.bundled_variation_id:
-                return '{}× {} – {}'.format(self.count, self.bundled_product.name, self.bundled_variation.value)
+                return f'{self.count}× {self.bundled_product.name} – {self.bundled_variation.value}'
             else:
-                return '{}x {}'.format(self.count, self.bundled_product.name)
+                return f'{self.count}x {self.bundled_product.name}'
 
     @staticmethod
     def clean_productvar(event, bundled_product, bundled_variation):
@@ -1088,7 +1245,7 @@ class Question(LoggedModel):
     * a one-line string (``TYPE_STRING``)
     * a multi-line string (``TYPE_TEXT``)
     * a boolean (``TYPE_BOOLEAN``)
-    * a multiple choice option (``TYPE_CHOICE`` and ``TYPE_CHOICE_MULTIPLE``)
+    * a predefined choice option (``TYPE_CHOICE``, ``TYPE_CHOICE_DROPDOWN`` and ``TYPE_CHOICE_MULTIPLE``)
     * a file upload (``TYPE_FILE``)
     * a date (``TYPE_DATE``)
     * a time (``TYPE_TIME``)
@@ -1105,6 +1262,11 @@ class Question(LoggedModel):
     :param products: A set of ``Products`` objects that this question should be applied to
     :param ask_during_checkin: Whether to ask this question during check-in instead of during check-out.
     :type ask_during_checkin: bool
+    :param active: Whether this question is active. Inactive questions are not shown to customers
+                   during checkout or check-in. Unlike ``hidden`` (which is system-level and hides
+                   questions completely from the public interface), ``active`` is an organizer-controlled
+                   toggle for temporarily disabling questions without deleting them.
+    :type active: bool
     :param hidden: Whether to only show the question in the backend
     :type hidden: bool
     :param identifier: An arbitrary, internal identifier
@@ -1121,6 +1283,7 @@ class Question(LoggedModel):
     TYPE_TEXT = 'T'
     TYPE_BOOLEAN = 'B'
     TYPE_CHOICE = 'C'
+    TYPE_CHOICE_DROPDOWN = 'L'
     TYPE_CHOICE_MULTIPLE = 'M'
     TYPE_FILE = 'F'
     TYPE_DATE = 'D'
@@ -1129,12 +1292,16 @@ class Question(LoggedModel):
     TYPE_COUNTRYCODE = 'CC'
     TYPE_PHONENUMBER = 'TEL'
     TYPE_DESCRIPTION = 'DES'
+    TYPE_URL = 'URL'
+    SINGLE_CHOICE_TYPES = (TYPE_CHOICE, TYPE_CHOICE_DROPDOWN)
+    OPTION_TYPES = SINGLE_CHOICE_TYPES + (TYPE_CHOICE_MULTIPLE,)
     TYPE_CHOICES = (
         (TYPE_NUMBER, _('Number')),
         (TYPE_STRING, _('Text (one line)')),
         (TYPE_TEXT, _('Multiline text')),
         (TYPE_BOOLEAN, _('Confirm Checkbox')),
         (TYPE_CHOICE, _('Radio button (Choose one option)')),
+        (TYPE_CHOICE_DROPDOWN, _('Dropdown (Choose one option)')),
         (TYPE_CHOICE_MULTIPLE, _('Checkbox (Choose one or several options)')),
         (TYPE_FILE, _('File upload')),
         (TYPE_DATE, _('Date')),
@@ -1143,12 +1310,22 @@ class Question(LoggedModel):
         (TYPE_COUNTRYCODE, _('Country code (ISO 3166-1 alpha-2)')),
         (TYPE_PHONENUMBER, _('Phone number')),
         (TYPE_DESCRIPTION, _('Text field')),
+        (TYPE_URL, _('URL')),
     )
     UNLOCALIZED_TYPES = [TYPE_DATE, TYPE_TIME, TYPE_DATETIME]
     ASK_DURING_CHECKIN_UNSUPPORTED = [TYPE_PHONENUMBER]
 
     event = models.ForeignKey(Event, related_name='questions', on_delete=models.CASCADE)
-    question = I18nTextField(verbose_name=_('Question'))
+    question = I18nTextField(verbose_name=_('Custom Field'))
+    active = models.BooleanField(
+        default=True,
+        verbose_name=_('Active'),
+        help_text=_(
+            'Inactive questions are not shown to customers during checkout or check-in. '
+            'Unlike hidden questions (which are system-level), active controls visibility '
+            'and can be toggled by event organizers.'
+        ),
+    )
     description = I18nTextField(
         verbose_name=_('Description'),
         default='',
@@ -1169,8 +1346,8 @@ class Question(LoggedModel):
         null=True,
         blank=True,
     )
-    type = models.CharField(max_length=5, choices=TYPE_CHOICES, verbose_name=_('Question type'))
-    required = models.BooleanField(default=False, verbose_name=_('Required question'))
+    type = models.CharField(max_length=5, choices=TYPE_CHOICES, verbose_name=_('Type'))
+    required = models.BooleanField(default=False, verbose_name=_('Required field'))
     products = models.ManyToManyField(
         Product,
         related_name='questions',
@@ -1185,8 +1362,13 @@ class Question(LoggedModel):
         default=False,
     )
     hidden = models.BooleanField(
-        verbose_name=_('Hidden question'),
-        help_text=_('This question will only show up in the backend.'),
+        verbose_name=_('Hidden field'),
+        help_text=_(
+            'This field and its input field are invisible to customers in the public ticket shop. '
+            'This feature is intended for internal use. Only staff members logged into the control panel '
+            'can see and fill out this field. The purpose is for internal note taking or tracking information '
+            'that the customer does not need to see, such as internal seat assignment, VIP status, or internal notes.'
+        ),
         default=False,
     )
     print_on_invoice = models.BooleanField(verbose_name=_('Print answer on invoices'), default=False)
@@ -1293,7 +1475,7 @@ class Question(LoggedModel):
                 return False
             return None
 
-        if self.type == Question.TYPE_CHOICE:
+        if self.type in self.SINGLE_CHOICE_TYPES:
             if isinstance(answer, QuestionOption):
                 return answer
             q = Q(identifier=answer)
@@ -1362,7 +1544,7 @@ class Question(LoggedModel):
             try:
                 dt = dateutil.parser.parse(answer)
                 if is_naive(dt):
-                    dt = make_aware(dt, pytz.timezone(self.event.settings.timezone))
+                    dt = make_aware(dt, ZoneInfo(self.event.settings.timezone))
             except:
                 raise ValidationError(_('Invalid datetime input.'))
             else:
@@ -1407,7 +1589,9 @@ class QuestionOption(models.Model):
         super().save(*args, **kwargs)
 
     @staticmethod
-    def clean_identifier(event, code, instance=None, known=[]):
+    def clean_identifier(event, code, instance=None, known=None):
+        if known is None:
+            known = []
         qs = QuestionOption.objects.filter(question__event=event, identifier=code)
         if instance:
             qs = qs.exclude(pk=instance.pk)
@@ -1566,7 +1750,7 @@ class Quota(LoggedModel):
         count_waitinglist=True,
         _cache=None,
         allow_cache=False,
-    ) -> Tuple[int, int]:
+    ) -> tuple[int, int]:
         """
         This method is used to determine whether Products or ProductVariations belonging
         to this quota should currently be available for sale.

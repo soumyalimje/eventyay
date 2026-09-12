@@ -2,18 +2,22 @@ import json
 import logging
 import string
 from datetime import date, datetime, time
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.conf import settings
+from django.core.exceptions import PermissionDenied
 from django.core.validators import MinLengthValidator, RegexValidator
 from django.db import models, transaction
 from django.db.models import Exists, OuterRef, Q
+from django.db.models.signals import m2m_changed
+from django.dispatch import receiver
 from django.urls import reverse
 from django.utils.crypto import get_random_string
 from django.utils.functional import cached_property
 from django.utils.timezone import get_current_timezone, make_aware, now
 from django.utils.translation import gettext_lazy as _
-from django_scopes import scope
+from django_scopes import scope, scopes_disabled
 from rules.contrib.models import RulesModelBase, RulesModelMixin
 
 from eventyay.base.models.base import LoggedModel
@@ -32,7 +36,14 @@ from ..settings import settings_hierarkey
 from . import BillingInvoice
 from .auth import User
 
+
 logger = logging.getLogger(__name__)
+
+
+class TeamPermissionError(PermissionDenied):
+    """Raised when team access permission checks fail to preserve administrator access."""
+
+    pass
 
 
 def check_access_permissions(organizer):
@@ -44,8 +55,7 @@ def check_access_permissions(organizer):
     warnings = []
     teams = organizer.teams.all().annotate(member_count=models.Count('members')).filter(member_count__gt=0)
     if not [t for t in teams if t.can_change_teams]:
-        # TODO: Should use a concrete exception type
-        raise Exception(
+        raise TeamPermissionError(
             _(
                 'There must be at least one team with the permission to change teams, '
                 'as otherwise nobody can create new teams or grant permissions to existing teams.'
@@ -69,8 +79,7 @@ def check_access_permissions(organizer):
     for event in organizer.events.all():
         event_teams = teams.filter(models.Q(limit_events=event) | models.Q(all_events=True)).distinct()
         if not event_teams:
-            # TODO: Should use a concrete exception type
-            raise Exception(
+            raise TeamPermissionError(
                 str(
                     _(
                         'There must be at least one team with access to every event. '
@@ -148,6 +157,7 @@ class Organizer(LoggedModel, TimestampedModel, RulesModelMixin, models.Model, me
 
     class orga_urls(EventUrls):
         """URL patterns for organizer panel views of this organizer."""
+
         base_path = settings.BASE_PATH
         base = '{base_path}/orga/organizer/{self.slug}/'
         settings = '{base_path}/orga/organizer/{self.slug}/settings/'
@@ -207,7 +217,6 @@ class Organizer(LoggedModel, TimestampedModel, RulesModelMixin, models.Model, me
         this organizer, so you don't have to prefix your cache keys. In addition, the cache
         is being cleared every time the organizer changes.
         """
-        # FIXME: This "cache" module is missing.
         from eventyay.base.cache import ObjectRelatedCache
 
         return ObjectRelatedCache(self)
@@ -270,11 +279,24 @@ class Organizer(LoggedModel, TimestampedModel, RulesModelMixin, models.Model, me
             and not self.devices.exists()
         )
 
+    @scopes_disabled()
     def delete_sub_objects(self):
+        from django.db.models import ProtectedError
+
+        from eventyay.base.models.log import LogEntry
+
         for e in self.events.all():
             e.delete_sub_objects()
             e.delete()
-        self.teams.all().delete()
+        LogEntry.all.filter(api_token__team__organizer=self).update(api_token=None)
+        try:
+            self.teams.all().delete()
+        except ProtectedError as exc:
+            protected_labels = ', '.join(sorted({obj._meta.label for obj in exc.protected_objects})) or 'unknown'
+            logger.warning(
+                'Team deletion blocked for organizer %s by protected objects: %s', self.slug, protected_labels
+            )
+            raise
 
     def has_unpaid_invoice(self):
         # Check if Organizer has unpaid invoices which status is pending or expired
@@ -331,6 +353,8 @@ class Team(LoggedModel, TimestampedModel, RulesModelMixin, models.Model, metacla
     :type can_view_orders: bool
     :param can_change_orders: If ``True``, the members can change details of orders of the associated events.
     :type can_change_orders: bool
+    :param can_manage_bank_transfers: If ``True``, the members can import bank data and manage bank transfer refunds.
+    :type can_manage_bank_transfers: bool
     :param can_checkin_orders: If ``True``, the members can perform check-in related actions.
     :type can_checkin_orders: bool
     :param can_view_vouchers: If ``True``, the members can inspect details of all vouchers of the associated events.
@@ -364,9 +388,21 @@ class Team(LoggedModel, TimestampedModel, RulesModelMixin, models.Model, metacla
     can_manage_gift_cards = models.BooleanField(default=False, verbose_name=_('Can manage gift cards'))
 
     can_change_event_settings = models.BooleanField(default=False, verbose_name=_('Can change event settings'))
+    can_change_config = models.BooleanField(
+        default=False,
+        verbose_name=_('Can change config'),
+        help_text=_(
+            'Edit in-video Event Config such as theme, connection limits, and BBB defaults.'
+        ),
+    )
     can_change_items = models.BooleanField(default=False, verbose_name=_('Can change product settings'))
     can_view_orders = models.BooleanField(default=False, verbose_name=_('Can view orders'))
     can_change_orders = models.BooleanField(default=False, verbose_name=_('Can change orders'))
+    can_manage_bank_transfers = models.BooleanField(
+        default=False,
+        verbose_name=_('Can manage bank transfers'),
+        help_text=_('Import bank data and export refunds for bank transfer payments.'),
+    )
     can_checkin_orders = models.BooleanField(
         default=False,
         verbose_name=_('Can perform check-ins'),
@@ -378,29 +414,87 @@ class Team(LoggedModel, TimestampedModel, RulesModelMixin, models.Model, metacla
     can_view_vouchers = models.BooleanField(default=False, verbose_name=_('Can view vouchers'))
     can_change_vouchers = models.BooleanField(default=False, verbose_name=_('Can change vouchers'))
 
+    TEAMSHIFTS_ROLE_CHOICES = [
+        ('coordinator', _('Event Coordinator')),
+        ('lead', _('Team Lead')),
+    ]
+
+    teamshifts_role = models.CharField(
+        max_length=20,
+        choices=TEAMSHIFTS_ROLE_CHOICES,
+        default='',
+        blank=True,
+        verbose_name=_('TeamShifts role'),
+    )
+    all_teamshifts_roles = models.BooleanField(default=False, verbose_name=_('All teamshifts roles'))
+    limit_teamshifts_roles = models.JSONField(default=list, blank=True, verbose_name=_('Limit teamshifts roles'))
+    hide_teamshifts_emails = models.BooleanField(default=False, verbose_name=_('Hide email addresses'))
+
     def __str__(self) -> str:
         return _('%(name)s on %(object)s') % {
             'name': str(self.name),
             'object': str(self.organizer),
         }
 
+    PERMISSION_IMPLICATIONS = {
+        'can_change_orders': ('can_view_orders',),
+        'can_change_vouchers': ('can_view_vouchers',),
+        'can_manage_bank_transfers': ('can_view_orders',),
+    }
+
+    @classmethod
+    def _permission_field_names(cls) -> tuple:
+        cached = cls.__dict__.get('_permission_field_names_cache')
+        if cached is None:
+            cached = tuple(
+                field.name
+                for field in cls._meta.get_fields()
+                if isinstance(field, models.BooleanField)
+                and (field.name.startswith('can_') or field.name.startswith('is_'))
+            )
+            cls._permission_field_names_cache = cached
+        return cached
+
+    def _granted_permissions(self) -> set:
+        return {name for name in self._permission_field_names() if getattr(self, name) is True}
+
     def permission_set(self) -> set:
-        attribs = dir(self)
-        return {
-            attr
-            for attr in attribs
-            if (attr.startswith("can_") or attr.startswith("is_"))
-            and getattr(self, attr, False) is True
-            and self.has_permission(attr)
-        }
+        granted = self._granted_permissions()
+        implied = set()
+        for perm in granted:
+            implied.update(self.PERMISSION_IMPLICATIONS.get(perm, ()))
+        return granted | implied
 
     @property
     def can_change_settings(self):  # Legacy compatiblilty
         return self.can_change_event_settings
 
+    @property
+    def can_change_organiser_settings(self):
+        """British spelling alias used by Talk code and tests."""
+        return self.can_change_organizer_settings
+
+    @can_change_organiser_settings.setter
+    def can_change_organiser_settings(self, value):
+        self.can_change_organizer_settings = value
+
+    @property
+    def organiser(self):
+        """British spelling alias used by Talk code and tests."""
+        return self.organizer
+
+    @organiser.setter
+    def organiser(self, value):
+        self.organizer = value
+
     def has_permission(self, perm_name):
         try:
-            return getattr(self, perm_name)
+            if getattr(self, perm_name):
+                return True
+            for p, implications in self.PERMISSION_IMPLICATIONS.items():
+                if perm_name in implications and getattr(self, p):
+                    return True
+            return False
         except AttributeError:
             raise ValueError('Invalid required permission: %s' % perm_name)
 
@@ -420,7 +514,17 @@ class Team(LoggedModel, TimestampedModel, RulesModelMixin, models.Model, metacla
         rules_permissions = TEAM_PERMISSIONS
 
     # From Talk
-    limit_tracks = models.ManyToManyField(to='Track', verbose_name=_('Limit to tracks'), blank=True)
+    limit_tracks = models.ManyToManyField(
+        to='Track',
+        verbose_name=_('Restrict access to tracks'),
+        blank=True,
+        help_text=_(
+            'Limit this team to the selected tracks. Members only see proposals, sessions, '
+            'reviews, speakers, schedule data, exports, and API results for those tracks. '
+            'Leave empty for access to all tracks in the team’s events. '
+            'Configure tracks per event below.'
+        ),
+    )
     can_change_submissions = models.BooleanField(
         default=False,
         verbose_name=_('Reviewer Manager — can edit and manage submissions'),
@@ -428,23 +532,94 @@ class Team(LoggedModel, TimestampedModel, RulesModelMixin, models.Model, metacla
             'Can edit submission details, change proposal states (accept/reject/waitlist), '
             'manage submission metadata, and oversee the review workflow. '
             'This provides full management permissions beyond standard reviewing.'
-        )
+        ),
     )
     is_reviewer = models.BooleanField(
         default=False,
         verbose_name=_('Reviewer — can only review submissions'),
         help_text=_(
             'Can review and provide feedback on submissions but cannot edit details or change submission states.'
-        )
+        ),
     )
     force_hide_speaker_names = models.BooleanField(
-        verbose_name=_('Always hide speaker names'),
+        verbose_name=_('Always hide speaker details'),
         help_text=_(
-            'Normally, anonymisation is configured in the event review settings. '
-            'This setting will <strong>override the event settings</strong> '
-            'and always hide speaker names for this team.'
+            'Normally, speaker anonymisation follows each event’s review settings. '
+            'When enabled, this team <strong>always</strong> hides speaker names and details '
+            'in proposal and review views, exports, and API responses — even if the event '
+            'review phase would otherwise show them. Applies together with any track limits.'
         ),
         default=False,
+    )
+    force_hide_speaker_emails = models.BooleanField(
+        verbose_name=_('Always hide speaker emails only'),
+        help_text=_(
+            'When enabled, this team cannot see speaker email addresses in organiser views, '
+            'exports, or API responses, but can still see other speaker details (unless '
+            '“Always hide speaker details” is also enabled).'
+        ),
+        default=False,
+    )
+
+    can_change_exhibition_proposals = models.BooleanField(
+        default=False,
+        verbose_name=_('Reviewer Manager — can review and manage exhibitor proposals'),
+        help_text=_(
+            'Can review proposals and approve or reject exhibitor and sponsor applications. '
+            'This provides full proposal-management permissions beyond standard reviewing, '
+            'without granting access to the rest of the event setup.'
+        ),
+    )
+    is_exhibition_reviewer = models.BooleanField(
+        default=False,
+        verbose_name=_('Exhibitor Reviewer — can only review exhibitor proposals'),
+        help_text=_(
+            'Can review and provide feedback on exhibitor and sponsor proposals but cannot '
+            'approve, reject, or otherwise manage them.'
+        ),
+    )
+    hide_exhibition_applicant_emails = models.BooleanField(
+        default=False,
+        verbose_name=_('Hide emails of applicants'),
+        help_text=_(
+            'When enabled, Exhibitor Reviewers on this team cannot see the email addresses '
+            'of proposal applicants, but can still review the rest of the proposal.'
+        ),
+    )
+    can_manage_social_media = models.BooleanField(
+        default=False,
+        verbose_name=_('Can manage social media settings'),
+        help_text=_(
+            'Allows members of this team to connect social media accounts, '
+            'manage draft posts, and automate social media publications.'
+        ),
+    )
+
+
+    can_video_manage_content = models.BooleanField(
+        default=False,
+        verbose_name=_('Video: Can manage rooms and content'),
+        help_text=_(
+            'Create and edit stages and chat/video channels; edit and delete rooms.'
+        ),
+    )
+    can_video_moderate = models.BooleanField(
+        default=False,
+        verbose_name=_('Video: Can moderate users and engagement'),
+        help_text=_(
+            'Announce globally and in rooms; list and moderate users; moderate chat; '
+            'see room viewers; manage polls and Q&A; access BBB recordings.'
+        ),
+    )
+    can_video_manage_kiosks = models.BooleanField(
+        default=False,
+        verbose_name=_('Video: Can manage kiosks'),
+        help_text=_('Allows creating and editing kiosk displays inside Eventyay Video.'),
+    )
+    can_video_view_analytics = models.BooleanField(
+        default=False,
+        verbose_name=_('Video: Can view analytics'),
+        help_text=_('Allows viewing Eventyay Video statistics and analytics dashboards.'),
     )
 
     @cached_property
@@ -458,10 +633,19 @@ class Team(LoggedModel, TimestampedModel, RulesModelMixin, models.Model, metacla
             return self.organizer.events.all()
         return self.limit_events.all()
 
+    def get_orga_teams_tab_url(self, next_url=None):
+        """Unified organizer teams page with this team selected (permissions)."""
+        base = reverse('eventyay_common:organizer.teams', kwargs={'organizer': self.organizer.slug})
+        query = [('team', str(self.pk)), ('section', 'permissions')]
+        if next_url:
+            query.append(('next', next_url))
+        return f'{base}?{urlencode(query)}'
+
     class orga_urls(EventUrls):
         """URL patterns for organizer panel views of this team."""
-        base = '{self.organizer.orga_urls.teams}{self.pk}/'
-        delete = '{base}delete/'
+
+        base = '{self.organizer.orga_urls.teams}?team={self.pk}&section=permissions'
+        delete = '{self.organizer.orga_urls.base}team/{self.pk}/delete/'
 
 
 class TeamInvite(models.Model):
@@ -716,3 +900,27 @@ class OrganizerBillingModel(models.Model):
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
         self.organizer.cache.clear()
+
+
+@receiver(m2m_changed, sender=Team.members.through)
+@scopes_disabled()
+def handle_team_members_changed(sender, instance, action, reverse, pk_set, **kwargs):
+    if action in ('post_remove', 'post_clear'):
+        if reverse:
+            user = instance
+            if user.default_organizer_id and not user.teams.filter(organizer_id=user.default_organizer_id).exists():
+                User.objects.filter(pk=user.pk).update(default_organizer=None)
+        else:
+            team = instance
+            users_to_check = (
+                User.objects.filter(pk__in=pk_set, default_organizer=team.organizer)
+                if pk_set
+                else User.objects.filter(default_organizer=team.organizer)
+            )
+            users_with_other_teams = set(
+                Team.objects.filter(organizer=team.organizer, members__in=users_to_check)
+                .values_list('members', flat=True)
+            )
+            users_to_clear = [u.pk for u in users_to_check if u.pk not in users_with_other_teams]
+            if users_to_clear:
+                User.objects.filter(pk__in=users_to_clear).update(default_organizer=None)

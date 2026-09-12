@@ -1,0 +1,51 @@
+{% load i18n %}
+{% load event_tags %}
+{% load eventsignal %}
+
+<li class="nav-item">
+    <details class="dropdown fix-height" id="profile-dropdown">
+        {% with user_label=request.user|short_user_label %}
+            <summary class="header-nav" aria-label="{% translate 'User menu' %} - {{ user_label }}">
+                <i class="fa fa-user" aria-hidden="true"></i>
+                <span class="hidden-xs" aria-hidden="true">{{ user_label }}</span>
+                <i class="fa fa-caret-down ml-1 hidden-xs" aria-hidden="true"></i>
+            </summary>
+        {% endwith %}
+        <div class="dropdown-content dropdown-content-sw">
+            <a class="dropdown-item" href="{{ base_path }}/common/">
+                <i class="fa fa-tachometer"></i> {% translate "Dashboard" %}
+            </a>
+
+            <a class="dropdown-item" href="{{ base_path }}/common/orders/">
+                <i class="fa fa-shopping-cart"></i> {% translate "My orders" %}
+            </a>
+            {% signal "eventyay.common.signals.user_dashboard_links" request %}
+            <a class="dropdown-item" href="{{ base_path }}/common/sessions/">
+                <i class="fa fa-sticky-note-o"></i> {% translate "My sessions" %}
+            </a>
+            <a class="dropdown-item" href="{{ base_path }}/common/events/">
+                <i class="fa fa-calendar"></i> {% translate "My Events" %}
+            </a>
+            <a class="dropdown-item" href="{{ base_path }}/common/organizers/">
+                <i class="fa fa-users"></i> {% translate "Organizers" %}
+            </a>
+
+            <hr />
+
+            <a class="dropdown-item" href="{{ base_path }}/common/account/">
+                <i class="fa fa-user-circle"></i> {% translate "Account" %}
+            </a>
+            {% if request.user.is_staff and staff_session %}
+                <a class="dropdown-item" href="{{ base_path }}/admin/">
+                    <i class="fa fa-cog"></i> {% translate "Admin" %}
+                </a>
+            {% endif %}
+
+            <hr />
+
+            <a class="dropdown-item" href="{{ base_path }}/common/logout/?back={{ request.get_full_path|urlencode }}">
+                <i class="fa fa-sign-out"></i> {% translate "Logout" %}
+            </a>
+        </div>
+    </details>
+</li>

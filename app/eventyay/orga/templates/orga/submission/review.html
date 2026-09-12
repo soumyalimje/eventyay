@@ -3,6 +3,7 @@
 {% load compress %}
 {% load staff_session %}
 {% load i18n %}
+{% load presale_locale %}
 {% load rich_text %}
 {% load rules %}
 {% load static %}
@@ -14,6 +15,7 @@
     <script src="{% static "vendored/marked.min.js" %}" defer></script> {# do not compress #}
     <script defer src="{% static "vendored/purify.min.js" %}"></script>
     <script src="{% static "orga/js/reviewSubmission.js" %}" defer></script>
+    <script defer src="{% static 'cfp/js/talk_dependencies.js' %}"></script>
 {% endblock scripts %}
 
 {% block submission_content %}
@@ -33,7 +35,7 @@
             {% if request.event.settings.review_help_text %}
                 <div class="alert alert-info">
                     <div>
-                        <p>{{ request.event.settings.review_help_text|rich_text }}</p>
+                        <p>{{ request.event.settings.review_help_text|event_localize|rich_text }}</p>
                     </div>
                 </div>
             {% elif not form.instance.pk and not can_view_other_reviews and request.event.active_review_phase and request.event.active_review_phase.can_see_other_reviews == "after_review" %}
@@ -161,7 +163,22 @@
 
                 <div id="own-review" {% if form.instance.pk %}class="d-none"{% endif %}>
                     {% for score_field in form.get_score_fields %}
-                        {{ score_field.as_field_group }}
+                        <div class="form-group row">
+                            <label class="col-md-3 col-form-label text-md-right">
+                                {{ score_field.label }}
+                                {% if score_field.field.required %}*{% endif %}
+                            </label>
+                            <div class="col-md-9">
+                                {% for radio in score_field %}
+                                <div class="form-check form-check-inline">
+                                    {{ radio.tag }}
+                                    <label class="form-check-label" for="{{ radio.id_for_label }}">
+                                        {{ radio.choice_label }}
+                                    </label>
+                                </div>
+                                {% endfor %}
+                            </div>
+                        </div>
                     {% endfor %}
                     {{ qform }}
                     {{ form.text.as_field_group }}

@@ -20,6 +20,7 @@ from i18nfield.strings import LazyI18nString
 
 from eventyay.base.email import get_available_placeholders
 from eventyay.base.forms import I18nModelForm, PlaceholderValidator
+from eventyay.common.forms.fields import EmailBodyField
 from eventyay.base.forms.questions import WrappedPhoneNumberPrefixWidget
 from eventyay.base.forms.widgets import (
     DatePickerWidget,
@@ -125,6 +126,8 @@ class CancelForm(ForceQuotaConfirmationForm):
         required=False,
         max_digits=10,
         decimal_places=2,
+        min_value=Decimal('0.00'),
+        error_messages={'min_value': _('The cancellation fee cannot be negative.')},
         localize=True,
         label=_('Keep a cancellation fee of'),
         help_text=_(
@@ -178,6 +181,13 @@ class MarkPaidForm(ConfirmPaymentForm):
 class ExporterForm(forms.Form):
     def clean(self):
         data = super().clean()
+
+        if data.get('approval_pending_only') and data.get('paid_only'):
+            self.add_error('approval_pending_only', _('This option cannot be combined with only paid orders.'))
+            self.add_error('paid_only', _('This option cannot be combined with only approval pending orders.'))
+
+        if data.get('approval_pending_only') and 'include_payment_amounts' in data:
+            data['include_payment_amounts'] = False
 
         for k, v in data.items():
             if isinstance(v, models.Model):
@@ -505,27 +515,31 @@ class OrderLocaleForm(forms.ModelForm):
 class OrderMailForm(forms.Form):
     subject = forms.CharField(label=_('Subject'), required=True)
 
-    def _set_field_placeholders(self, fn, base_parameters):
-        phs = ['{%s}' % p for p in sorted(get_available_placeholders(self.order.event, base_parameters).keys())]
-        ht = _('Available placeholders: {list}').format(list=', '.join(phs))
+    def _placeholder_names(self, base_parameters: list[str]) -> list[str]:
+        return sorted(get_available_placeholders(self.order.event, base_parameters).keys())
+
+    def _add_placeholder_help_text(self, fn: str, placeholder_names: list[str]) -> None:
+        phs_display = ['{%s}' % p for p in placeholder_names]
+        ht = _('Available placeholders: {list}').format(list=', '.join(phs_display))
         if self.fields[fn].help_text:
             self.fields[fn].help_text += ' ' + str(ht)
         else:
             self.fields[fn].help_text = ht
-        self.fields[fn].validators.append(PlaceholderValidator(phs))
+        self.fields[fn].validators.append(PlaceholderValidator(phs_display))
 
     def __init__(self, *args, **kwargs):
         order = self.order = kwargs.pop('order')
         super().__init__(*args, **kwargs)
         self.fields['sendto'] = forms.EmailField(label=_('Recipient'), required=True, initial=order.email)
         self.fields['sendto'].widget.attrs['readonly'] = 'readonly'
-        self.fields['message'] = forms.CharField(
+        placeholder_names = self._placeholder_names(['event', 'order'])
+        self.fields['message'] = EmailBodyField(
             label=_('Message'),
             required=True,
-            widget=forms.Textarea,
-            initial=order.event.settings.mail_text_order_custom_mail.localize(order.locale),
+            placeholders=placeholder_names,
+            initial=str(order.event.settings.mail_text_order_custom_mail.localize(order.locale)),
         )
-        self._set_field_placeholders('message', ['event', 'order'])
+        self._add_placeholder_help_text('message', placeholder_names)
 
 
 class OrderPositionMailForm(OrderMailForm):
@@ -533,13 +547,14 @@ class OrderPositionMailForm(OrderMailForm):
         position = self.position = kwargs.pop('position')
         super().__init__(*args, **kwargs)
         self.fields['sendto'].initial = position.attendee_email
-        self.fields['message'] = forms.CharField(
+        placeholder_names = self._placeholder_names(['event', 'order', 'position'])
+        self.fields['message'] = EmailBodyField(
             label=_('Message'),
             required=True,
-            widget=forms.Textarea,
-            initial=self.order.event.settings.mail_text_order_custom_mail.localize(self.order.locale),
+            placeholders=placeholder_names,
+            initial=str(self.order.event.settings.mail_text_order_custom_mail.localize(self.order.locale)),
         )
-        self._set_field_placeholders('message', ['event', 'order', 'position'])
+        self._add_placeholder_help_text('message', placeholder_names)
 
 
 class OrderRefundForm(forms.Form):
@@ -655,6 +670,7 @@ class EventCancelForm(forms.Form):
         label=_('Keep a fixed cancellation fee'),
         max_digits=10,
         decimal_places=2,
+        min_value=Decimal('0.00'),
         required=False,
     )
     keep_fee_per_ticket = forms.DecimalField(
@@ -662,12 +678,15 @@ class EventCancelForm(forms.Form):
         help_text=_('Free tickets and add-on products are not counted'),
         max_digits=10,
         decimal_places=2,
+        min_value=Decimal('0.00'),
         required=False,
     )
     keep_fee_percentage = forms.DecimalField(
         label=_('Keep a percentual cancellation fee'),
         max_digits=10,
         decimal_places=2,
+        min_value=Decimal('0.00'),
+        max_value=Decimal('100.00'),
         required=False,
     )
     keep_fees = forms.MultipleChoiceField(

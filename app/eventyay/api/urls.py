@@ -8,13 +8,13 @@ from rest_framework import routers
 from eventyay.api.views import cart
 from eventyay.common.urls import OrganizerSlugConverter  # noqa: F401 (registers converter)
 
-from ..eventyay_common.views.billing import BillingInvoicePreview
 from .views import (
     access_code,
     checkin,
     device,
     event,
     exporters,
+    feedback,
     mail,
     oauth,
     order,
@@ -26,6 +26,7 @@ from .views import (
     schedule,
     speaker,
     speaker_information,
+    stream_schedule,
     submission,
     upload,
     user,
@@ -46,7 +47,6 @@ def talks_to_submissions_redirect(request, event, subpath):
 
     if query_string := request.META.get('QUERY_STRING', ''):
         new_path += f'?{query_string}'
-        new_path += '?' + query_string
 
     return HttpResponsePermanentRedirect(new_path)
 
@@ -100,17 +100,17 @@ event_router.register('rooms', room.RoomViewSet, basename='room')
 event_router.register('talkquestions', question.QuestionViewSet, basename='talkquestion')
 event_router.register('answers', question.AnswerViewSet, basename='answer')
 event_router.register('question-options', question.AnswerOptionViewSet, basename='question_option')
-event_router.register(
-    'speaker-information',
-    speaker_information.SpeakerInformationViewSet,
-    basename='speaker_information',
-)
+event_router.register('speaker-information', speaker_information.SpeakerInformationViewSet, basename='speaker_information')
+event_router.register('feedback', feedback.FeedbackViewSet, basename='feedback')
 
 checkinlist_router = routers.DefaultRouter()
 checkinlist_router.register(r'positions', checkin.CheckinListPositionViewSet, basename='checkinlistpos')
 
 question_router = routers.DefaultRouter()
 question_router.register(r'options', product.QuestionOptionViewSet)
+
+room_router = routers.DefaultRouter()
+room_router.register(r'stream-schedules', stream_schedule.StreamScheduleViewSet, basename='stream-schedule')
 
 product_router = routers.DefaultRouter()
 product_router.register(r'variations', product.ProductVariationViewSet)
@@ -130,6 +130,8 @@ for app in apps.get_app_configs():
         if importlib.util.find_spec(app.name + '.urls'):
             importlib.import_module(app.name + '.urls')
 
+importlib.import_module('eventyay.plugins.ticketoutputpdf.urls')
+
 urlpatterns = [
     path('', include(router.urls)),
     path('organizers/<orgslug:organizer>/', include(orga_router.urls)),
@@ -146,6 +148,31 @@ urlpatterns = [
         'organizers/<orgslug:organizer>/events/<slug:event>/settings/',
         event.EventSettingsView.as_view(),
         name='event.settings',
+    ),
+    path(
+        'organizers/<orgslug:organizer>/events/<slug:event>/publish-talks/',
+        event.EventPublishTalksView.as_view(),
+        name='event.publish-talks',
+    ),
+    path(
+        'organizers/<orgslug:organizer>/events/<slug:event>/publish-tickets/',
+        event.EventPublishTicketsView.as_view(),
+        name='event.publish-tickets',
+    ),
+    path(
+        'organizers/<orgslug:organizer>/events/<slug:event>/enable-manual-payment/',
+        event.EventEnableManualPaymentView.as_view(),
+        name='event.enable-manual-payment',
+    ),
+    path(
+        'organizers/<orgslug:organizer>/events/<slug:event>/speakers/import/',
+        speaker.SpeakerImportView.as_view(),
+        name='speaker.import',
+    ),
+    path(
+        'organizers/<orgslug:organizer>/events/<slug:event>/submissions/import/',
+        submission.SubmissionImportView.as_view(),
+        name='submission.import',
     ),
     path(
         'organizers/<orgslug:organizer>/events/<slug:event>/',
@@ -176,6 +203,10 @@ urlpatterns = [
         'organizers/<orgslug:organizer>/events/<slug:event>/orders/<int:order>/',
         include(order_router.urls),
     ),
+    path(
+        'organizers/<orgslug:organizer>/events/<slug:event>/rooms/<int:room_pk>/',
+        include(room_router.urls),
+    ),
     path('oauth/authorize', oauth.AuthorizationView.as_view(), name='authorize'),
     path('oauth/token', oauth.TokenView.as_view(), name='token'),
     path('oauth/revoke_token', oauth.RevokeTokenView.as_view(), name='revoke-token'),
@@ -185,6 +216,12 @@ urlpatterns = [
         name='device.initialize',
     ),
     path('device/update', device.UpdateView.as_view(), name='device.update'),
+    path('device/session', device.SessionView.as_view(), name='device.session'),
+    path(
+        'device/verify-setup-token',
+        device.VerifySetupTokenView.as_view(),
+        name='device.verify-setup-token',
+    ),
     path('device/roll', device.RollKeyView.as_view(), name='device.roll'),
     path('device/revoke', device.RevokeKeyView.as_view(), name='device.revoke'),
     path(
@@ -195,12 +232,8 @@ urlpatterns = [
     path('upload', upload.UploadView.as_view(), name='upload'),
     path('me', user.MeView.as_view(), name='user.me'),
     path('version', version.VersionView.as_view(), name='version'),
-    path(
-        'billing-testing/<task>',
-        BillingInvoicePreview.as_view(),
-        name='billing-testing',
-    ),
     path('webhook/stripe', stripe_webhook_view, name='stripe-webhook'),
+    path('webhook/stripe/', stripe_webhook_view, name='stripe-webhook-slash'),
     path(
         '<orgslug:organizer>/<slug:event>/schedule-public',
         event.talk_schedule_public,
@@ -230,9 +263,18 @@ urlpatterns = [
         submission.favourite_view,
         name='submission.favourite',
     ),
-    path('events/<slug:event>/', include(event_router.urls)),
+    path(
+        'events/<slug:event>/submissions/favourites/merge/',
+        submission.favourites_merge_view,
+        name='submission.favourites.merge',
+    ),
+    path(
+        'events/<slug:event>/rooms/<int:room_pk>/',
+        include(room_router.urls),
+    ),
     path(
         'events/<slug:event>/favourite-talk/',
         submission.SubmissionFavouriteDeprecatedView.as_view(),
     ),
+    path('events/<slug:event>/', include(event_router.urls)),
 ]

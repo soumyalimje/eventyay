@@ -7,7 +7,8 @@ from os.path import dirname
 from urllib.parse import urljoin
 
 import dateutil.parser
-import pytz
+import datetime
+from zoneinfo import ZoneInfo
 from django.core.exceptions import PermissionDenied
 from django.db.models import Max, Min, Q, Sum
 from django.db.models.functions import TruncMinute
@@ -182,9 +183,9 @@ def build_room_view_fig(fig, room, begin, end, tz):
                 )
                 emoji_axs[i].imshow(emoji_img)
                 emoji_axs[i].axis("off")
-        ax.set_title(room.name)
+        ax.set_title(str(room.name))
     else:
-        ax.set_title(room.title)
+        ax.set_title(str(getattr(room, 'title', getattr(room, 'name', 'Room'))))
 
     fig.autofmt_xdate()
     ax.xaxis.set_major_formatter(dates.DateFormatter("%d. %H:%M", tz=tz))
@@ -196,7 +197,7 @@ class RoomAttendanceGraphView(GraphView):
         return get_object_or_404(self.event.rooms, pk=self.request.GET.get("room"))
 
     def build(self):
-        tz = pytz.timezone(self.event.timezone)
+        tz = ZoneInfo(self.event.timezone)
 
         begin = self.room.views.aggregate(min=Min("start"))["min"]
         end = self.room.views.aggregate(max=Max("end"))["max"]
@@ -214,8 +215,8 @@ class RoomAttendanceGraphView(GraphView):
                 pass
 
         if is_naive(begin):
-            begin = tz.localize(begin)
+            begin = begin.replace(tzinfo=tz)
         if is_naive(end):
-            end = tz.localize(end)
+            end = end.replace(tzinfo=tz)
         end = max(end, begin + timedelta(minutes=1))
         build_room_view_fig(self.fig, self.room, begin, end, tz)

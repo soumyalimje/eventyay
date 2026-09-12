@@ -1,0 +1,43 @@
+.product-hidden {
+  display: none;
+}
+
+.order-product-list:hover .product-hidden {
+  display: list-item;
+}
+
+.order-product-list:hover .product-ellipsis {
+  display: none;
+}
+
+@media (max-width: 767px) {
+  .orders-search-actions {
+    width: 100%;
+  }
+
+  .orders-search-actions .btn {
+    flex: 1 1 auto;
+  }
+
+  .orders-search {
+    flex-direction: column;
+  }
+  
+  .orders-advanced-grid {
+    flex-wrap: wrap;
+  }
+}
+
+.orders-user-cell {
+  word-break: break-word;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  max-width: 180px;
+}
+
+.orders-email-cell {
+  word-break: break-all;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  max-width: 220px;
+}

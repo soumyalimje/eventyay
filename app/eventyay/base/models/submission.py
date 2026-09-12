@@ -6,8 +6,10 @@ from itertools import repeat
 
 from django.conf import settings
 from django.core.validators import MinValueValidator
-from django.db import models
+from django.db import models, transaction
 from django.db.models import JSONField, Q
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from django.db.models.fields.files import FieldFile
 from django.shortcuts import get_object_or_404
 from django.utils.crypto import get_random_string
@@ -21,10 +23,12 @@ from rest_framework import serializers
 
 from eventyay.base.models import Choices, User
 from eventyay.common.exceptions import SubmissionError
+from eventyay.common.language import LANGUAGE_NAMES
 from eventyay.common.text.path import path_with_hash
 from eventyay.common.text.phrases import phrases
 from eventyay.common.text.serialize import serialize_duration
 from eventyay.common.urls import EventUrls
+from eventyay.submission.constants import AUTO_DRAFT_TITLE
 from eventyay.submission.signals import submission_state_change
 from eventyay.talk_rules.agenda import (
     event_uses_feedback,
@@ -106,6 +110,7 @@ class SubmissionStates(Choices):
     }
 
     accepted_states = (ACCEPTED, CONFIRMED)
+    terminal_states = (REJECTED, DELETED, CANCELED, WITHDRAWN)
 
     @staticmethod
     def get_color(state):
@@ -259,6 +264,13 @@ class Submission(GenerateCode, PretalxModel):
         verbose_name=_('Show this session in public list of featured sessions.'),
     )
     do_not_record = models.BooleanField(default=False, verbose_name=_('Don’t record this session.'))
+    etherpad_url = models.URLField(
+        max_length=500,
+        null=True,
+        blank=True,
+        verbose_name=_('Etherpad URL'),
+        help_text=_('Collaborative notes pad for this session. Notes are hosted on the configured Etherpad instance.'),
+    )
     image = models.ImageField(
         null=True,
         blank=True,
@@ -326,9 +338,15 @@ class Submission(GenerateCode, PretalxModel):
         confirm = '{user_base}confirm'
         public_base = '{self.event.urls.base}talk/{self.code}'
         public = '{public_base}/'
+        wip_public = '{self.event.urls.base}schedule/v/wip/talk/{self.code}/'
         feedback = '{public}feedback/'
         social_image = '{public}og-image'
         ical = '{public_base}.ics'
+        export_json = '{public_base}.json'
+        export_xml = '{public_base}.xml'
+        export_xcal = '{public_base}.xcal'
+        export_google_calendar = '{public}export/google-calendar'
+        export_webcal = '{public}export/webcal'
         image = '{self.image_url}'
         invite = '{user_base}invite'
         accept_invitation = '{self.event.urls.base}invitation/{self.code}/{self.invitation_token}'
@@ -336,7 +354,8 @@ class Submission(GenerateCode, PretalxModel):
 
     class orga_urls(EventUrls):
         """URL patterns for organizer panel views of this submission."""
-        base = edit = '{self.event.orga_urls.submissions}{self.code}/'
+        base = '{self.event.orga_urls.submissions}{self.code}/'
+        edit = '{base}edit'
         make_submitted = '{base}submit'
         accept = '{base}accept'
         reject = '{base}reject'
@@ -349,11 +368,13 @@ class Submission(GenerateCode, PretalxModel):
         reviews = '{base}reviews/'
         feedback = '{base}feedback/'
         toggle_featured = '{base}toggle_featured'
+        video_link = '{base}video'
         apply_pending = '{base}apply_pending'
         anonymise = '{base}anonymise/'
         comments = '{base}comments/'
         quick_schedule = '{self.event.orga_urls.schedule}quick/{self.code}/'
         history = '{base}history/'
+        etherpad_generate = '{base}etherpad/generate'
 
     @property
     def image_url(self):
@@ -402,6 +423,7 @@ class Submission(GenerateCode, PretalxModel):
             self.answers.filter(
                 Q(question__submission_types__in=[self.submission_type]) | Q(question__submission_types__isnull=True),
                 question__is_public=True,
+                question__active=True,
                 question__event=self.event,
                 question__target=TalkQuestionTarget.SUBMISSION,
             )
@@ -410,7 +432,7 @@ class Submission(GenerateCode, PretalxModel):
         )
         if self.track:
             qs = qs.filter(Q(question__tracks__in=[self.track]) | Q(question__tracks__isnull=True))
-        return []
+        return qs
 
     def get_duration(self) -> int:
         """Returns this submission's duration in minutes.
@@ -479,14 +501,11 @@ class Submission(GenerateCode, PretalxModel):
             old_state = self.state
             self.state = new_state
             self.pending_state = None
-            if new_state in (
-                SubmissionStates.REJECTED,
-                SubmissionStates.DELETED,
-                SubmissionStates.CANCELED,
-                SubmissionStates.WITHDRAWN,
-            ):
+            update_fields = ['state', 'pending_state']
+            if new_state in SubmissionStates.terminal_states:
                 self.is_featured = False
-            self.save(update_fields=['state', 'pending_state'])
+                update_fields.append('is_featured')
+            self.save(update_fields=update_fields)
             self.update_talk_slots()
             submission_state_change.send_robust(
                 self.event,
@@ -580,7 +599,7 @@ class Submission(GenerateCode, PretalxModel):
                 'submission': self,
             },
             context={
-                'full_submission_content': self.get_content_for_mail(),
+                'full_submission_content': self.get_content_for_mail(locale=locale),
             },
             skip_queue=True,
             commit=True,  # Send immediately, but save a record
@@ -591,18 +610,41 @@ class Submission(GenerateCode, PretalxModel):
             template.text = template_text
             template.save()
         if self.event.mail_settings['mail_on_new_submission']:
-            self.event.get_mail_template(MailTemplateRoles.NEW_SUBMISSION_INTERNAL).to_mail(
-                user=self.event.email,
-                event=self.event,
-                context_kwargs={
-                    'user': person,
-                    'submission': self,
-                },
-                context={'orga_url': self.orga_urls.base.full()},
-                skip_queue=True,
-                commit=False,  # Send immediately, don't save a record
-                locale=self.event.locale,
+            admin_emails = list(
+                filter(None, (
+                    self.event.teams.filter(can_change_event_settings=True)
+                    .values_list('members__email', flat=True)
+                    .distinct()
+                ))
             )
+            admin_emails = [e for e in admin_emails if e and e.strip()]
+            if not admin_emails:
+                fallback_source = (
+                    self.event.settings.get('mail_reply_to')
+                    or self.event.organizer.settings.get('contact_mail')
+                    or self.event.settings.mail_from
+                )
+                if fallback_source:
+                    raw_fallback = next(
+                        (a.strip() for a in fallback_source.split(',') if a.strip()),
+                        None,
+                    )
+                    if raw_fallback:
+                        admin_emails = [raw_fallback]
+
+            for admin_email in admin_emails:
+                self.event.get_mail_template(MailTemplateRoles.NEW_SUBMISSION_INTERNAL).to_mail(
+                    user=admin_email,
+                    event=self.event,
+                    context_kwargs={
+                        'user': person,
+                        'submission': self,
+                    },
+                    context={'orga_url': self.orga_urls.base.full()},
+                    skip_queue=True,
+                    commit=False,
+                    locale=self.event.locale,
+                )
 
     def make_submitted(
         self,
@@ -618,7 +660,7 @@ class Submission(GenerateCode, PretalxModel):
             self.send_initial_mails(person=person)
         else:
             self.log_action(
-                'pretalx.submission.make_submitted',
+                'eventyay.submission.make_submitted',
                 person=person,
                 orga=orga,
                 data={'previous': previous, 'from_pending': from_pending},
@@ -637,7 +679,7 @@ class Submission(GenerateCode, PretalxModel):
         previous = self.state
         self._set_state(SubmissionStates.CONFIRMED, force, person=person)
         self.log_action(
-            'pretalx.submission.confirm',
+            'eventyay.submission.confirm',
             person=person,
             orga=orga,
             data={'previous': previous, 'from_pending': from_pending},
@@ -660,7 +702,7 @@ class Submission(GenerateCode, PretalxModel):
         previous = self.state
         self._set_state(SubmissionStates.ACCEPTED, force, person=person)
         self.log_action(
-            'pretalx.submission.accept',
+            'eventyay.submission.accept',
             person=person,
             orga=True,
             data={'previous': previous, 'from_pending': from_pending},
@@ -685,7 +727,7 @@ class Submission(GenerateCode, PretalxModel):
         previous = self.state
         self._set_state(SubmissionStates.REJECTED, force, person=person)
         self.log_action(
-            'pretalx.submission.reject',
+            'eventyay.submission.reject',
             person=person,
             orga=True,
             data={'previous': previous, 'from_pending': from_pending},
@@ -717,7 +759,10 @@ class Submission(GenerateCode, PretalxModel):
         return self.event.locale
 
     def get_content_locale_display(self):
-        return str(dict(self.event.named_content_locales)[self.content_locale])
+        locales = dict(self.event.named_content_locales)
+        if self.content_locale in locales:
+            return str(locales[self.content_locale])
+        return str(LANGUAGE_NAMES.get(self.content_locale, self.content_locale))
 
     def send_state_mail(self):
         from .mail import MailTemplateRoles
@@ -750,7 +795,7 @@ class Submission(GenerateCode, PretalxModel):
         previous = self.state
         self._set_state(SubmissionStates.CANCELED, force, person=person)
         self.log_action(
-            'pretalx.submission.cancel',
+            'eventyay.submission.cancel',
             person=person,
             orga=True,
             data={'previous': previous, 'from_pending': from_pending},
@@ -769,7 +814,7 @@ class Submission(GenerateCode, PretalxModel):
         previous = self.state
         self._set_state(SubmissionStates.WITHDRAWN, force, person=person)
         self.log_action(
-            'pretalx.submission.withdraw',
+            'eventyay.submission.withdraw',
             person=person,
             orga=orga,
             data={'previous': previous, 'from_pending': from_pending},
@@ -790,7 +835,7 @@ class Submission(GenerateCode, PretalxModel):
         for answer in self.answers.all():
             answer.remove(person=person, force=force)
         self.log_action(
-            'pretalx.submission.deleted',
+            'eventyay.submission.deleted',
             person=person,
             orga=True,
             data={'previous': previous, 'from_pending': from_pending},
@@ -869,9 +914,15 @@ class Submission(GenerateCode, PretalxModel):
         """Helper method for a consistent speaker name display."""
         return ', '.join(speaker.get_display_name() for speaker in self.speakers.all())
 
+    @property
+    def display_title(self):
+        if self.title == AUTO_DRAFT_TITLE:
+            return _('Untitled draft')
+        return self.title
+
     @cached_property
     def display_title_with_speakers(self):
-        title = f'{phrases.base.quotation_open}{self.title}{phrases.base.quotation_close}'
+        title = f'{phrases.base.quotation_open}{self.display_title}{phrases.base.quotation_close}'
         if not self.speakers.exists():
             return title
         return _('{title_in_quotes} by {list_of_speakers}').format(
@@ -949,43 +1000,55 @@ class Submission(GenerateCode, PretalxModel):
         all_availabilities = self.event.availabilities.filter(person__in=self.speaker_profiles)
         return Availability.intersection(all_availabilities)
 
-    def get_content_for_mail(self):
-        order = [
-            'title',
-            'abstract',
-            'description',
-            'notes',
-            'duration',
-            'content_locale',
-            'do_not_record',
-            'image',
-        ]
-        data = []
-        result = ''
-        for field in order:
-            field_content = getattr(self, field, None)
-            if field_content:
-                _field = self._meta.get_field(field)
-                field_name = _field.verbose_name or _field.name
-                data.append({'name': field_name, 'value': field_content})
-        for answer in self.answers.all().order_by('question__position'):
-            if answer.question.variant == 'boolean':
-                data.append({'name': answer.question.question, 'value': answer.boolean_answer})
-            elif answer.answer_file:
-                data.append({'name': answer.question.question, 'value': answer.answer_file})
-            else:
-                data.append({'name': answer.question.question, 'value': answer.answer or '-'})
-        for content in data:
-            field_name = content['name']
-            field_content = content['value']
-            if isinstance(field_content, bool):
-                field_content = _('Yes') if field_content else _('No')
-            elif isinstance(field_content, FieldFile):
-                field_content = (self.event.custom_domain or settings.SITE_URL) + field_content.url
-            result += f'**{field_name}**: {field_content}\n\n'
-        return result
+    def get_content_for_mail(self, locale=None):
+        locale = locale or self.get_email_locale()
+        with override(locale):
+            order = [
+                'title',
+                'abstract',
+                'description',
+                'notes',
+                'duration',
+                'content_locale',
+                'do_not_record',
+                'image',
+            ]
+            data = []
+            info_step_config = self.event.cfp_flow.config.get('steps', {}).get('info', {})
+            info_fields = {
+                field_key: field
+                for field in info_step_config.get('fields', [])
+                if isinstance(field, dict) and (field_key := field.get('key'))
+            }
 
-    def add_speaker(self, email, name=None, locale=None, user=None):
+            for field in order:
+                field_content = getattr(self, field, None)
+                if field_content:
+                    _field = self._meta.get_field(field)
+                    field_name = _field.verbose_name or _field.name
+                    if field in info_fields and info_fields[field].get('label'):
+                        field_name = str(info_fields[field]['label'])
+                    data.append({'name': field_name, 'value': field_content})
+            for answer in self.answers.select_related('question').order_by('question__position'):
+                if answer.question.variant == 'boolean':
+                    data.append({'name': answer.question.question, 'value': answer.boolean_answer})
+                elif answer.answer_file:
+                    data.append({'name': answer.question.question, 'value': answer.answer_file})
+                else:
+                    data.append({'name': answer.question.question, 'value': answer.answer or '-'})
+
+            result = ''
+            for content in data:
+                field_name = content['name']
+                field_content = content['value']
+                if isinstance(field_content, bool):
+                    field_content = _('Yes') if field_content else _('No')
+                elif isinstance(field_content, FieldFile):
+                    field_content = (self.event.custom_domain or settings.SITE_URL) + field_content.url
+                result += f'**{field_name}**: {field_content}\n\n'
+            return result
+
+    def add_speaker(self, email, name=None, locale=None, user=None, biography=None):
         from eventyay.common.urls import build_absolute_uri
 
         from .auth import User
@@ -1011,6 +1074,12 @@ class Submission(GenerateCode, PretalxModel):
                 kwargs={'organizer': self.event.organizer.slug, 'event': self.event.slug, 'token': speaker.pw_reset_token},
             )
 
+        if biography:
+            profile = SpeakerProfile.objects.get(user=speaker, event=self.event)
+            if not profile.biography:
+                profile.biography = biography
+                profile.save(update_fields=['biography'])
+
         self.speakers.add(speaker)
         self.log_action('eventyay.submission.speakers.add', person=user, orga=True)
         context['user'] = speaker
@@ -1029,6 +1098,13 @@ class Submission(GenerateCode, PretalxModel):
     def remove_speaker(self, speaker, orga=True, user=None):
         if self.speakers.filter(code=speaker.code).exists():
             self.speakers.remove(speaker)
+            from eventyay.agenda.views.utils import (
+                clear_featured_speakers_without_active_submissions,
+                clear_schedule_caches,
+            )
+
+            clear_featured_speakers_without_active_submissions(self.event, [speaker])
+            clear_schedule_caches(self.event, speaker=speaker)
             self.log_action(
                 'eventyay.submission.speakers.remove',
                 person=user or speaker,
@@ -1036,7 +1112,7 @@ class Submission(GenerateCode, PretalxModel):
                 data={
                     'code': speaker.code,
                     'email': speaker.email,
-                    'name': speaker.name,
+                    'name': speaker.fullname,
                 },
             )
 
@@ -1120,3 +1196,22 @@ class SubmissionFavourite(PretalxModel):
 
     class Meta:
         unique_together = (('user', 'submission'),)
+
+
+@receiver(post_save, sender=Submission)
+def invalidate_schedule_cache_on_submission_change(sender, instance, **kwargs):
+    from eventyay.base.models.slot import TalkSlot
+    from eventyay.base.services.stale_cache import bump_schedule_cache_version_on_commit
+
+    if kwargs.get('created'):
+        return
+
+    event_id = instance.event_id
+    if not event_id:
+        return
+    if not TalkSlot.objects.filter(
+        submission_id=instance.pk,
+        schedule__version__isnull=False,
+    ).exists():
+        return
+    bump_schedule_cache_version_on_commit(event_id)

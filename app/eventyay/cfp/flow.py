@@ -4,17 +4,18 @@ import logging
 from collections import OrderedDict
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import login
 from django.core.files.storage import FileSystemStorage
 from django.core.files.uploadedfile import UploadedFile
-from django.db.models import Q
 from django.forms import ValidationError
 from django.http import HttpResponseNotAllowed
 from django.shortcuts import redirect
 from django.urls import reverse
+from django.utils.datastructures import MultiValueDict
 from django.utils.functional import Promise, cached_property
 from django.utils.translation import gettext
 from django.utils.translation import gettext_lazy as _
@@ -22,19 +23,29 @@ from django.views.generic.base import TemplateResponseMixin
 from i18nfield.strings import LazyI18nString
 from i18nfield.utils import I18nJSONEncoder
 
-from eventyay.cfp.signals import cfp_steps
-from eventyay.common.exceptions import SendMailException
-from eventyay.common.language import language
-from eventyay.common.text.phrases import phrases
-from eventyay.person.forms import SpeakerProfileForm, UserForm
-from eventyay.base.models import User
-from eventyay.submission.forms import InfoForm, TalkQuestionsForm
 from eventyay.base.models import (
-    TalkQuestionTarget,
     SubmissionStates,
     SubmissionType,
     Track,
+    User,
 )
+from eventyay.cfp.signals import cfp_steps
+from eventyay.common.exceptions import SendMailException
+from eventyay.common.language import language
+from eventyay.common.social_links import get_social_link_value
+from eventyay.common.text.phrases import phrases
+from eventyay.person.forms import (
+    SpeakerProfileForm,
+    UserForm,
+    build_speaker_social_links_formset,
+    cleaned_social_links_from_formset,
+    formset_has_social_links,
+    social_link_prefixes,
+    social_links_formset_initial,
+)
+from eventyay.submission.constants import AUTO_DRAFT_TITLE
+from eventyay.submission.forms import InfoForm
+
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +64,15 @@ def i18n_string(data, locales):
         english = data.get('en', '')
 
     for locale in locales:
-        if locale != 'en' and not data.get(locale):
-            with language(locale):
-                data[locale] = gettext(english)
+        if locale != 'en':
+            stored = data.get(locale, '')
+            # Re-evaluate if missing OR if the stored value is identical to English,
+            # which indicates a failed gettext lookup that was cached as a fallback.
+            if not stored or stored == english:
+                with language(locale):
+                    translation = gettext(english)
+                    if translation != english:
+                        data[locale] = translation
     return LazyI18nString(data)
 
 
@@ -182,6 +199,7 @@ class BaseCfPStep:
         self.__dict__.update(state)
         self.request = None
 
+
 class TemplateFlowStep(TemplateResponseMixin, BaseCfPStep):
     template_name = 'cfp/event/submission_base.html'
 
@@ -211,22 +229,104 @@ class TemplateFlowStep(TemplateResponseMixin, BaseCfPStep):
 
 class FormFlowStep(TemplateFlowStep):
     form_class = None
-    file_storage = FileSystemStorage(str(Path(settings.MEDIA_ROOT) / 'cfp_uploads'))
+    file_storage = FileSystemStorage(
+        str(Path(settings.MEDIA_ROOT) / 'cfp_uploads'),
+        base_url=f'{settings.MEDIA_URL.rstrip("/")}/cfp_uploads/',
+    )
 
     def get_form_initial(self):
         initial_data = self.cfp_session.get('initial', {}).get(self.identifier, {})
         previous_data = self.cfp_session.get('data', {}).get(self.identifier, {})
-        return copy.deepcopy({**initial_data, **previous_data})
+        form_initial = copy.deepcopy({**initial_data, **previous_data})
+
+        saved_files = self.cfp_session.get('files', {}).get(self.identifier, {})
+        for field, file_data in saved_files.items():
+            entries = file_data if isinstance(file_data, list) else [file_data]
+
+            is_multiple = field.endswith('_files')
+
+            if is_multiple:
+                resources = []
+                for entry in entries:
+                    resources.append(
+                        SimpleNamespace(
+                            filename=entry['name'],
+                            url=self.file_storage.url(entry['tmp_name']),
+                            pk='tmp:' + entry['tmp_name'],
+                            link='',
+                        )
+                    )
+                form_initial[field] = resources
+            else:
+                # Single file field (ImageField, ExtensionFileField)
+                entry = entries[0] if entries else None
+                if entry:
+                    form_initial[field] = SimpleNamespace(
+                        name=entry['name'],
+                        url=self.file_storage.url(entry['tmp_name']),
+                    )
+
+        return form_initial
 
     def get_form(self, from_storage=False):
-        if self.request.method == 'GET' or from_storage:
+        # Process get_files() before rebuilding POST initial data
+        # so cleared file values are pruned from session beforehand.
+        session_files = self.get_files() if self.request.method == 'POST' else None
+
+        # Cache form initial data to avoid repeated work
+        form_initial = self.get_form_initial()
+
+        if self.request.method == 'GET':
+            # For initial GET requests, use an unbound form populated from session data
+            # This shows saved values but intentionally does not display validation errors
             return self.form_class(
-                data=self.get_form_initial() if from_storage else None,
-                initial=self.get_form_initial(),
-                files=self.get_files(),
+                data=None,
+                initial=form_initial,
+                files=None,
                 **self.get_form_kwargs(),
             )
-        return self.form_class(data=self.request.POST, files=self.request.FILES, **self.get_form_kwargs())
+        if from_storage:
+            # Use distinct copies for bound data vs. initial values to avoid
+            # in-form mutations (some forms tweak the ``initial`` dict).
+            # Sharing the same object caused saved form data to be wiped when
+            # a form updated ``initial`` entries, which then also changed the
+            # bound data reference.
+            form_data = copy.deepcopy(form_initial)
+            form_initial = copy.deepcopy(form_initial)
+            # For validation checks, create a bound form with session data
+            return self.form_class(
+                data=form_data,
+                initial=form_initial,
+                files=session_files or self.get_files(),
+                **self.get_form_kwargs(),
+            )
+
+        # For POST requests, merge new uploads with existing session files
+        # This allows users to navigate back without losing previously uploaded files
+        session_files = session_files or MultiValueDict()
+
+        # Preserve MultiValueDict semantics for proper multi-file field support
+        files = MultiValueDict()
+        # Add session files first
+        for field, file_list in session_files.lists():
+            files.setlist(field, file_list)
+        # For single-file fields, new uploads replace the session file.
+        # For multi-file fields (e.g. slides_files), HTML file inputs only
+        # submit the newly selected files, so we must *append* them to the
+        # existing session files rather than overwriting.
+        for field, file_list in self.request.FILES.lists():
+            if field.endswith('_files'):
+                for f in file_list:
+                    files.appendlist(field, f)
+            else:
+                files.setlist(field, file_list)
+
+        return self.form_class(
+            data=self.request.POST,
+            files=files,
+            initial=form_initial,
+            **self.get_form_kwargs(),
+        )
 
     def is_completed(self, request):
         self.request = request
@@ -234,25 +334,38 @@ class FormFlowStep(TemplateFlowStep):
 
     def get_context_data(self, **kwargs):
         result = super().get_context_data(**kwargs)
-        result['form'] = self.get_form()
+        result.setdefault('form', self.get_form())
         previous_data = self.cfp_session.get('data')
-        result['submission_title'] = previous_data.get('info', {}).get('title')
+        submission_title = previous_data.get('info', {}).get('title')
+        result['submission_title'] = '' if submission_title == AUTO_DRAFT_TITLE else submission_title
         return result
 
     def post(self, request):
         self.request = request
         form = self.get_form()
+        action = request.POST.get('action', 'submit')
+
+        # For "back" action, only save data if form is valid
+        if action == 'back':
+            if form.is_valid():
+                self.set_data(form.cleaned_data)
+            # Always save files if present
+            if form.files:
+                self.set_files(form.files)
+            prev_url = self.get_prev_url(request)
+            return redirect(prev_url) if prev_url else redirect(request.path)
+
+        # For "submit" and "draft" actions, validate as before
         if not form.is_valid():
-            error_message = '\n\n'.join(
-                (f'{form.fields[key].label}: ' if key != '__all__' else '') + ' '.join(values)
-                for key, values in form.errors.items()
-            )
-            messages.error(self.request, error_message)
-            return self.get(request)
+            warning_messages = getattr(form, 'warning_messages', None) or []
+            for warning in filter(None, warning_messages):
+                messages.warning(self.request, warning)
+            form.hide_top_errors = True
+            return self.render(form=form)
         self.set_data(form.cleaned_data)
         self.set_files(form.files)
         next_url = self.get_next_url(request)
-        return redirect(next_url) if next_url else None
+        return redirect(next_url) if next_url else redirect(request.path)
 
     def set_data(self, data):
         self.cfp_session['data'][self.identifier] = json.loads(
@@ -264,26 +377,68 @@ class FormFlowStep(TemplateFlowStep):
 
     def get_files(self):
         saved_files = self.cfp_session['files'].get(self.identifier, {})
-        files = {}
-        for field, field_dict in saved_files.items():
-            field_dict = field_dict.copy()
-            tmp_name = field_dict.pop('tmp_name')
-            files[field] = UploadedFile(file=self.file_storage.open(tmp_name), **field_dict)
+        files = MultiValueDict()
+
+        # Iterate over a list so we can mutate saved_files safely
+        for field, field_dict in list(saved_files.items()):
+            field_entries = field_dict if isinstance(field_dict, list) else [field_dict]
+
+            is_cleared = False
+            clear_ids = []
+            if getattr(self, 'request', None) and self.request.method == 'POST':
+                if self.request.POST.get(f'{field}-clear'):
+                    is_cleared = True
+                if field.endswith('_files'):
+                    base_field = field[:-6]
+                    clear_ids = self.request.POST.getlist(f'{base_field}_clear_ids')
+
+            retained_entries = []
+            for entry in field_entries:
+                field_entry = entry.copy()
+                tmp_name = field_entry.pop('tmp_name')
+
+                if is_cleared or tmp_name in clear_ids or f'tmp:{tmp_name}' in clear_ids:
+                    # Prune matching session entries before saving files
+                    continue
+
+                retained_entries.append(entry)
+                uf = UploadedFile(file=self.file_storage.open(tmp_name), **field_entry)
+                uf.is_session_file = True
+                files.appendlist(field, uf)
+
+            # If any entries were cleared, update the session record immediately
+            if len(retained_entries) != len(field_entries):
+                if not retained_entries:
+                    del saved_files[field]
+                else:
+                    saved_files[field] = retained_entries if isinstance(field_dict, list) else retained_entries[0]
+                self.cfp_session['files'][self.identifier] = saved_files
+
         return files or None
 
     def set_files(self, files):
-        for field, field_file in files.items():
-            tmp_filename = self.file_storage.save(field_file.name, field_file)
-            file_dict = {
-                'tmp_name': tmp_filename,
-                'name': field_file.name,
-                'content_type': field_file.content_type,
-                'size': field_file.size,
-                'charset': field_file.charset,
-            }
-            data = self.cfp_session['files'].get(self.identifier, {})
-            data[field] = file_dict
-            self.cfp_session['files'][self.identifier] = data
+        data = self.cfp_session['files'].get(self.identifier, {})
+
+        # Remove fields that were fully cleared and are no longer in `files`
+        for field in list(data.keys()):
+            if field not in files:
+                del data[field]
+
+        for field, field_files in files.lists():
+            file_entries = []
+            for field_file in field_files:
+                tmp_filename = self.file_storage.save(field_file.name, field_file)
+                file_entries.append(
+                    {
+                        'tmp_name': tmp_filename,
+                        'name': field_file.name,
+                        'content_type': field_file.content_type,
+                        'size': field_file.size,
+                        'charset': field_file.charset,
+                    }
+                )
+            data[field] = file_entries if len(file_entries) > 1 else file_entries[0]
+        self.cfp_session['files'][self.identifier] = data
 
 
 class GenericFlowStep:
@@ -304,10 +459,27 @@ class GenericFlowStep:
         # always be used, particularly in the CfP editor
         return {}
 
+    def is_draft_save_action(self):
+        return self.request.method == 'POST' and self.request.POST.get('action') == 'draft'
+
+    def should_use_non_strict_validation(self):
+        if self.request.method != 'POST':
+            return False
+        if self.is_draft_save_action():
+            return True
+        current_step = getattr(getattr(self.request, 'resolver_match', None), 'kwargs', {}).get('step')
+        return (
+            self.request.POST.get('action') == 'submit'
+            and current_step == self.identifier
+            and bool(self.get_next_applicable(self.request))
+        )
+
     def get_form_kwargs(self):
         return {
             'event': self.request.event,
             'field_configuration': self.config.get('fields'),
+            'not_strict': self.should_use_non_strict_validation(),
+            'draft_save': self.is_draft_save_action(),
             **self.get_extra_form_kwargs(),
         }
 
@@ -328,6 +500,30 @@ class InfoStep(GenericFlowStep, FormFlowStep):
         result = super().get_form_kwargs()
         result['access_code'] = getattr(self.request, 'access_code', None)
         return result
+
+    def get_form(self, from_storage=False):
+        form = super().get_form(from_storage=from_storage)
+        if not getattr(form, 'draft_save', False) or not form.is_bound:
+            return form
+
+        access_code = getattr(self.request, 'access_code', None)
+        form_data = copy.deepcopy(form.data)
+        if not form_data.get('title'):
+            # Use an internal, language-independent sentinel for empty draft titles.
+            form_data['title'] = AUTO_DRAFT_TITLE
+
+        if 'submission_type' in form.fields and not form_data.get('submission_type'):
+            default_submission_type = (
+                form.default_values.get('submission_type')
+                or getattr(access_code, 'submission_type', None)
+                or self.event.cfp.default_type
+                or form.fields['submission_type'].queryset.first()
+            )
+            if default_submission_type:
+                form_data['submission_type'] = str(default_submission_type.pk)
+
+        form.data = form_data
+        return form
 
     def get_form_initial(self):
         result = super().get_form_initial()
@@ -365,14 +561,6 @@ class InfoStep(GenericFlowStep, FormFlowStep):
                 ),
             )
 
-            additional_speaker = (form.cleaned_data.get('additional_speaker') or '').strip()
-            if additional_speaker:
-                try:
-                    submission.send_invite(to=[additional_speaker], _from=request.user)
-                except SendMailException as exception:
-                    logging.getLogger('').warning(str(exception))
-                    messages.warning(self.request, phrases.cfp.submission_email_fail)
-
         access_code = getattr(request, 'access_code', None)
         if access_code:
             submission.access_code = access_code
@@ -393,70 +581,9 @@ class InfoStep(GenericFlowStep, FormFlowStep):
     @property
     def _text(self):
         return _(
-            'We’re glad that you want to contribute to our event with your proposal. Let’s get started, this won’t take long.'
+            'We’re glad that you want to contribute to our event with your proposal. '
+            'Let’s get started, this won’t take long.'
         )
-
-
-class QuestionsStep(GenericFlowStep, FormFlowStep):
-    identifier = 'questions'
-    icon = 'question-circle-o'
-    form_class = TalkQuestionsForm
-    template_name = 'cfp/event/submission_questions.html'
-    priority = 25
-
-    def is_applicable(self, request):
-        self.request = request
-        info_data = self.cfp_session.get('data', {}).get('info', {})
-        track = info_data.get('track')
-        if track:
-            questions = self.event.talkquestions.exclude(
-                Q(target=TalkQuestionTarget.SUBMISSION)
-                & (
-                    (~Q(tracks__in=[info_data.get('track')]) & Q(tracks__isnull=False))
-                    | (~Q(submission_types__in=[info_data.get('submission_type')]) & Q(submission_types__isnull=False))
-                )
-            )
-        else:
-            questions = self.event.talkquestions.exclude(
-                Q(target=TalkQuestionTarget.SUBMISSION)
-                & (~Q(submission_types__in=[info_data.get('submission_type')]) & Q(submission_types__isnull=False))
-            )
-        return questions.exists()
-
-    def get_extra_form_kwargs(self):
-        return {'target': ''}
-
-    def get_form_kwargs(self):
-        result = super().get_form_kwargs()
-        info_data = self.cfp_session.get('data', {}).get('info', {})
-        result['track'] = info_data.get('track')
-        access_code = getattr(self.request, 'access_code', None)
-        if access_code and access_code.submission_type:
-            result['submission_type'] = access_code.submission_type
-        else:
-            result['submission_type'] = info_data.get('submission_type')
-        if not self.request.user.is_anonymous:
-            result['speaker'] = self.request.user
-        return result
-
-    def done(self, request, draft=False):
-        form = self.get_form(from_storage=True)
-        form.speaker = request.user
-        form.submission = request.submission
-        form.is_valid()
-        form.save()
-
-    @property
-    def label(self):
-        return _('Additional information')
-
-    @property
-    def _title(self):
-        return _('Tell us more!')
-
-    @property
-    def _text(self):
-        return _('Before we can save your proposal, we have some more questions for you.')
 
 
 class UserStep(GenericFlowStep, FormFlowStep):
@@ -499,7 +626,9 @@ class UserStep(GenericFlowStep, FormFlowStep):
     @property
     def _text(self):
         return _(
-            'To create your proposal, you need an account on this page. This not only gives us a way to contact you, it also gives you the possibility to edit your proposal or to view its current state.'
+            'To create your proposal, you need an account on this page. '
+            'This not only gives us a way to contact you, it also gives you the possibility '
+            'to edit your proposal or to view its current state.'
         )
 
 
@@ -509,6 +638,21 @@ class ProfileStep(GenericFlowStep, FormFlowStep):
     form_class = SpeakerProfileForm
     template_name = 'cfp/event/submission_profile.html'
     priority = 75
+    social_links_session_key = '_social_links'
+
+    def is_completed(self, request):
+        self.request = request
+        if not self.get_form(from_storage=True).is_valid():
+            return False
+        if not request.event.cfp.request_social_links:
+            return True
+        # Drafts may omit required social links; final submit still enforces them.
+        if self.is_draft_save_action():
+            return True
+        if request.event.cfp.require_social_links:
+            stored = self.cfp_session.get('data', {}).get(self.social_links_session_key, [])
+            return bool(stored)
+        return True
 
     def get_form_kwargs(self):
         result = super().get_form_kwargs()
@@ -521,7 +665,53 @@ class ProfileStep(GenericFlowStep, FormFlowStep):
         result['name'] = user.fullname if user else user_data.get('register_name')
         result['read_only'] = False
         result['essential_only'] = True
+        result['enforce_account_name_match'] = True
         return result
+
+    def get_extra_form_kwargs(self):
+        return {'add_additional_speaker': True}
+
+    def get_social_links_profile(self):
+        user = self.get_form_kwargs().get('user')
+        if user:
+            return user.event_profile(self.request.event)
+        return None
+
+    def get_social_links_initial(self):
+        stored = self.cfp_session.get('data', {}).get(self.social_links_session_key)
+        if stored is not None:
+            initial = []
+            for link in stored:
+                network = link.get('network', '')
+                path = link.get('path')
+                if not path and network and link.get('url'):
+                    path = get_social_link_value(link.get('url', ''), network)
+                initial.append({'network': network, 'path': path or ''})
+            return initial
+        return social_links_formset_initial(self.get_social_links_profile())
+
+    def get_social_media_formset(self, data=None):
+        if not self.request.event.cfp.request_social_links:
+            return None
+        return build_speaker_social_links_formset(
+            profile=self.get_social_links_profile(),
+            data=data,
+            initial=None if data is not None else self.get_social_links_initial(),
+        )
+
+    def social_media_formset_is_valid(self, formset):
+        if formset is None:
+            return True
+        if not formset.is_valid():
+            return False
+        if (
+            self.request.event.cfp.require_social_links
+            and not self.is_draft_save_action()
+            and not formset_has_social_links(formset)
+        ):
+            formset.non_form_errors().append(_('Please add at least one social media link.'))
+            return False
+        return True
 
     def get_context_data(self, **kwargs):
         result = super().get_context_data(**kwargs)
@@ -531,13 +721,78 @@ class ProfileStep(GenericFlowStep, FormFlowStep):
             email = data.get('register_email', '')
         if email:
             result['gravatar_parameter'] = User(email=email).gravatar_parameter
+        formset = kwargs.get('social_media_formset')
+        if formset is None:
+            formset = self.get_social_media_formset()
+        result['social_media_formset'] = formset
+        result['social_link_prefixes'] = social_link_prefixes() if formset is not None else {}
+        result['show_social_links'] = formset is not None
         return result
+
+    def post(self, request):
+        self.request = request
+        form = self.get_form()
+        formset = self.get_social_media_formset(data=request.POST)
+        action = request.POST.get('action', 'submit')
+
+        if action == 'back':
+            if form.is_valid() and self.social_media_formset_is_valid(formset):
+                self.set_data(form.cleaned_data)
+                if formset is not None:
+                    self.cfp_session['data'][self.social_links_session_key] = cleaned_social_links_from_formset(formset)
+            if form.files:
+                self.set_files(form.files)
+            prev_url = self.get_prev_url(request)
+            return redirect(prev_url) if prev_url else redirect(request.path)
+
+        form_valid = form.is_valid()
+        formset_valid = self.social_media_formset_is_valid(formset)
+
+        if not form_valid or not formset_valid:
+            warning_messages = getattr(form, 'warning_messages', None) or []
+            for warning in filter(None, warning_messages):
+                messages.warning(self.request, warning)
+            form.hide_top_errors = True
+            return self.render(form=form, social_media_formset=formset)
+        self.set_data(form.cleaned_data)
+        if formset is not None:
+            self.cfp_session['data'][self.social_links_session_key] = cleaned_social_links_from_formset(formset)
+        self.set_files(form.files)
+        next_url = self.get_next_url(request)
+        return redirect(next_url) if next_url else redirect(request.path)
 
     def done(self, request, draft=False):
         form = self.get_form(from_storage=True)
         form.is_valid()
         form.user = request.user
         form.save()
+
+        additional_speaker = (form.cleaned_data.get('additional_speaker') or '').strip()
+        submission = getattr(request, 'submission', None)
+        if not draft and additional_speaker and submission:
+            try:
+                submission.send_invite(to=[additional_speaker], _from=request.user)
+            except SendMailException as exception:
+                logger.warning('Failed to send co-speaker invite email: %s', exception)
+                messages.warning(request, phrases.cfp.submission_email_fail)
+
+        if request.event.cfp.request_social_links:
+            profile = request.user.event_profile(request.event)
+            stored = self.cfp_session.get('data', {}).get(self.social_links_session_key, [])
+            from django.db import transaction
+
+            with transaction.atomic():
+                profile.social_links.all().delete()
+                if stored:
+                    from eventyay.base.models import SpeakerSocialLink
+
+                    SpeakerSocialLink.objects.bulk_create(
+                        [
+                            SpeakerSocialLink(profile=profile, network=link['network'], url=link['url'])
+                            for link in stored
+                            if link.get('network') and link.get('url')
+                        ]
+                    )
 
     @property
     def label(self):
@@ -550,7 +805,8 @@ class ProfileStep(GenericFlowStep, FormFlowStep):
     @property
     def _text(self):
         return _(
-            'This information will be publicly displayed next to your session - you can always edit for as long as proposals are still open.'
+            'This information will be publicly displayed next to your session - '
+            'you can always edit for as long as proposals are still open.'
         )
 
     def get_csp_update(self, request):
@@ -562,7 +818,6 @@ class ProfileStep(GenericFlowStep, FormFlowStep):
 
 DEFAULT_STEPS = (
     InfoStep,
-    QuestionsStep,
     UserStep,
     ProfileStep,
 )

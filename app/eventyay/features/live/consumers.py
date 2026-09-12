@@ -27,10 +27,9 @@ from .modules.announcement import AnnouncementModule
 from .modules.auth import AuthModule
 from .modules.bbb import BBBModule
 from .modules.chat import ChatModule
-from .modules.exhibition import ExhibitionModule
 from .modules.januscall import JanusCallModule
+from .modules.jitsi import JitsiModule
 from .modules.poll import PollModule
-from .modules.poster import PosterModule
 from .modules.question import QuestionModule
 from .modules.room import RoomModule
 from .modules.roulette import RouletteModule
@@ -120,8 +119,7 @@ class MainConsumer(AsyncJsonWebsocketConsumer):
             "bbb": BBBModule(self),
             "zoom": ZoomModule(self),
             "januscall": JanusCallModule(self),
-            "exhibition": ExhibitionModule(self),
-            "poster": PosterModule(self),
+            "jitsi": JitsiModule(self),
             "question": QuestionModule(self),
             "poll": PollModule(self),
             "room": RoomModule(self),
@@ -160,6 +158,10 @@ class MainConsumer(AsyncJsonWebsocketConsumer):
         if content[0] == "ping":
             await self.send_json(["pong", content[1]])
             self.last_conn_ping = await ping_connection(self.last_conn_ping, self.user)
+            return
+
+        if not self.event:
+            await self.send_error("event.unknown_event", close=True)
             return
 
         if not self.user:

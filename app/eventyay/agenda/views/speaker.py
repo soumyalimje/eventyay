@@ -1,57 +1,207 @@
+import datetime as dt
 import io
-from collections import defaultdict
-from urllib.parse import urlparse
+import json
+from urllib.parse import unquote, urljoin, urlparse
 
 import vobject
 from django.conf import settings
 from django.core.exceptions import SuspiciousFileOperation
 from django.core.files.storage import Storage
-from django.http import FileResponse, Http404, HttpResponse
+from django.db.models import Q
+from django.http import FileResponse, Http404, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import redirect
+from django.template.loader import get_template
+from django.urls import reverse
 from django.utils.functional import cached_property
+from django.utils.translation import gettext_lazy as _
 from django.views.decorators.cache import cache_page
-from django.views.generic import DetailView, ListView, TemplateView
+from django.views.generic import DetailView, ListView, TemplateView, View
 from django_context_decorator import context
+from i18nfield.utils import I18nJSONEncoder
 
+from eventyay.agenda.export_resources import public_resource_attachments, public_resource_links
+from eventyay.agenda.views.utils import (
+    WipAgendaPreviewPageMixin,
+    build_google_calendar_url,
+    build_speaker_cards,
+    build_speaker_schedule_json,
+    escape_json_for_script,
+    is_public_speakers_empty,
+    is_public_speakers_list_empty,
+    matching_content_locales,
+    redirect_to_presale_with_warning,
+    redirect_when_public_speakers_unavailable,
+    speaker_profile_display_order,
+    speaker_public_content_locale_enabled,
+    speaker_public_field_flags,
+)
+from eventyay.base.models import SpeakerProfile, TalkQuestionTarget, User
 from eventyay.common.text.path import safe_filename
+from eventyay.common.urls import get_base_url
+from eventyay.common.utils.language import localize_event_text
 from eventyay.common.views.mixins import (
     EventPermissionRequired,
     Filterable,
     PermissionRequired,
     SocialMediaCardMixin,
 )
-from eventyay.base.models import SpeakerProfile, User
-from eventyay.base.models import TalkQuestionTarget
+from eventyay.talk_rules.agenda import (
+    agenda_speaker_talks,
+    can_list_released_schedule_speakers,
+    should_hide_public_speaker_sessions,
+)
+
+
+def public_speaker_search_q(event, query: str) -> Q:
+    """Search only public, this-event schedule data (name, public bio, visible titles)."""
+    search_q = Q(user__fullname__icontains=query)
+    _, include_biography = speaker_public_field_flags(event)
+    if include_biography:
+        search_q |= Q(biography__icontains=query)
+    schedule = event.current_schedule
+    if schedule:
+        search_q |= Q(
+            user__submissions__event=event,
+            user__submissions__title__icontains=query,
+            user__submissions__slots__schedule=schedule,
+            user__submissions__slots__is_visible=True,
+        )
+    return search_q
 
 
 class SpeakerList(EventPermissionRequired, Filterable, ListView):
     context_object_name = 'speakers'
     template_name = 'agenda/speakers.html'
     permission_required = 'base.list_schedule'
-    default_filters = ('user__fullname__icontains',)
+    default_filters = ()
+    paginate_by = 48
+
+    def render_to_response(self, context, **response_kwargs):
+        if self.request.GET.get('format') == 'json':
+            speakers = build_speaker_cards(context['object_list'], self.request.event)
+            page_obj = context.get('page_obj')
+            next_url = None
+            if page_obj and page_obj.has_next():
+                query_dict = self.request.GET.copy()
+                query_dict['page'] = page_obj.next_page_number()
+                next_url = self.request.build_absolute_uri(f'{self.request.path}?{query_dict.urlencode()}')
+            return JsonResponse(
+                {
+                    'results': speakers,
+                    'next': next_url,
+                },
+                encoder=I18nJSONEncoder,
+            )
+        return super().render_to_response(context, **response_kwargs)
+
+    def has_permission(self):
+        return can_list_released_schedule_speakers(self.request.user, self.request.event)
+
+    def dispatch(self, request, *args, **kwargs):
+        if is_public_speakers_list_empty(request):
+            return redirect_to_presale_with_warning(request, _('No published speakers.'))
+        if not can_list_released_schedule_speakers(request.user, request.event):
+            return redirect_when_public_speakers_unavailable(request)
+        return super().dispatch(request, *args, **kwargs)
 
     def get_queryset(self):
-        qs = (
-            SpeakerProfile.objects.filter(user__in=self.request.event.speakers, event=self.request.event)
-            .select_related('user', 'event', 'event__organizer')
-            .order_by('user__fullname')
-        )
-        qs = self.filter_queryset(qs)
+        event = self.request.event
+        qs = SpeakerProfile.objects.filter(user__in=event.speakers, event=event)
+        qs = qs.select_related('user', 'event', 'event__organizer').prefetch_related('social_links')
+        sort = self.request.GET.get('sort')
+        if sort == 'a-z':
+            qs = qs.order_by('user__fullname', 'pk')
+        elif sort == 'z-a':
+            qs = qs.order_by('-user__fullname', 'pk')
+        else:
+            qs = qs.order_by('-is_featured', *speaker_profile_display_order())
+        # Searching session titles joins the speakers M2M, which can duplicate rows.
+        return self.filter_queryset(qs).distinct()
 
-        speaker_mapping = defaultdict(list)
-        for talk in self.request.event.talks.all().prefetch_related('speakers'):
-            for speaker in talk.speakers.all():
-                speaker_mapping[speaker.code].append(talk)
+    def filter_queryset(self, qs):
+        qs = super().filter_queryset(qs)
+        event = self.request.event
+        query = self.request.GET.get('q')
+        if query:
+            qs = qs.filter(public_speaker_search_q(event, unquote(query)))
+        schedule = event.current_schedule
+        if not schedule:
+            return qs
 
-        for profile in qs:
-            profile.talks = speaker_mapping[profile.user.code]
+        tracks = self.request.GET.getlist('track')
+        if tracks:
+            qs = qs.filter(
+                user__submissions__event=event,
+                user__submissions__track__in=tracks,
+                user__submissions__slots__schedule=schedule,
+                user__submissions__slots__is_visible=True,
+            )
+
+        languages = self.request.GET.getlist('language')
+        if languages and speaker_public_content_locale_enabled(event):
+            available = schedule.talks.filter(is_visible=True).exclude(
+                submission__content_locale__isnull=True
+            ).exclude(
+                submission__content_locale=''
+            ).values_list('submission__content_locale', flat=True).distinct()
+            qs = qs.filter(
+                user__submissions__event=event,
+                user__submissions__content_locale__in=matching_content_locales(languages, available),
+                user__submissions__slots__schedule=schedule,
+                user__submissions__slots__is_visible=True,
+            )
         return qs
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        event = self.request.event
+        schedule = event.current_schedule
+
+        meta = {
+            'tracks': [],
+            'content_locales': [],
+            'timezone': event.timezone,
+            'feature_flags': event.schedule_client_feature_flags(),
+            'has_featured_speakers': SpeakerProfile.objects.filter(
+                event=event,
+                user__in=event.speakers,
+                is_featured=True,
+            ).exists(),
+        }
+        if schedule:
+            meta['tracks'] = [
+                {'id': str(track.pk), 'name': track.name, 'color': track.color}
+                for track in event.tracks.filter(
+                    submissions__slots__schedule=schedule,
+                    submissions__slots__is_visible=True,
+                ).distinct()
+            ]
+            if speaker_public_content_locale_enabled(event):
+                locales = schedule.talks.filter(is_visible=True).exclude(
+                    submission__content_locale__isnull=True
+                ).exclude(
+                    submission__content_locale=''
+                ).values_list('submission__content_locale', flat=True).distinct()
+                meta['content_locales'] = sorted(set(locales))
+
+        context['speakers_meta_json'] = escape_json_for_script(json.dumps(meta, cls=I18nJSONEncoder))
+        return context
 
 
 class SpeakerView(PermissionRequired, TemplateView):
     template_name = 'agenda/speaker.html'
     permission_required = 'base.view_speakerprofile'
     slug_field = 'code'
+    wip_preview = False
+
+    @context
+    def schedule_json(self):
+        return build_speaker_schedule_json(self.request, self.kwargs['code'])
+
+    def dispatch(self, request, *args, **kwargs):
+        if not self.wip_preview and is_public_speakers_empty(request):
+            return redirect_to_presale_with_warning(request, _('No published speakers.'))
+        return super().dispatch(request, *args, **kwargs)
 
     @context
     @cached_property
@@ -65,15 +215,28 @@ class SpeakerView(PermissionRequired, TemplateView):
     @context
     @cached_property
     def talks(self):
-        if not self.request.event.current_schedule:
-            return []
+        if should_hide_public_speaker_sessions(
+            self.request.user,
+            self.request.event,
+            wip_preview=self.wip_preview,
+        ):
+            from eventyay.base.models import TalkSlot
+
+            return TalkSlot.objects.none()
         return (
-            self.request.event.current_schedule.talks.filter(
-                submission__speakers__code=self.kwargs['code'], is_visible=True
+            agenda_speaker_talks(
+                self.request.event,
+                self.request.user,
+                speaker_code=self.kwargs['code'],
+                wip_preview=self.wip_preview,
             )
             .select_related('submission', 'room', 'submission__event', 'submission__event__organizer')
             .prefetch_related('submission__speakers')
         )
+
+    @context
+    def schedule_version(self):
+        return ''
 
     def get_permission_object(self):
         return self.profile
@@ -85,6 +248,14 @@ class SpeakerView(PermissionRequired, TemplateView):
             question__event=self.request.event,
             question__target=TalkQuestionTarget.SPEAKER,
         ).select_related('question')
+
+
+class WipSpeakerView(WipAgendaPreviewPageMixin, SpeakerView):
+    pass
+
+
+class WipSpeakerList(WipAgendaPreviewPageMixin, TemplateView):
+    template_name = 'agenda/speakers.html'
 
 
 class SpeakerRedirect(DetailView):
@@ -107,13 +278,16 @@ class SpeakerTalksIcalView(PermissionRequired, DetailView):
         return SpeakerProfile.objects.filter(event=self.request.event, user__code__iexact=self.kwargs['code']).first()
 
     def get(self, request, event, *args, **kwargs):
-        if not self.request.event.current_schedule:
+        speaker = self.get_object()
+        slots = agenda_speaker_talks(
+            request.event,
+            request.user,
+            speaker=speaker.user,
+            wip_preview=getattr(self, 'wip_preview', False),
+        ).select_related('room', 'submission')
+        if not slots.exists():
             raise Http404()
         netloc = urlparse(settings.SITE_URL).netloc
-        speaker = self.get_object()
-        slots = self.request.event.current_schedule.talks.filter(
-            submission__speakers=speaker.user, is_visible=True
-        ).select_related('room', 'submission')
 
         cal = vobject.iCalendar()
         cal.add('prodid').value = f'-//eventyay//{netloc}//{request.event.slug}//{speaker.code}'
@@ -122,7 +296,7 @@ class SpeakerTalksIcalView(PermissionRequired, DetailView):
             slot.build_ical(cal)
 
         try:
-            speaker_name = Storage().get_valid_name(name=speaker.user.name or speaker.user.code)
+            speaker_name = Storage().get_valid_name(name=speaker.user.fullname or speaker.user.code)
         except SuspiciousFileOperation:
             speaker_name = Storage().get_valid_name(name=speaker.user.code)
         return HttpResponse(
@@ -134,15 +308,194 @@ class SpeakerTalksIcalView(PermissionRequired, DetailView):
         )
 
 
+class SpeakerTalksExportView(EventPermissionRequired, View):
+    """Export a speaker's talks in JSON, XML, or XCal format."""
+
+    permission_required = 'base.list_schedule'
+
+    def get_speaker_and_slots(self, request):
+        speaker = (
+            SpeakerProfile.objects.filter(event=request.event, user__code__iexact=self.kwargs['code'])
+            .select_related('user')
+            .first()
+        )
+        if not speaker:
+            raise Http404()
+        slots = agenda_speaker_talks(
+            request.event,
+            request.user,
+            speaker=speaker.user,
+            wip_preview=getattr(self, 'wip_preview', False),
+        ).select_related(
+            'room', 'submission', 'submission__track', 'submission__submission_type'
+        ).prefetch_related('submission__speakers', 'submission__resources')
+        if not slots.exists():
+            raise Http404()
+        return speaker, slots
+
+    def get(self, request, event, **kwargs):
+        fmt = kwargs.get('format', '')
+        handler = {
+            'json': self.render_json,
+            'xml': self.render_xml,
+            'xcal': self.render_xcal,
+        }.get(fmt)
+        if not handler:
+            raise Http404
+        speaker, slots = self.get_speaker_and_slots(request)
+        return handler(request, speaker, slots)
+
+    def render_json(self, request, speaker, slots):
+        event = request.event
+        base_url = get_base_url(event)
+        show_abstract = event.cfp.public_abstract
+        show_description = event.cfp.public_description
+        show_biography = event.cfp.public_biography
+        talks_data = []
+        for slot in slots:
+            sub = slot.submission
+            talks_data.append(
+                {
+                    'guid': slot.uuid,
+                    'code': sub.code,
+                    'id': sub.id,
+                    'date': slot.local_start.isoformat(),
+                    'start': f'{slot.local_start:%H:%M}',
+                    'duration': slot.export_duration,
+                    'room': localize_event_text(slot.room.name) if slot.room else None,
+                    'slug': slot.frab_slug,
+                    'url': sub.urls.public.full(),
+                    'title': localize_event_text(sub.title),
+                    'track': localize_event_text(sub.track.name) if sub.track else None,
+                    'type': localize_event_text(sub.submission_type.name),
+                    'language': sub.content_locale,
+                    'abstract': localize_event_text(sub.abstract) if show_abstract else '',
+                    'description': localize_event_text(sub.description) if show_description else '',
+                    'do_not_record': sub.do_not_record,
+                    'persons': [
+                        {
+                            'code': p.code,
+                            'name': p.get_display_name(),
+                            'biography': localize_event_text(p.event_profile(event).biography)
+                            if show_biography
+                            else '',
+                        }
+                        for p in sub.speakers.all()
+                    ],
+                    'links': public_resource_links(sub, event),
+                    'attachments': public_resource_attachments(sub, event),
+                }
+            )
+        data = {
+            'speaker': speaker.user.code,
+            'base_url': base_url,
+            'talks': talks_data,
+        }
+        return JsonResponse(data, encoder=I18nJSONEncoder)
+
+    def render_xml(self, request, speaker, slots):
+        base_url = get_base_url(request.event)
+        context = {
+            'talk_slots': slots,
+            'event': request.event,
+            'base_url': base_url,
+        }
+        content = get_template('agenda/single_talk.xml').render(context=context)
+        return HttpResponse(content, content_type='text/xml')
+
+    def render_xcal(self, request, speaker, slots):
+        url = get_base_url(request.event)
+        domain = urlparse(url).netloc
+        context = {
+            'talk_slots': slots,
+            'url': url,
+            'domain': domain,
+        }
+        content = get_template('agenda/single_talk.xcal').render(context=context)
+        return HttpResponse(content, content_type='text/xml')
+
+
+class SpeakerTalksCalendarRedirectView(EventPermissionRequired, View):
+    """Redirect to Google Calendar or Webcal for a speaker's talks."""
+
+    permission_required = 'base.list_schedule'
+
+    def get(self, request, event, **kwargs):
+        provider = kwargs.get('provider', '')
+        speaker = (
+            SpeakerProfile.objects.filter(event=request.event, user__code__iexact=self.kwargs['code'])
+            .select_related('user')
+            .first()
+        )
+        if not speaker:
+            raise Http404()
+        slots = agenda_speaker_talks(
+            request.event,
+            request.user,
+            speaker=speaker.user,
+            wip_preview=getattr(self, 'wip_preview', False),
+        ).select_related('room', 'submission')
+        if not slots.exists():
+            raise Http404()
+
+        if provider == 'google-calendar':
+            slot = slots.first()
+            return self.google_calendar_redirect(slot, request)
+        if provider == 'webcal':
+            parsed_base = urlparse(get_base_url(request.event))
+            base_url = f'{parsed_base.scheme}://{parsed_base.netloc}'
+            ical_url = urljoin(
+                base_url,
+                reverse(
+                    'agenda:speaker.talks.ical',
+                    kwargs={
+                        'organizer': request.event.organizer.slug,
+                        'event': event,
+                        'code': self.kwargs['code'],
+                    },
+                ),
+            )
+            webcal_url = ical_url.replace('https://', 'webcal://').replace('http://', 'webcal://')
+            response = HttpResponse(status=302)
+            response['Location'] = webcal_url
+            return response
+        raise Http404()
+
+    def google_calendar_redirect(self, slot, request):
+        sub = slot.submission
+        start = slot.start
+        end = slot.real_end
+        if not start or not end:
+            raise Http404()
+        start_utc = start.astimezone(dt.UTC)
+        end_utc = end.astimezone(dt.UTC)
+        dates = f'{start_utc:%Y%m%dT%H%M%SZ}/{end_utc:%Y%m%dT%H%M%SZ}'
+        title = localize_event_text(sub.title)
+        location = localize_event_text(slot.room.name) if slot.room else ''
+        details = localize_event_text(sub.abstract) if request.event.cfp.public_abstract else ''
+        url = build_google_calendar_url(title, dates, location, details)
+        return HttpResponseRedirect(url)
+
+
 class SpeakerSocialMediaCard(SocialMediaCardMixin, SpeakerView):
     def get_image(self):
-        return self.profile.avatar
+        return self.profile.avatar if self.request.event.cfp.public_avatar else None
 
 
 @cache_page(60 * 60)
 def empty_avatar_view(request, organizer=None, event=None):
     # cached for an hour
     color = request.event.visible_primary_color or settings.DEFAULT_EVENT_PRIMARY_COLOR
+    body_style = (
+        f'fill:none;stroke:{color};stroke-width:1.6;stroke-linecap:butt;'
+        'stroke-linejoin:round;stroke-miterlimit:4;stroke-dasharray:2.1, 2.1;'
+        'stroke-dashoffset:0;stroke-opacity:0.87'
+    )
+    head_style = (
+        f'fill:#ffffff;stroke:{color};stroke-width:1.3;stroke-linecap:butt;'
+        'stroke-linejoin:round;stroke-miterlimit:4;stroke-dasharray:6.5, 8;'
+        'stroke-dashoffset:4;stroke-opacity:0.87'
+    )
     avatar_template = f"""<svg
    xmlns="http://www.w3.org/2000/svg"
    viewBox="0 0 100 100">
@@ -150,14 +503,14 @@ def empty_avatar_view(request, organizer=None, event=None):
     <path
        id="body"
        d="m 2,98 h 96 0 c 0,0 6,-65 -48,-52 c 0,0 -54,-10 -48,52"
-       style="fill:none;stroke:{color};stroke-width:1.6;stroke-linecap:butt;stroke-linejoin:round;stroke-miterlimit:4;stroke-dasharray:2.1, 2.1;stroke-dashoffset:0;stroke-opacity:0.87" />
+       style="{body_style}" />
     <ellipse
        ry="27"
        rx="27"
        cy="28"
        cx="50"
        id="heady"
-       style="fill:#ffffff;stroke:{color};stroke-width:1.3;stroke-linecap:butt;stroke-linejoin:round;stroke-miterlimit:4;stroke-dasharray:6.5, 8;stroke-dashoffset:4;stroke-opacity:0.87" />
+       style="{head_style}" />
   </g>
 </svg>"""
     return FileResponse(

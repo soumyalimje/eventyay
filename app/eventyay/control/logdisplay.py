@@ -2,9 +2,11 @@ import json
 from collections import defaultdict
 from decimal import Decimal
 
-import bleach
 import dateutil.parser
-import pytz
+import nh3
+import datetime
+from zoneinfo import ZoneInfo
+from django.core.exceptions import ObjectDoesNotExist
 from django.dispatch import receiver
 from django.urls import reverse
 from django.utils.formats import date_format
@@ -12,21 +14,34 @@ from django.utils.html import escape
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import pgettext_lazy
+from django_scopes import ScopeError, scopes_disabled
 from i18nfield.strings import LazyI18nString
 
 from eventyay.base.models import (
     Checkin,
     CheckinList,
     Event,
-    ProductVariation,
     LogEntry,
     OrderPosition,
+    ProductVariation,
     TaxRule,
 )
 from eventyay.base.signals import logentry_display
 from eventyay.base.templatetags.money import money_filter
 
+
 OVERVIEW_BANLIST = ['eventyay.plugins.sendmail.order.email.sent']
+
+
+def _get_checkin_list_name(event: Event, list_id):
+    if not list_id:
+        return _('(unknown)')
+
+    try:
+        with scopes_disabled():
+            return event.checkin_lists.get(pk=list_id).name
+    except (CheckinList.DoesNotExist, ScopeError):
+        return _('(unknown)')
 
 
 def _display_order_changed(event: Event, logentry: LogEntry, action_type: str):
@@ -140,6 +155,22 @@ def _display_order_changed(event: Event, logentry: LogEntry, action_type: str):
                 old_price=money_filter(Decimal(data['old_price']), event.currency),
             )
         )
+    elif action_type == 'eventyay.event.order.changed.reinstate':
+        try:
+            product = str(event.products.get(pk=data['product']))
+            if data.get('variation'):
+                product += ' - ' + str(ProductVariation.objects.get(pk=data['variation']))
+        except ObjectDoesNotExist:
+            product = _('(deleted product)')
+        return (
+            text
+            + ' '
+            + _('Position #{posid} ({product}, {price}) reinstated.').format(
+                posid=data.get('positionid', '?'),
+                product=product,
+                price=money_filter(Decimal(data['price']), event.currency),
+            )
+        )
     elif action_type == 'eventyay.event.order.changed.add':
         product = str(event.products.get(pk=data['product']))
         if data['variation']:
@@ -209,16 +240,10 @@ def _display_checkin(event, logentry, action_type: str):
     if 'datetime' in data:
         dt = dateutil.parser.parse(data.get('datetime'))
         show_dt = abs((logentry.datetime - dt).total_seconds()) > 5 or 'forced' in data
-        tz = pytz.timezone(event.settings.timezone)
+        tz = ZoneInfo(event.settings.timezone)
         dt_formatted = date_format(dt.astimezone(tz), 'SHORT_DATETIME_FORMAT')
 
-    if 'list' in data:
-        try:
-            checkin_list = event.checkin_lists.get(pk=data.get('list')).name
-        except CheckinList.DoesNotExist:
-            checkin_list = _('(unknown)')
-    else:
-        checkin_list = _('(unknown)')
+    checkin_list = _get_checkin_list_name(event, data.get('list'))
 
     if action_type == 'eventyay.event.checkin.unknown':
         if show_dt:
@@ -333,6 +358,7 @@ PRETIX_LEGACY_ALIASES = {
     'pretix.team.member.joined': 'eventyay.team.member.joined',
     'pretix.team.member.left': 'eventyay.team.member.left',
     'pretix.team.token.created': 'eventyay.team.token.created',
+    'pretix.organizer.deleted': 'eventyay.organizer.deleted',
     'pretix.user.settings.changed': 'eventyay.user.settings.changed',
     'pretix.user.settings.2fa.enabled': 'eventyay.user.settings.2fa.enabled',
     'pretix.user.settings.2fa.disabled': 'eventyay.user.settings.2fa.disabled',
@@ -371,6 +397,8 @@ PRETIX_LEGACY_ALIASES = {
     'pretix.event.live.deactivated': 'eventyay.event.live.deactivated',
     'pretix.event.testmode.activated': 'eventyay.event.testmode.activated',
     'pretix.event.testmode.deactivated': 'eventyay.event.testmode.deactivated',
+    'pretix.event.private_testmode.activated': 'eventyay.event.private_testmode.activated',
+    'pretix.event.private_testmode.deactivated': 'eventyay.event.private_testmode.deactivated',
     'pretix.subevent.added': 'eventyay.subevent.added',
     'pretix.subevent.changed': 'eventyay.subevent.changed',
     'pretix.subevent.deleted': 'eventyay.subevent.deleted',
@@ -390,7 +418,6 @@ PRETIX_LEGACY_ALIASES = {
     'pretix.event.checkin.reverted': 'eventyay.event.checkin.reverted',
     'pretix.control.views.checkin': 'eventyay.control.views.checkin',
     'pretix.control.views.checkin.reverted': 'eventyay.control.views.checkin.reverted',
-    
     # Additional mappings for complete backward compatibility
     'pretix.event.category.changed': 'eventyay.event.category.changed',
     'pretix.event.question.added': 'eventyay.event.question.added',
@@ -428,7 +455,6 @@ PRETIX_LEGACY_ALIASES = {
     'pretix.gate.changed': 'eventyay.gate.changed',
     'pretix.device.changed': 'eventyay.device.changed',
     'pretix.property.changed': 'eventyay.property.changed',
-    
     # Additional order and email action mappings for complete coverage
     'pretix.event.order.contact.confirmed': 'eventyay.event.order.contact.confirmed',
     'pretix.event.order.comment': 'eventyay.event.order.comment',
@@ -447,7 +473,6 @@ PRETIX_LEGACY_ALIASES = {
     'pretix.event.order.refund.created.externally': 'eventyay.event.order.refund.created.externally',
     'pretix.subevent.canceled': 'eventyay.subevent.canceled',
     'pretix.voucher.sent': 'eventyay.voucher.sent',
-    
     # pretalx.* (old talk system) mappings - map to eventyay equivalents
     'pretalx.room.create': 'eventyay.room.create',
     'pretalx.room.update': 'eventyay.room.update',
@@ -459,11 +484,15 @@ PRETIX_LEGACY_ALIASES = {
 def eventyaycontrol_logentry_display(sender: Event, logentry: LogEntry, **kwargs):
     # Map legacy pretix.* prefixes to eventyay.* for backward compatibility
     action_type = PRETIX_LEGACY_ALIASES.get(logentry.action_type, logentry.action_type)
-    
+
     plains = {
         'eventyay.object.cloned': _('This object has been created by cloning.'),
         'eventyay.organizer.changed': _('The organizer has been changed.'),
         'eventyay.organizer.settings': _('The organizer settings have been changed.'),
+        'eventyay.organizer.deletion.scheduled': _('The organizer deletion has been scheduled.'),
+        'eventyay.organizer.deletion.failed': _(
+            'The organizer deletion could not be completed because of protected objects: {reason}.'
+        ),
         'eventyay.giftcards.acceptance.added': _('Gift card acceptance for another organizer has been added.'),
         'eventyay.giftcards.acceptance.removed': _('Gift card acceptance for another organizer has been removed.'),
         'eventyay.webhook.created': _('The webhook has been created.'),
@@ -534,6 +563,9 @@ def eventyaycontrol_logentry_display(sender: Event, logentry: LogEntry, **kwargs
         'eventyay.event.order.email.order_free': _(
             'An email has been sent to notify the user that the order has been received.'
         ),
+        'eventyay.event.order.email.meetup_registration': _(
+            'An email has been sent to confirm the meetup registration.'
+        ),
         'eventyay.event.order.email.order_paid': _(
             'An email has been sent to notify the user that payment has been received.'
         ),
@@ -552,6 +584,7 @@ def eventyaycontrol_logentry_display(sender: Event, logentry: LogEntry, **kwargs
         'eventyay.event.order.email.resend': _(
             'An email with a link to the order detail page has been resent to the user.'
         ),
+        'eventyay.event.order.anonymized': _('The order ticketing data has been anonymized.'),
         'eventyay.event.order.payment.confirmed': _('Payment {local_id} has been confirmed.'),
         'eventyay.event.order.payment.canceled': _('Payment {local_id} has been canceled.'),
         'eventyay.event.order.payment.canceled.failed': _('Canceling payment {local_id} has failed.'),
@@ -624,10 +657,12 @@ def eventyaycontrol_logentry_display(sender: Event, logentry: LogEntry, **kwargs
         'eventyay.event.tickets.settings': _('The ticket download settings have been changed.'),
         'eventyay.event.plugins.enabled': _('A plugin has been enabled.'),
         'eventyay.event.plugins.disabled': _('A plugin has been disabled.'),
-        'eventyay.event.live.activated': _('The shop has been taken live.'),
-        'eventyay.event.live.deactivated': _('The shop has been taken offline.'),
+        'eventyay.event.live.activated': _('The event has been published.'),
+        'eventyay.event.live.deactivated': _('The event has been unpublished.'),
         'eventyay.event.testmode.activated': _('The shop has been taken into test mode.'),
         'eventyay.event.testmode.deactivated': _('The test mode has been disabled.'),
+        'eventyay.event.private_testmode.activated': _('Private test mode has been enabled.'),
+        'eventyay.event.private_testmode.deactivated': _('Private test mode has been disabled.'),
         'eventyay.event.added': _('The event has been created.'),
         'eventyay.event.changed': _('The event details have been changed.'),
         'eventyay.event.permissions.added': _('A user has been added to the event team.'),
@@ -658,6 +693,7 @@ def eventyaycontrol_logentry_display(sender: Event, logentry: LogEntry, **kwargs
         'eventyay.device.changed': _('The device has been changed.'),
         'eventyay.device.revoked': _('Access of the device has been revoked.'),
         'eventyay.device.initialized': _('The device has been initialized.'),
+        'eventyay.device.setup_token_reset': _('A new device setup code has been generated.'),
         'eventyay.device.keyroll': _('The access token of the device has been regenerated.'),
         'eventyay.device.updated': _('The device has notified the server of an hardware or software update.'),
         'eventyay.giftcards.created': _('The gift card has been created.'),
@@ -686,14 +722,15 @@ def eventyaycontrol_logentry_display(sender: Event, logentry: LogEntry, **kwargs
     }
 
     try:
-        data = json.loads(logentry.data or "{}")
+        data = json.loads(logentry.data or '{}')
     except (TypeError, json.JSONDecodeError):
         data = {}
 
     if action_type.startswith('eventyay.event.product.variation'):
         if 'value' not in data:
             # Backwards compatibility
-            var = ProductVariation.objects.filter(id=data['id']).first()
+            with scopes_disabled():
+                var = ProductVariation.objects.filter(id=data['id']).first()
             if var:
                 data['value'] = str(var.value)
             else:
@@ -706,7 +743,8 @@ def eventyaycontrol_logentry_display(sender: Event, logentry: LogEntry, **kwargs
         return plains[action_type].format_map(data)
 
     if action_type.startswith('eventyay.event.order.changed'):
-        return _display_order_changed(sender, logentry, action_type)
+        with scopes_disabled():
+            return _display_order_changed(sender, logentry, action_type)
 
     if action_type.startswith('eventyay.event.payment.provider.'):
         return _('The settings of a payment provider have been changed.')
@@ -716,7 +754,7 @@ def eventyaycontrol_logentry_display(sender: Event, logentry: LogEntry, **kwargs
 
     if action_type == 'eventyay.event.order.consent':
         return _('The user confirmed the following message: "{}"').format(
-            bleach.clean(logentry.parsed_data.get('msg'), tags=[], strip=True)
+            nh3.clean(logentry.parsed_data.get('msg'), tags=set())
         )
 
     if sender and action_type.startswith('eventyay.event.checkin'):
@@ -725,15 +763,9 @@ def eventyaycontrol_logentry_display(sender: Event, logentry: LogEntry, **kwargs
     if action_type == 'eventyay.control.views.checkin':
         # deprecated
         dt = dateutil.parser.parse(data.get('datetime'))
-        tz = pytz.timezone(sender.settings.timezone)
+        tz = ZoneInfo(sender.settings.timezone)
         dt_formatted = date_format(dt.astimezone(tz), 'SHORT_DATETIME_FORMAT')
-        if 'list' in data:
-            try:
-                checkin_list = sender.checkin_lists.get(pk=data.get('list')).name
-            except CheckinList.DoesNotExist:
-                checkin_list = _('(unknown)')
-        else:
-            checkin_list = _('(unknown)')
+        checkin_list = _get_checkin_list_name(sender, data.get('list'))
 
         if data.get('first'):
             return _('Position #{posid} has been checked in manually at {datetime} on list "{list}".').format(
@@ -749,13 +781,7 @@ def eventyaycontrol_logentry_display(sender: Event, logentry: LogEntry, **kwargs
         'eventyay.control.views.checkin.reverted',
         'eventyay.event.checkin.reverted',
     ):
-        if 'list' in data:
-            try:
-                checkin_list = sender.checkin_lists.get(pk=data.get('list')).name
-            except CheckinList.DoesNotExist:
-                checkin_list = _('(unknown)')
-        else:
-            checkin_list = _('(unknown)')
+        checkin_list = _get_checkin_list_name(sender, data.get('list'))
 
         return _('The check-in of position #{posid} on list "{list}" has been reverted.').format(
             posid=data.get('positionid'),
@@ -805,5 +831,3 @@ def eventyaycontrol_logentry_display(sender: Event, logentry: LogEntry, **kwargs
 
     if action_type == 'eventyay.control.auth.user.impersonate_stopped':
         return str(_('You stopped impersonating {}.')).format(data['other_email'])
-
-

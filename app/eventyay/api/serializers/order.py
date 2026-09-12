@@ -3,6 +3,8 @@ from collections import Counter, defaultdict
 from decimal import Decimal
 
 import pycountry
+from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files import File
 from django.db.models import F, Q
 from django.utils.timezone import now
@@ -28,10 +30,10 @@ from eventyay.base.models import (
     Invoice,
     InvoiceAddress,
     InvoiceLine,
-    Product,
-    ProductVariation,
     Order,
     OrderPosition,
+    Product,
+    ProductVariation,
     Question,
     QuestionAnswer,
     Seat,
@@ -52,6 +54,7 @@ from eventyay.base.services.locking import NoLockManager
 from eventyay.base.services.pricing import get_price
 from eventyay.base.settings import COUNTRIES_WITH_STATE_IN_ADDRESS
 from eventyay.base.signals import register_ticket_outputs
+from eventyay.consts import SizeKey
 from eventyay.multidomain.urlreverse import build_absolute_uri
 
 
@@ -116,7 +119,7 @@ class InvoiceAddressSerializer(I18nAwareModelSerializer):
         if data.get('state'):
             cc = str(data.get('country') or self.instance.country or '')
             if cc not in COUNTRIES_WITH_STATE_IN_ADDRESS:
-                raise ValidationError({'state': ['States are not supported in country "{}".'.format(cc)]})
+                raise ValidationError({'state': [f'States are not supported in country "{cc}".']})
             if not pycountry.subdivisions.get(code=cc + '-' + data.get('state')):
                 raise ValidationError(
                     {'state': ['"{}" is not a known subdivision of the country "{}".'.format(data.get('state'), cc)]}
@@ -178,25 +181,29 @@ class AnswerSerializer(I18nAwareModelSerializer):
         return q
 
     def _handle_file_upload(self, data):
+        submitted_file_id = data.get('answer', '')
+        if isinstance(submitted_file_id, str) and submitted_file_id.startswith('file:'):
+            submitted_file_id = submitted_file_id[len('file:') :]
+
         try:
             ao = self.context['request'].user or self.context['request'].auth
             cf = CachedFile.objects.get(
                 session_key=f'api-upload-{str(type(ao))}-{ao.pk}',
                 file__isnull=False,
-                pk=data['answer'][len('file:') :],
+                pk=submitted_file_id,
             )
-        except (ValidationError, IndexError):  # invalid uuid
-            raise ValidationError('The submitted file ID "{fid}" was not found.'.format(fid=data))
+        except (DjangoValidationError, IndexError):  # invalid uuid
+            raise ValidationError(f'The submitted file ID "{submitted_file_id}" was not found.')
         except CachedFile.DoesNotExist:
-            raise ValidationError('The submitted file ID "{fid}" was not found.'.format(fid=data))
+            raise ValidationError(f'The submitted file ID "{submitted_file_id}" was not found.')
 
         allowed_types = ('image/png', 'image/jpeg', 'image/gif', 'application/pdf')
         if cf.type not in allowed_types:
             raise ValidationError(
-                'The submitted file "{fid}" has a file type that is not allowed in this field.'.format(fid=data)
+                f'The submitted file "{submitted_file_id}" has a file type that is not allowed in this field.'
             )
-        if cf.file.size > 10 * 1024 * 1024:
-            raise ValidationError('The submitted file "{fid}" is too large to be used in this field.'.format(fid=data))
+        if cf.file.size > settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_OTHER]:
+            raise ValidationError(f'The submitted file "{submitted_file_id}" is too large to be used in this field.')
 
         data['options'] = []
         data['answer'] = cf.file
@@ -205,13 +212,10 @@ class AnswerSerializer(I18nAwareModelSerializer):
     def validate(self, data):
         if data.get('question').type == Question.TYPE_FILE:
             return self._handle_file_upload(data)
-        elif data.get('question').type in (
-            Question.TYPE_CHOICE,
-            Question.TYPE_CHOICE_MULTIPLE,
-        ):
+        elif data.get('question').type in Question.OPTION_TYPES:
             if not data.get('options'):
                 raise ValidationError('You need to specify options if the question is of a choice type.')
-            if data.get('question').type == Question.TYPE_CHOICE and len(data.get('options')) > 1:
+            if data.get('question').type in Question.SINGLE_CHOICE_TYPES and len(data.get('options')) > 1:
                 raise ValidationError('You can specify at most one option for this question.')
             for o in data.get('options'):
                 if o.question_id != data.get('question').pk:
@@ -290,7 +294,9 @@ class PositionDownloadsField(serializers.Field):
                 or not instance.order.event.settings.ticket_download_pending
             ):
                 return []
-        if not instance.generate_ticket:
+
+        has_badges_plugin = 'eventyay.plugins.badges' in instance.order.event.plugins
+        if not instance.generate_ticket and not has_badges_plugin:
             return []
 
         request = self.context['request']
@@ -298,22 +304,32 @@ class PositionDownloadsField(serializers.Field):
         responses = register_ticket_outputs.send(instance.order.event)
         for receiver, response in responses:
             provider = response(instance.order.event)
-            if provider.is_enabled:
-                res.append(
-                    {
+            if not provider.is_enabled:
+                continue
+            if provider.identifier != 'badge' and not instance.generate_ticket:
+                continue
+            if provider.identifier == 'badge':
+                from eventyay.plugins.badges.utils import get_badge_layout_for_position
+
+                layout = get_badge_layout_for_position(instance.order.event, instance)
+                if not layout:
+                    continue
+            entry = {
+                'output': provider.identifier,
+                'url': reverse(
+                    'api-v1:orderposition-download',
+                    kwargs={
+                        'organizer': instance.order.event.organizer.slug,
+                        'event': instance.order.event.slug,
+                        'pk': instance.pk,
                         'output': provider.identifier,
-                        'url': reverse(
-                            'api-v1:orderposition-download',
-                            kwargs={
-                                'organizer': instance.order.event.organizer.slug,
-                                'event': instance.order.event.slug,
-                                'pk': instance.pk,
-                                'output': provider.identifier,
-                            },
-                            request=request,
-                        ),
-                    }
-                )
+                    },
+                    request=request,
+                ),
+            }
+            if provider.identifier == 'badge':
+                entry['layout'] = layout.pk
+            res.append(entry)
         return res
 
 
@@ -444,10 +460,13 @@ class OrderPositionSerializer(I18nAwareModelSerializer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         request = self.context.get('request')
+        eventpermset = getattr(request, 'eventpermset', None) if request else None
+        # If eventpermset is not available yet (nested field bind), keep pdf_data;
+        # OrderSerializer / the view will drop it when unauthorized or not requested.
         if (
             not request
-            or not self.context['request'].query_params.get('pdf_data', 'false') == 'true'
-            or 'can_view_orders' not in request.eventpermset
+            or request.query_params.get('pdf_data', 'false') != 'true'
+            or (eventpermset is not None and 'can_view_orders' not in eventpermset)
         ):
             self.fields.pop('pdf_data', None)
 
@@ -466,7 +485,7 @@ class OrderPositionSerializer(I18nAwareModelSerializer):
         if data.get('state'):
             cc = str(data.get('country') or self.instance.country or '')
             if cc not in COUNTRIES_WITH_STATE_IN_ADDRESS:
-                raise ValidationError({'state': ['States are not supported in country "{}".'.format(cc)]})
+                raise ValidationError({'state': [f'States are not supported in country "{cc}".']})
             if not pycountry.subdivisions.get(code=cc + '-' + data.get('state')):
                 raise ValidationError(
                     {'state': ['"{}" is not a known subdivision of the country "{}".'.format(data.get('state'), cc)]}
@@ -478,6 +497,7 @@ class OrderPositionSerializer(I18nAwareModelSerializer):
         # (hopefully), we'll be extra careful here and be explicit about the model fields we update.
         update_fields = [
             'attendee_name_parts',
+            'job_title',
             'company',
             'street',
             'zipcode',
@@ -532,11 +552,6 @@ class OrderPositionSerializer(I18nAwareModelSerializer):
         return instance
 
 
-class RequireAttentionField(serializers.Field):
-    def to_representation(self, instance: OrderPosition):
-        return instance.order.checkin_attention or instance.product.checkin_attention
-
-
 class AttendeeNameField(serializers.Field):
     def to_representation(self, instance: OrderPosition):
         an = instance.attendee_name
@@ -568,10 +583,44 @@ class AttendeeNamePartsField(serializers.Field):
 
 
 class CheckinListOrderPositionSerializer(OrderPositionSerializer):
-    require_attention = RequireAttentionField(source='*')
+    require_attention = serializers.BooleanField(source='require_checkin_attention', read_only=True)
     attendee_name = AttendeeNameField(source='*')
     attendee_name_parts = AttendeeNamePartsField(source='*')
     order__status = serializers.SlugRelatedField(read_only=True, slug_field='status', source='order')
+    badge_customization = serializers.SerializerMethodField(read_only=True)
+    admission_valid_from = serializers.DateTimeField(read_only=True)
+    admission_valid_until = serializers.DateTimeField(read_only=True)
+
+    def get_badge_customization(self, obj):
+        if 'eventyay.plugins.badges' not in obj.order.event.plugins:
+            return None
+        from eventyay.plugins.badges.utils import (
+            get_badge_bundle_option_choices,
+            get_badge_field_display_values,
+            get_badge_field_overrides,
+            get_badge_hidden_fields,
+            get_badge_layout_for_position,
+        )
+
+        layout = get_badge_layout_for_position(obj.order.event, obj)
+        if not layout or not layout.allow_customization:
+            return None
+        # Reuse the resolved layout for display values to avoid a second layout lookup.
+        display_values = get_badge_field_display_values(obj.order.event, obj, layout=layout)
+        return {
+            'allow_customization': True,
+            'allow_badge_editing': layout.allow_badge_editing,
+            'fields': [
+                {
+                    'key': key,
+                    'label': label,
+                    'value': display_values.get(key, ''),
+                }
+                for key, label in get_badge_bundle_option_choices(obj.order.event, obj)
+            ],
+            'hidden_fields': get_badge_hidden_fields(obj),
+            'field_overrides': get_badge_field_overrides(obj),
+        }
 
     class Meta:
         model = OrderPosition
@@ -584,6 +633,7 @@ class CheckinListOrderPositionSerializer(OrderPositionSerializer):
             'price',
             'attendee_name',
             'attendee_name_parts',
+            'job_title',
             'company',
             'street',
             'zipcode',
@@ -605,20 +655,25 @@ class CheckinListOrderPositionSerializer(OrderPositionSerializer):
             'pdf_data',
             'seat',
             'require_attention',
+            'badge_customization',
+            'admission_valid_from',
+            'admission_valid_until',
             'order__status',
         )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        
+        request = self.context.get('request')
+        if request:
+            if 'subevent' in request.query_params.getlist('expand'):
+                self.fields['subevent'] = SubEventSerializer(read_only=True)
 
-        if 'subevent' in self.context['request'].query_params.getlist('expand'):
-            self.fields['subevent'] = SubEventSerializer(read_only=True)
+            if 'product' in request.query_params.getlist('expand'):
+                self.fields['product'] = ProductSerializer(read_only=True)
 
-        if 'product' in self.context['request'].query_params.getlist('expand'):
-            self.fields['product'] = ProductSerializer(read_only=True)
-
-        if 'variation' in self.context['request'].query_params.getlist('expand'):
-            self.fields['variation'] = InlineProductVariationSerializer(read_only=True)
+            if 'variation' in request.query_params.getlist('expand'):
+                self.fields['variation'] = InlineProductVariationSerializer(read_only=True)
 
 
 class OrderPaymentTypeField(serializers.Field):
@@ -787,20 +842,21 @@ class OrderSerializer(I18nAwareModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not self.context['request'].query_params.get('pdf_data', 'false') == 'true':
-            self.fields['positions'].child.fields.pop('pdf_data', None)
+        if 'request' in self.context:
+            if not self.context['request'].query_params.get('pdf_data', 'false') == 'true':
+                self.fields['positions'].child.fields.pop('pdf_data', None)
 
-        for exclude_field in self.context['request'].query_params.getlist('exclude'):
-            p = exclude_field.split('.')
-            if p[0] in self.fields:
-                if len(p) == 1:
-                    del self.fields[p[0]]
-                elif len(p) == 2:
-                    self.fields[p[0]].child.fields.pop(p[1])
+            for exclude_field in self.context['request'].query_params.getlist('exclude'):
+                p = exclude_field.split('.')
+                if p[0] in self.fields:
+                    if len(p) == 1:
+                        del self.fields[p[0]]
+                    elif len(p) == 2:
+                        self.fields[p[0]].child.fields.pop(p[1])
 
     def validate_locale(self, l):
         if l not in set(k for k in self.instance.event.settings.locales):
-            raise ValidationError('"{}" is not a supported locale for this event.'.format(l))
+            raise ValidationError(f'"{l}" is not a supported locale for this event.')
         return l
 
     def update(self, instance, validated_data):
@@ -900,6 +956,13 @@ class OrderFeeCreateSerializer(I18nAwareModelSerializer):
             raise ValidationError('The specified tax rate does not belong to this event.')
         return tr
 
+    def validate(self, data):
+        data = super().validate(data)
+        if data.get('_treat_value_as_percentage') and data.get('value') is not None:
+            if data['value'] < 0 or data['value'] > 100:
+                raise ValidationError({'value': ['Percentage values must be between 0 and 100.']})
+        return data
+
 
 class OrderPositionCreateSerializer(I18nAwareModelSerializer):
     answers = AnswerCreateSerializer(many=True, required=False)
@@ -927,6 +990,7 @@ class OrderPositionCreateSerializer(I18nAwareModelSerializer):
             'attendee_name_parts',
             'attendee_email',
             'company',
+            'job_title',
             'street',
             'zipcode',
             'city',
@@ -996,7 +1060,7 @@ class OrderPositionCreateSerializer(I18nAwareModelSerializer):
         if data.get('state'):
             cc = str(data.get('country') or self.instance.country or '')
             if cc not in COUNTRIES_WITH_STATE_IN_ADDRESS:
-                raise ValidationError({'state': ['States are not supported in country "{}".'.format(cc)]})
+                raise ValidationError({'state': [f'States are not supported in country "{cc}".']})
             if not pycountry.subdivisions.get(code=cc + '-' + data.get('state')):
                 raise ValidationError(
                     {'state': ['"{}" is not a known subdivision of the country "{}".'.format(data.get('state'), cc)]}
@@ -1064,7 +1128,8 @@ class OrderCreateSerializer(I18nAwareModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fields['positions'].child.fields['voucher'].queryset = self.context['event'].vouchers.all()
+        if 'event' in self.context:
+            self.fields['positions'].child.fields['voucher'].queryset = self.context['event'].vouchers.all()
 
     class Meta:
         model = Order
@@ -1279,8 +1344,8 @@ class OrderCreateSerializer(I18nAwareModelSerializer):
                             v_budget[v] -= new_disc
                             if new_disc == Decimal('0.00') or pos_data.get('price') is not None:
                                 errs[i]['voucher'] = [
-                                    'The voucher has a remaining budget of {}, therefore a discount of {} can not be '
-                                    'given.'.format(v_budget[v] + new_disc, disc)
+                                    f'The voucher has a remaining budget of {v_budget[v] + new_disc}, therefore a discount of {disc} can not be '
+                                    'given.'
                                 ]
                                 continue
                             pos_data['price'] = price + (disc - new_disc)
@@ -1710,3 +1775,39 @@ class RevokedTicketSecretSerializer(I18nAwareModelSerializer):
     class Meta:
         model = RevokedTicketSecret
         fields = ('id', 'secret', 'created')
+
+
+class OrderActionSendEmailSerializer(serializers.Serializer):
+    send_email = serializers.BooleanField(
+        default=True,
+        help_text="Whether to send an email to the user about this action.",
+    )
+
+
+class OrderActionCancelSerializer(OrderActionSendEmailSerializer):
+    cancellation_fee = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+        help_text="Optional cancellation fee to retain.",
+    )
+
+
+class OrderActionDenySerializer(OrderActionSendEmailSerializer):
+    comment = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="Optional comment to attach to the denial.",
+    )
+
+
+class OrderActionExtendSerializer(serializers.Serializer):
+    expires = serializers.DateField(
+        required=True,
+        help_text="New expiration date for the order.",
+    )
+    force = serializers.BooleanField(
+        default=False,
+        help_text="Force the extension even if there are quota issues.",
+    )

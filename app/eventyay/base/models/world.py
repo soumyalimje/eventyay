@@ -1,5 +1,4 @@
 from collections import defaultdict
-from typing import List
 from urllib.parse import urljoin
 
 import icalendar
@@ -15,111 +14,30 @@ from eventyay.base.models.auth import User
 from eventyay.base.models.cache import VersionedModel
 from eventyay.core.permissions import (
     MAX_PERMISSIONS_IF_SILENCED,
+    ORGANIZER_ROLES,
     SYSTEM_ROLES,
     Permission,
+    default_grants,
+    default_roles,
+    normalize_permission_value,
+    traits_match_required,
 )
 from eventyay.core.utils.json import CustomJSONEncoder
 from eventyay.base.models.chat import ChatEvent, Membership
-from eventyay.base.models.exhibitor import ContactRequest, ExhibitorStaff, ExhibitorView
 from eventyay.base.models.feedback import Feedback
 from eventyay.base.models.poll import Poll
-from eventyay.base.models.poster import PosterPresenter
-from eventyay.base.models.question import RoomQuestion
 from eventyay.base.models.room import Reaction, RoomView
 from eventyay.base.models.storage_model import StoredFile
 
 
-def default_roles():
-    attendee = [
-        Permission.WORLD_VIEW,
-        Permission.WORLD_EXHIBITION_CONTACT,
-        Permission.WORLD_CHAT_DIRECT,
-    ]
-    viewer = attendee + [Permission.ROOM_VIEW, Permission.ROOM_CHAT_READ]
-    participant = viewer + [
-        Permission.ROOM_CHAT_JOIN,
-        Permission.ROOM_CHAT_SEND,
-        Permission.ROOM_QUESTION_READ,
-        Permission.ROOM_QUESTION_ASK,
-        Permission.ROOM_QUESTION_VOTE,
-        Permission.ROOM_POLL_READ,
-        Permission.ROOM_POLL_VOTE,
-        Permission.ROOM_ROULETTE_JOIN,
-        Permission.ROOM_BBB_JOIN,
-        Permission.ROOM_JANUSCALL_JOIN,
-        Permission.ROOM_ZOOM_JOIN,
-    ]
-    room_creator = [Permission.WORLD_ROOMS_CREATE_CHAT]
-    room_owner = participant + [
-        Permission.ROOM_INVITE,
-        Permission.ROOM_DELETE,
-    ]
-    speaker = participant + [
-        Permission.ROOM_BBB_MODERATE,
-        Permission.ROOM_JANUSCALL_MODERATE,
-        Permission.ROOM_POLL_EARLY_RESULTS,
-    ]
-    moderator = speaker + [
-        Permission.ROOM_VIEWERS,
-        Permission.ROOM_CHAT_MODERATE,
-        Permission.ROOM_ANNOUNCE,
-        Permission.ROOM_BBB_RECORDINGS,
-        Permission.ROOM_QUESTION_MODERATE,
-        Permission.ROOM_POLL_EARLY_RESULTS,
-        Permission.ROOM_POLL_MANAGE,
-        Permission.WORLD_ANNOUNCE,
-    ]
-    admin = (
-        moderator
-        + room_creator
-        + [
-            Permission.WORLD_UPDATE,
-            Permission.ROOM_DELETE,
-            Permission.ROOM_UPDATE,
-            Permission.WORLD_ROOMS_CREATE_BBB,
-            Permission.WORLD_ROOMS_CREATE_STAGE,
-            Permission.WORLD_ROOMS_CREATE_EXHIBITION,
-            Permission.WORLD_ROOMS_CREATE_POSTER,
-            Permission.WORLD_USERS_LIST,
-            Permission.WORLD_USERS_MANAGE,
-            Permission.WORLD_GRAPHS,
-            Permission.WORLD_CONNECTIONS_UNLIMITED,
-        ]
-    )
-    apiuser = admin + [Permission.WORLD_API, Permission.WORLD_SECRETS]
-    scheduleuser = [Permission.WORLD_API]
-    return {
-        "attendee": attendee,
-        "viewer": viewer,
-        "participant": participant,
-        "room_creator": room_creator,
-        "room_owner": room_owner,
-        "speaker": speaker,
-        "moderator": moderator,
-        "admin": admin,
-        "apiuser": apiuser,
-        "scheduleuser": scheduleuser,
-    }
-
-
-def default_grants():
-    return {
-        "attendee": ["attendee"],
-        "admin": ["admin"],
-        "scheduleuser": ["schedule-update"],
-    }
-
-
 FEATURE_FLAGS = [
     "schedule-control",
-    "iframe-player",
     "roulette",
     "muxdata",
     "page.landing",
     "zoom",
     "janus",
     "polls",
-    "poster",
     "conftool",
     "cross-origin-isolation",
 ]
@@ -192,40 +110,38 @@ class World(VersionedModel):
         self,
         *,
         traits,
-        permissions: List[Permission],
+        permissions: list[Permission],
         room=None,
         allow_empty_traits=True,
     ):
         for role, required_traits in self.trait_grants.items():
-            if (
-                isinstance(required_traits, list)
-                and all(
-                    any(x in traits for x in (r if isinstance(r, list) else [r]))
-                    for r in required_traits
-                )
-                and (required_traits or allow_empty_traits)
+            if role in ORGANIZER_ROLES:
+                if not required_traits or not traits_match_required(traits, required_traits):
+                    continue
+            else:
+                if not (traits_match_required(traits, required_traits) and (required_traits or allow_empty_traits)):
+                    continue
+            role_perms = self.roles.get(role, SYSTEM_ROLES.get(role, []))
+            if any(
+                normalize_permission_value(p) in role_perms
+                for p in permissions
             ):
-                if any(
-                    p.value in self.roles.get(role, SYSTEM_ROLES.get(role, []))
-                    for p in permissions
-                ):
-                    return True
+                return True
 
         if room:
             for role, required_traits in room.trait_grants.items():
-                if (
-                    isinstance(required_traits, list)
-                    and all(
-                        any(x in traits for x in (r if isinstance(r, list) else [r]))
-                        for r in required_traits
-                    )
-                    and (required_traits or allow_empty_traits)
+                if role in ORGANIZER_ROLES:
+                    if not required_traits or not traits_match_required(traits, required_traits):
+                        continue
+                else:
+                    if not (traits_match_required(traits, required_traits) and (required_traits or allow_empty_traits)):
+                        continue
+                role_perms = self.roles.get(role, SYSTEM_ROLES.get(role, []))
+                if any(
+                    normalize_permission_value(p) in role_perms
+                    for p in permissions
                 ):
-                    if any(
-                        p.value in self.roles.get(role, SYSTEM_ROLES.get(role, []))
-                        for p in permissions
-                    ):
-                        return True
+                    return True
 
     def has_permission(self, *, user, permission: Permission, room=None):
         """
@@ -245,7 +161,7 @@ class World(VersionedModel):
             return False
 
         if self.has_permission_implicit(
-            traits=user.traits,
+            traits=user.traits or [],
             permissions=permission,
             room=room,
             allow_empty_traits=user.type == User.UserType.PERSON,
@@ -254,10 +170,8 @@ class World(VersionedModel):
 
         roles = user.get_role_grants(room)
         for r in roles:
-            if any(
-                p.value in self.roles.get(r, SYSTEM_ROLES.get(r, []))
-                for p in permission
-            ):
+            role_perms = self.roles.get(r, SYSTEM_ROLES.get(r, []))
+            if any(normalize_permission_value(p) in role_perms for p in permission):
                 return True
 
     async def has_permission_async(self, *, user, permission: Permission, room=None):
@@ -278,7 +192,7 @@ class World(VersionedModel):
             return False
 
         if self.has_permission_implicit(
-            traits=user.traits,
+            traits=user.traits or [],
             permissions=permission,
             room=room,
             allow_empty_traits=user.type == User.UserType.PERSON,
@@ -287,10 +201,8 @@ class World(VersionedModel):
 
         roles = await user.get_role_grants_async(room)
         for r in roles:
-            if any(
-                p.value in self.roles.get(r, SYSTEM_ROLES.get(r, []))
-                for p in permission
-            ):
+            role_perms = self.roles.get(r, SYSTEM_ROLES.get(r, []))
+            if any(normalize_permission_value(p) in role_perms for p in permission):
                 return True
 
     def get_all_permissions(self, user):
@@ -300,17 +212,16 @@ class World(VersionedModel):
             return result
 
         allow_empty_traits = user.type == User.UserType.PERSON
+        user_traits = user.traits or []
 
         for role, required_traits in self.trait_grants.items():
-            if (
-                isinstance(required_traits, list)
-                and all(
-                    any(x in user.traits for x in (r if isinstance(r, list) else [r]))
-                    for r in required_traits
-                )
-                and (required_traits or allow_empty_traits)
-            ):
-                result[self].update(self.roles.get(role, SYSTEM_ROLES.get(role, [])))
+            if role in ORGANIZER_ROLES:
+                if not required_traits or not traits_match_required(user_traits, required_traits):
+                    continue
+            else:
+                if not (traits_match_required(user_traits, required_traits) and (required_traits or allow_empty_traits)):
+                    continue
+            result[self].update(self.roles.get(role, SYSTEM_ROLES.get(role, [])))
 
         for grant in user.world_grants.all():
             result[self].update(
@@ -319,20 +230,15 @@ class World(VersionedModel):
 
         for room in self.rooms.all():
             for role, required_traits in room.trait_grants.items():
-                if (
-                    isinstance(required_traits, list)
-                    and all(
-                        any(
-                            x in user.traits
-                            for x in (r if isinstance(r, list) else [r])
-                        )
-                        for r in required_traits
-                    )
-                    and (required_traits or allow_empty_traits)
-                ):
-                    result[room].update(
-                        self.roles.get(role, SYSTEM_ROLES.get(role, []))
-                    )
+                if role in ORGANIZER_ROLES:
+                    if not required_traits or not traits_match_required(user_traits, required_traits):
+                        continue
+                else:
+                    if not (traits_match_required(user_traits, required_traits) and (required_traits or allow_empty_traits)):
+                        continue
+                result[room].update(
+                    self.roles.get(role, SYSTEM_ROLES.get(role, []))
+                )
 
         for grant in user.room_grants.select_related("room"):
             result[grant.room].update(
@@ -346,21 +252,16 @@ class World(VersionedModel):
 
     def clear_data(self):
         """
-        Clears all personal information. It generally leaves structure such as rooms and exhibitors intact, but to make
-        sure all personal data is scrubbed, it also clears all uploaded files, which includes things like exhibitor
-        logos.
+        Clears all personal information. It generally leaves structure such as rooms intact, but to make
+        sure all personal data is scrubbed, it also clears all uploaded files.
         """
-        
+
         self.audit_logs.all().delete()
         self.world_grants.all().delete()
         self.room_grants.all().delete()
         self.bbb_calls.all().delete()
         ChatEvent.objects.filter(channel__world=self).delete()
         Membership.objects.filter(channel__world=self).delete()
-        ExhibitorStaff.objects.filter(exhibitor__world=self).delete()
-        PosterPresenter.objects.filter(poster__world=self).delete()
-        ContactRequest.objects.filter(exhibitor__world=self).delete()
-        ExhibitorView.objects.filter(exhibitor__world=self).delete()
         Reaction.objects.filter(room__world=self).delete()
         RoomView.objects.filter(room__world=self).delete()
         WorldView.objects.filter(world=self).delete()
@@ -439,50 +340,18 @@ class World(VersionedModel):
         self.external_auth_url = old.external_auth_url
         self.save()
 
-        room_map = {}
         for r in old.rooms.all():
             try:
                 has_channel = r.channel
             except Exception:
                 has_channel = False
 
-            old_id = r.pk
             r.pk = None
             r.world = self
             r.module_config = clone_stored_files(struct=r.module_config)
             r.save()
-            room_map[old_id] = r
             if has_channel:
                 Channel.objects.create(room=r, world=self)
-
-        for r in old.rooms.prefetch_related(
-            "exhibitors", "exhibitors__links", "exhibitors__social_media_links"
-        ):
-            for ex in r.exhibitors.all():
-                old_links = list(ex.links.all())
-                old_smlinks = list(ex.social_media_links.all())
-
-                ex.pk = None
-                ex.world = self
-                ex.room = room_map[ex.room_id]
-                if ex.highlighted_room_id:
-                    ex.highlighted_room = room_map[ex.highlighted_room_id]
-                clone_stored_files(
-                    inst=ex, attrs=["logo", "banner_list", "banner_detail"]
-                )
-                ex.text_content = clone_stored_files(struct=ex.text_content)
-                ex.save()
-
-                for link in old_smlinks:
-                    link.pk = None
-                    link.exhibitor = ex
-                    link.save()
-
-                for link in old_links:
-                    link.pk = None
-                    clone_stored_files(inst=link, attrs=["url"])
-                    link.exhibitor = ex
-                    link.save()
 
 
 class PlannedUsage(models.Model):

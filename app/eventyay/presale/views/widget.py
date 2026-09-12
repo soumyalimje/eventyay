@@ -4,10 +4,12 @@ import json
 import logging
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
 
 import isoweek
-import pytz
+import datetime
+
 from django.conf import settings
 from django.contrib.staticfiles import finders
 from django.core.cache import cache
@@ -39,6 +41,7 @@ from eventyay.helpers.thumb import get_thumbnail
 from eventyay.multidomain.urlreverse import build_absolute_uri
 from eventyay.presale.views.cart import get_or_create_cart_id
 from eventyay.presale.views.event import (
+    event_has_redeemable_voucher_products,
     get_grouped_products,
     product_group_by_category,
 )
@@ -209,8 +212,9 @@ def get_picture(event, picture):
 class WidgetAPIProductList(EventListMixin, View):
     def _get_products(self):
         qs = self.request.event.products
-        if 'products' in self.request.GET:
-            qs = qs.filter(pk__in=self.request.GET.get('products').split(','))
+        item_filter = self.request.GET.get('items') or self.request.GET.get('products')
+        if item_filter:
+            qs = qs.filter(pk__in=item_filter.split(','))
         if 'categories' in self.request.GET:
             qs = qs.filter(category__pk__in=self.request.GET.get('categories').split(','))
 
@@ -228,15 +232,15 @@ class WidgetAPIProductList(EventListMixin, View):
                 {
                     'id': cat.pk if cat else None,
                     'name': str(cat.name) if cat else None,
-                    'description': str(rich_text(cat.description, safelinks=False))
+                    'description': str(rich_text(cat.description))
                     if cat and cat.description
                     else None,
-                    'products': [
+                    'items': [
                         {
                             'id': product.pk,
                             'name': str(product.name),
                             'picture': get_picture(self.request.event, product.picture) if product.picture else None,
-                            'description': str(rich_text(product.description, safelinks=False))
+                            'description': str(rich_text(product.description))
                             if product.description
                             else None,
                             'has_variations': product.has_variations,
@@ -269,7 +273,7 @@ class WidgetAPIProductList(EventListMixin, View):
                                     'id': var.id,
                                     'value': str(var.value),
                                     'order_max': var.order_max,
-                                    'description': str(rich_text(var.description, safelinks=False))
+                                    'description': str(rich_text(var.description))
                                     if var.description
                                     else None,
                                     'price': price_dict(product, var.display_price),
@@ -320,7 +324,7 @@ class WidgetAPIProductList(EventListMixin, View):
         if not hasattr(request, 'event'):
             return self._get_event_list(request, **kwargs)
 
-        if not request.event.live:
+        if not request.event.live or not request.event.user_can_view_tickets(request.user, request=request):
             return self.response({'error': gettext('This ticket shop is currently disabled.')})
 
         if request.sales_channel.identifier not in request.event.sales_channels:
@@ -399,6 +403,8 @@ class WidgetAPIProductList(EventListMixin, View):
 
     def _get_date_range(self, ev, event, tz=None):
         tz = tz or event.timezone
+        if isinstance(tz, str):
+            tz = ZoneInfo(key=tz)
         dr = ev.get_date_range_display(tz)
         if event.settings.show_times:
             dr += ' ' + date_format(ev.date_from.astimezone(tz), 'TIME_FORMAT')
@@ -418,7 +424,7 @@ class WidgetAPIProductList(EventListMixin, View):
                 event = ev.event
             else:
                 event = ev
-            tz = pytz.timezone(e['timezone'])
+            tz = ZoneInfo(e['timezone'])
             time = (
                 date_format(ev.date_from.astimezone(tz), 'TIME_FORMAT')
                 if e.get('time') and event.settings.show_times
@@ -465,7 +471,7 @@ class WidgetAPIProductList(EventListMixin, View):
 
         if hasattr(self.request, 'event'):
             data['name'] = str(request.event.name)
-            data['frontpage_text'] = str(rich_text(request.event.settings.frontpage_text, safelinks=False))
+            data['frontpage_text'] = str(rich_text(request.event.settings.frontpage_text))
 
         cache_key = ':'.join(
             [
@@ -488,9 +494,9 @@ class WidgetAPIProductList(EventListMixin, View):
 
             data['date'] = date(self.year, self.month, 1)
             if hasattr(self.request, 'event'):
-                tz = pytz.timezone(self.request.event.settings.timezone)
+                tz = ZoneInfo(self.request.event.settings.timezone)
             else:
-                tz = pytz.UTC
+                tz = datetime.timezone.utc
             before = datetime(self.year, self.month, 1, 0, 0, 0, tzinfo=tz) - timedelta(days=1)
             after = datetime(self.year, self.month, ndays, 0, 0, 0, tzinfo=tz) + timedelta(days=1)
 
@@ -557,9 +563,9 @@ class WidgetAPIProductList(EventListMixin, View):
             self._set_week_year()
 
             if hasattr(self.request, 'event'):
-                tz = pytz.timezone(self.request.event.settings.timezone)
+                tz = ZoneInfo(self.request.event.settings.timezone)
             else:
-                tz = pytz.UTC
+                tz = datetime.timezone.utc
 
             week = isoweek.Week(self.year, self.week)
             data['week'] = [self.year, self.week]
@@ -637,7 +643,7 @@ class WidgetAPIProductList(EventListMixin, View):
                         self.request,
                     )
                 )
-                tz = pytz.timezone(request.event.settings.timezone)
+                tz = ZoneInfo(request.event.settings.timezone)
                 if self.request.event.settings.event_list_available_only:
                     evs = [
                         se
@@ -660,7 +666,7 @@ class WidgetAPIProductList(EventListMixin, View):
                 data['events'] = []
                 qs = self._get_event_queryset()
                 for event in qs:
-                    tz = pytz.timezone(event.cache.get_or_set('timezone', lambda: event.settings.timezone))
+                    tz = ZoneInfo(event.cache.get_or_set('timezone', lambda: event.settings.timezone))
                     if event.has_subevents:
                         dr = daterange(
                             event.min_from.astimezone(tz),
@@ -722,9 +728,9 @@ class WidgetAPIProductList(EventListMixin, View):
         ev = self.subevent or request.event
         data['name'] = str(ev.name)
         if self.subevent:
-            data['frontpage_text'] = str(rich_text(self.subevent.frontpage_text, safelinks=False))
+            data['frontpage_text'] = str(rich_text(self.subevent.frontpage_text))
         else:
-            data['frontpage_text'] = str(rich_text(request.event.settings.frontpage_text, safelinks=False))
+            data['frontpage_text'] = str(rich_text(request.event.settings.frontpage_text))
         data['date_range'] = self._get_date_range(ev, request.event)
         fail = False
 
@@ -780,20 +786,20 @@ class WidgetAPIProductList(EventListMixin, View):
                 fail = True
 
         if not fail and (ev.presale_is_running or request.event.settings.show_products_outside_presale_period):
-            data['products_by_category'], data['display_add_to_cart'], data['productnum'] = self._get_products()
+            data['items_by_category'], data['display_add_to_cart'], data['itemnum'] = self._get_products()
             data['display_add_to_cart'] = data['display_add_to_cart'] and ev.presale_is_running
         else:
-            data['products_by_category'] = []
+            data['items_by_category'] = []
             data['display_add_to_cart'] = False
-            data['productnum'] = 0
+            data['itemnum'] = 0
 
         data['has_seating_plan'] = ev.seating_plan is not None
 
-        vouchers_exist = self.request.event.get_cache().get('vouchers_exist')
-        if vouchers_exist is None:
-            vouchers_exist = self.request.event.vouchers.exists()
-            self.request.event.get_cache().set('vouchers_exist', vouchers_exist)
-        data['vouchers_exist'] = vouchers_exist
+        data['vouchers_exist'] = event_has_redeemable_voucher_products(
+            request.event,
+            self.subevent,
+            channel=request.sales_channel.identifier,
+        )
 
         if 'cart_id' not in request.GET:
             cache.set(cache_key, data, 10)

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from collections import defaultdict
 from contextlib import suppress
@@ -9,13 +11,12 @@ from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext as _n
 from django_scopes.forms import SafeModelMultipleChoiceField
 
+from eventyay.base.models import Review, Submission, SubmissionStates, TalkQuestion, User
 from eventyay.common.forms.mixins import ReadOnlyFlag
 from eventyay.common.forms.renderers import InlineFormRenderer, TabularFormRenderer
-from eventyay.common.forms.widgets import EnhancedSelectMultiple, MarkdownWidget
+from eventyay.common.forms.widgets import EnhancedSelectMultiple, RichTextWidget
 from eventyay.common.text.phrases import phrases
 from eventyay.orga.forms.export import ExportForm
-from eventyay.base.models import User
-from eventyay.base.models import TalkQuestion, Review, Submission, SubmissionStates
 
 
 class TagsForm(ReadOnlyFlag, forms.ModelForm):
@@ -81,7 +82,6 @@ class ReviewForm(ReadOnlyFlag, forms.ModelForm):
                 hide_optional=self.event.review_settings['score_mandatory'],
             )
         self.fields['text'].widget.attrs['rows'] = 2
-        self.fields['text'].help_text += ' ' + phrases.base.use_markdown
 
     def build_score_field(self, category, read_only=False, initial=None, hide_optional=False):
         choices = [(None, _('No score'))] if (not category.required or self.allow_empty) else []
@@ -155,7 +155,7 @@ class ReviewForm(ReadOnlyFlag, forms.ModelForm):
         model = Review
         fields = ('text',)
         widgets = {
-            'text': MarkdownWidget,
+            'text': RichTextWidget,
         }
 
 
@@ -174,14 +174,15 @@ class DirectionForm(forms.Form):
 class ReviewAssignmentForm(forms.Form):
     def __init__(self, *args, event=None, **kwargs):
         self.event = event
+        review_teams = self.event.teams.filter(Q(is_reviewer=True) | Q(can_change_submissions=True)).distinct()
         self.reviewers = (
-            User.objects.filter(teams__in=self.event.teams.filter(is_reviewer=True)).order_by('fullname').distinct()
+            User.objects.filter(teams__in=review_teams).order_by('fullname').distinct()
         ).prefetch_related('assigned_reviews', 'teams', 'teams__limit_tracks')
         self.submissions = (
             self.event.submissions.order_by('title').select_related('track').prefetch_related('assigned_reviewers')
         )
         self.reviewers_by_track = defaultdict(set)
-        for team in self.event.teams.filter(is_reviewer=True).prefetch_related('members', 'limit_tracks'):
+        for team in review_teams.prefetch_related('members', 'limit_tracks'):
             if team.limit_tracks.exists():
                 for track in team.limit_tracks.all():
                     self.reviewers_by_track[track].update(team.members.all())
@@ -296,7 +297,7 @@ class ReviewExportForm(ExportForm):
         model = Review
         model_fields = ['score', 'text', 'created', 'updated']
 
-    def __init__(self, *args, user=None, **kwargs):
+    def __init__(self, *args, user: User | None = None, **kwargs):
         self.user = user
         super().__init__(*args, **kwargs)
         self.fields['text'].label = phrases.base.text_body
@@ -360,7 +361,9 @@ class ReviewExportForm(ExportForm):
         queryset = Review.objects.filter(submission__event=self.event)
         if target != 'all':
             queryset = queryset.filter(submission__in=self.event.submissions.filter(state=target)).distinct()
-        # TODO auto-adjust further to available tracks etc
+        from eventyay.talk_rules.submission import submissions_for_user
+
+        queryset = queryset.filter(submission__in=submissions_for_user(self.event, self.user))
         queryset = queryset.exclude(submission__speakers__in=[self.user]).distinct()
         return queryset.select_related('submission', 'user').prefetch_related(
             'answers', 'answers__question', 'scores', 'scores__category'

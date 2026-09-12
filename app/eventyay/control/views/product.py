@@ -1,4 +1,5 @@
 import json
+import logging
 from collections import OrderedDict, namedtuple
 from json.decoder import JSONDecodeError
 
@@ -6,7 +7,7 @@ from django.contrib import messages
 from django.core.exceptions import PermissionDenied
 from django.core.files import File
 from django.db import transaction
-from django.db.models import Count, Exists, F, OuterRef, Prefetch, Q
+from django.db.models import Count, Exists, F, Max, OuterRef, Prefetch, Q
 from django.forms.models import inlineformset_factory
 from django.http import (
     Http404,
@@ -15,15 +16,18 @@ from django.http import (
     HttpResponseRedirect,
     JsonResponse,
 )
-from django.shortcuts import redirect
+from django.shortcuts import get_object_or_404, redirect
 from django.urls import resolve, reverse
+from django.utils.decorators import method_decorator
 from django.utils.functional import cached_property
 from django.utils.timezone import now
 from django.utils.translation import gettext
 from django.utils.translation import gettext_lazy as _
-from django.views.generic import ListView
+from django.views import View
+from django.views.decorators.csrf import ensure_csrf_cookie
+from django.views.generic import FormView, ListView
 from django.views.generic.detail import DetailView, SingleObjectMixin
-from django.views.generic.edit import DeleteView
+from django.views.generic.edit import CreateView, DeleteView, UpdateView
 from django_countries.fields import Country
 
 from eventyay.api.serializers.product import (
@@ -34,10 +38,10 @@ from eventyay.api.serializers.product import (
 from eventyay.base.forms import I18nFormSet
 from eventyay.base.models import (
     CartPosition,
+    Order,
     Product,
     ProductCategory,
     ProductVariation,
-    Order,
     Question,
     QuestionAnswer,
     QuestionOption,
@@ -47,8 +51,17 @@ from eventyay.base.models import (
 from eventyay.base.models.event import SubEvent
 from eventyay.base.models.product import ProductAddOn, ProductBundle, ProductMetaValue
 from eventyay.base.services.quotas import QuotaAvailability
+from eventyay.base.services.system_questions import (
+    STATE_DO_NOT_ASK,
+    SYSTEM_QUESTION_FIELDS,
+    get_enabled_system_question_fields,
+    get_system_question_base_states,
+    get_system_question_product_overrides,
+)
 from eventyay.base.services.tickets import invalidate_cache
+from eventyay.base.services.waitinglist import assign_automatically
 from eventyay.base.signals import quota_availability
+from eventyay.control.forms.event import OrderFormDefaultFieldSettingsForm, OrderFormSettingsForm
 from eventyay.control.forms.product import (
     CategoryForm,
     DescriptionForm,
@@ -69,6 +82,7 @@ from eventyay.control.permissions import (
     EventPermissionRequiredMixin,
     event_permission_required,
 )
+from eventyay.control.views.event import EventSettingsFormView
 from eventyay.control.signals import product_forms, product_formsets
 from eventyay.helpers.models import modelcopy
 
@@ -76,13 +90,14 @@ from ...base.channels import get_all_sales_channels
 from . import ChartContainingView, CreateView, PaginationMixin, UpdateView
 
 
-class ProductList(ListView):
+logger = logging.getLogger(__name__)
+
+
+class ProductList(EventPermissionRequiredMixin, PaginationMixin, ListView):
     model = Product
     context_object_name = 'products'
-    # paginate_by = 30
-    # Pagination is disabled as it is very unlikely to be necessary
-    # here and could cause problems with the "reorder-within-category" feature
     template_name = 'pretixcontrol/items/index.html'
+    permission = 'can_change_items'
 
     def get_queryset(self):
         return (
@@ -94,6 +109,39 @@ class ProductList(ListView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
+        products = list(ctx['products'])
+        category_ids = {product.category_id for product in products}
+        category_filter = Q()
+        non_empty_category_ids = {category_id for category_id in category_ids if category_id is not None}
+        if non_empty_category_ids:
+            category_filter |= Q(category_id__in=non_empty_category_ids)
+        if None in category_ids:
+            category_filter |= Q(category__isnull=True)
+
+        products_by_category = {}
+        if category_filter:
+            for product_id, category_id in (
+                self.request.event.products.filter(category_filter)
+                .order_by('category_id', 'position')
+                .values_list('id', 'category_id')
+            ):
+                products_by_category.setdefault(category_id, []).append(product_id)
+
+        move_states = {}
+        for category_products in products_by_category.values():
+            last_index = len(category_products) - 1
+            for index, product_id in enumerate(category_products):
+                move_states[product_id] = {
+                    'can_move_up': index > 0,
+                    'can_move_down': index < last_index,
+                }
+
+        for product in products:
+            state = move_states.get(product.pk, {})
+            product.can_move_up = state.get('can_move_up', False)
+            product.can_move_down = state.get('can_move_down', False)
+
+        ctx['products'] = products
         ctx['sales_channels'] = get_all_sales_channels()
         return ctx
 
@@ -123,24 +171,30 @@ def product_move(request, product, up=True):
     messages.success(request, _('The order of products has been updated.'))
 
 
+def product_list_redirect(request):
+    url = reverse(
+        'control:event.products',
+        kwargs={
+            'organizer': request.event.organizer.slug,
+            'event': request.event.slug,
+        },
+    )
+    query = request.GET.urlencode()
+    if query:
+        url = f'{url}?{query}'
+    return HttpResponseRedirect(url)
+
+
 @event_permission_required('can_change_items')
 def product_move_up(request, organizer, event, product):
     product_move(request, product, up=True)
-    return redirect(
-        'control:event.products',
-        organizer=request.event.organizer.slug,
-        event=request.event.slug,
-    )
+    return product_list_redirect(request)
 
 
 @event_permission_required('can_change_items')
 def product_move_down(request, organizer, event, product):
     product_move(request, product, up=False)
-    return redirect(
-        'control:event.products',
-        organizer=request.event.organizer.slug,
-        event=request.event.slug,
-    )
+    return product_list_redirect(request)
 
 
 class CategoryDelete(EventPermissionRequiredMixin, DeleteView):
@@ -268,10 +322,11 @@ class CategoryCreate(EventPermissionRequiredMixin, CreateView):
         return super().form_invalid(form)
 
 
-class CategoryList(PaginationMixin, ListView):
+class CategoryList(EventPermissionRequiredMixin, PaginationMixin, ListView):
     model = ProductCategory
     context_object_name = 'categories'
     template_name = 'pretixcontrol/items/categories.html'
+    permission = 'can_change_items'
 
     def get_queryset(self):
         return self.request.event.categories.all()
@@ -328,87 +383,25 @@ def category_move_down(request, organizer, event, category):
     )
 
 
-FakeQuestion = namedtuple('FakeQuestion', 'id question position required')
+class QuestionList(EventPermissionRequiredMixin, View):
+    """
+    Redirects to Order Forms page where custom fields are now integrated.
+    This view is kept for backward compatibility with any external links.
+    """
 
+    permission = 'can_change_items'
 
-class QuestionList(ListView):
-    model = Question
-    context_object_name = 'questions'
-    template_name = 'pretixcontrol/items/questions.html'
-
-    def get_queryset(self):
-        return self.request.event.questions.prefetch_related('products')
-
-    def get_context_data(self, **kwargs):
-        ctx = super().get_context_data(**kwargs)
-        ctx['questions'] = list(ctx['questions'])
-
-        if self.request.event.settings.attendee_names_asked:
-            ctx['questions'].append(
-                FakeQuestion(
-                    id='attendee_name_parts',
-                    question=_('Attendee name'),
-                    position=self.request.event.settings.system_question_order.get('attendee_name_parts', 0),
-                    required=self.request.event.settings.attendee_names_required,
-                )
+    def get(self, request, *args, **kwargs):
+        # Redirect to the Order Forms page where custom fields are now managed
+        return HttpResponseRedirect(
+            reverse(
+                'control:event.products.orderforms',
+                kwargs={
+                    'organizer': request.event.organizer.slug,
+                    'event': request.event.slug,
+                },
             )
-
-        if self.request.event.settings.attendee_emails_asked:
-            ctx['questions'].append(
-                FakeQuestion(
-                    id='attendee_email',
-                    question=_('Attendee email'),
-                    position=self.request.event.settings.system_question_order.get('attendee_email', 0),
-                    required=self.request.event.settings.attendee_emails_required,
-                )
-            )
-
-        if self.request.event.settings.attendee_emails_asked:
-            ctx['questions'].append(
-                FakeQuestion(
-                    id='company',
-                    question=_('Company'),
-                    position=self.request.event.settings.system_question_order.get('company', 0),
-                    required=self.request.event.settings.attendee_company_required,
-                )
-            )
-
-        if self.request.event.settings.attendee_addresses_asked:
-            ctx['questions'].append(
-                FakeQuestion(
-                    id='street',
-                    question=_('Street'),
-                    position=self.request.event.settings.system_question_order.get('street', 0),
-                    required=self.request.event.settings.attendee_addresses_required,
-                )
-            )
-            ctx['questions'].append(
-                FakeQuestion(
-                    id='zipcode',
-                    question=_('ZIP code'),
-                    position=self.request.event.settings.system_question_order.get('zipcode', 0),
-                    required=self.request.event.settings.attendee_addresses_required,
-                )
-            )
-            ctx['questions'].append(
-                FakeQuestion(
-                    id='city',
-                    question=_('City'),
-                    position=self.request.event.settings.system_question_order.get('city', 0),
-                    required=self.request.event.settings.attendee_addresses_required,
-                )
-            )
-            ctx['questions'].append(
-                FakeQuestion(
-                    id='country',
-                    question=_('Country'),
-                    position=self.request.event.settings.system_question_order.get('country', 0),
-                    required=self.request.event.settings.attendee_addresses_required,
-                )
-            )
-
-        ctx['questions'].sort(key=lambda q: q.position)
-        return ctx
+        )
 
 
 @transaction.atomic
@@ -419,13 +412,16 @@ def reorder_questions(request, organizer, event):
     except (JSONDecodeError, KeyError, ValueError):
         return HttpResponseBadRequest('expected JSON: {ids:[]}')
 
-    input_questions = request.event.questions.filter(id__in=[i for i in ids if i.isdigit()])
+    digit_ids = [i for i in ids if i.isdigit()]
+    input_questions = request.event.questions.none()
+    if digit_ids:
+        input_questions = request.event.questions.filter(id__in=digit_ids)
 
-    if input_questions.count() != len([i for i in ids if i.isdigit()]):
-        raise Http404(_('Some of the provided question ids are invalid.'))
+        if input_questions.count() != len(digit_ids):
+            raise Http404(_('Some of the provided question ids are invalid.'))
 
-    if input_questions.count() != request.event.questions.count():
-        raise Http404(_('Not all questions have been selected.'))
+        if input_questions.count() != request.event.questions.count():
+            raise Http404(_('Not all questions have been selected.'))
 
     for q in input_questions:
         pos = ids.index(str(q.pk))
@@ -438,10 +434,14 @@ def reorder_questions(request, organizer, event):
         'attendee_name_parts',
         'attendee_email',
         'company',
+        'job_title',
         'street',
         'zipcode',
         'city',
         'country',
+        'order_email',
+        'order_phone',
+        'name_address',
     ):
         if s in ids:
             system_question_order[s] = ids.index(s)
@@ -480,7 +480,7 @@ class QuestionDelete(EventPermissionRequiredMixin, DeleteView):
 
     def get_success_url(self) -> str:
         return reverse(
-            'control:event.products.questions',
+            'control:event.products.orderforms',
             kwargs={
                 'organizer': self.request.event.organizer.slug,
                 'event': self.request.event.slug,
@@ -490,6 +490,76 @@ class QuestionDelete(EventPermissionRequiredMixin, DeleteView):
 
 class DescriptionDelete(QuestionDelete):
     template_name = 'pretixcontrol/items/desciption_delete.html'
+
+
+@method_decorator(ensure_csrf_cookie, name='dispatch')
+class QuestionToggle(EventPermissionRequiredMixin, View):
+    """Toggle question field states via AJAX POST."""
+
+    permission = 'can_change_items'
+
+    def get_object(self) -> Question:
+        return get_object_or_404(Question, event=self.request.event, pk=self.kwargs.get('question'))
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        question = self.get_object()
+
+        try:
+            data = json.loads(request.body.decode())
+        except json.JSONDecodeError as e:
+            logger.warning('Invalid JSON in QuestionToggle request: %s', e)
+            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+        field = data.get('field')
+        value = data.get('value')
+
+        # Validate that the field name is present
+        if field is None:
+            return JsonResponse({'error': 'Missing field parameter'}, status=400)
+
+        if field == 'required':
+            # Validate presence and type for boolean fields
+            if value is None or not isinstance(value, bool):
+                logger.warning(
+                    'Invalid value for question %s field %s: expected bool, got %s',
+                    question.pk,
+                    field,
+                    type(value).__name__ if value is not None else 'None',
+                )
+                return JsonResponse(
+                    {
+                        'error': 'Value must be a boolean for required field',
+                        'received': type(value).__name__ if value is not None else 'None',
+                    },
+                    status=400,
+                )
+            question.required = value
+            question.save(update_fields=['required'])
+            question.log_action('eventyay.event.question.changed', user=self.request.user, data={'required': value})
+        elif field == 'active':
+            # Validate presence and type for boolean fields
+            if value is None or not isinstance(value, bool):
+                logger.warning(
+                    'Invalid value for question %s field %s: expected bool, got %s',
+                    question.pk,
+                    field,
+                    type(value).__name__ if value is not None else 'None',
+                )
+                return JsonResponse(
+                    {
+                        'error': 'Value must be a boolean for active field',
+                        'received': type(value).__name__ if value is not None else 'None',
+                    },
+                    status=400,
+                )
+            question.active = value
+            question.save(update_fields=['active'])
+            question.log_action('eventyay.event.question.changed', user=self.request.user, data={'active': value})
+        else:
+            return JsonResponse({'error': f'Invalid field: {field}'}, status=400)
+
+        return JsonResponse({'success': True, 'field': field, 'value': getattr(question, field)})
 
 
 class QuestionMixin:
@@ -603,7 +673,7 @@ class QuestionView(EventPermissionRequiredMixin, QuestionMixin, ChartContainingV
                     'count': qs.filter(file__isnull=False).count(),
                 }
             ]
-        elif self.object.type in (Question.TYPE_CHOICE, Question.TYPE_CHOICE_MULTIPLE):
+        elif self.object.type in Question.OPTION_TYPES:
             qs = (
                 qs.order_by('options')
                 .values('options', 'options__answer')
@@ -660,7 +730,7 @@ class QuestionView(EventPermissionRequiredMixin, QuestionMixin, ChartContainingV
 
     def get_success_url(self) -> str:
         return reverse(
-            'control:event.products.questions',
+            'control:event.products.orderforms',
             kwargs={
                 'organizer': self.request.event.organizer.slug,
                 'event': self.request.event.slug,
@@ -683,7 +753,7 @@ class QuestionUpdate(EventPermissionRequiredMixin, QuestionMixin, UpdateView):
 
     @transaction.atomic
     def form_valid(self, form):
-        if form.cleaned_data.get('type') in ('M', 'C'):
+        if form.cleaned_data.get('type') in Question.OPTION_TYPES:
             if not self.save_formset(self.get_object()):
                 return self.get(self.request, *self.args, **self.kwargs)
 
@@ -698,7 +768,7 @@ class QuestionUpdate(EventPermissionRequiredMixin, QuestionMixin, UpdateView):
 
     def get_success_url(self) -> str:
         return reverse(
-            'control:event.products.questions',
+            'control:event.products.orderforms',
             kwargs={
                 'organizer': self.request.event.organizer.slug,
                 'event': self.request.event.slug,
@@ -729,7 +799,7 @@ class QuestionCreate(EventPermissionRequiredMixin, QuestionMixin, CreateView):
 
     def get_success_url(self) -> str:
         return reverse(
-            'control:event.products.questions',
+            'control:event.products.orderforms',
             kwargs={
                 'organizer': self.request.event.organizer.slug,
                 'event': self.request.event.slug,
@@ -745,9 +815,14 @@ class QuestionCreate(EventPermissionRequiredMixin, QuestionMixin, CreateView):
 
     @transaction.atomic
     def form_valid(self, form):
-        if form.cleaned_data.get('type') in ('M', 'C'):
+        if form.cleaned_data.get('type') in Question.OPTION_TYPES:
             if not self.formset.is_valid():
                 return self.get(self.request, *self.args, **self.kwargs)
+
+        system_question_order = self.request.event.settings.system_question_order or {}
+        max_system = max(system_question_order.values(), default=-1)
+        max_question = self.request.event.questions.aggregate(Max('position'))['position__max'] or -1
+        form.instance.position = max(max_system, max_question) + 1
 
         messages.success(self.request, _('The new question has been created.'))
         ret = super().form_valid(form)
@@ -757,7 +832,7 @@ class QuestionCreate(EventPermissionRequiredMixin, QuestionMixin, CreateView):
             data=dict(form.cleaned_data),
         )
 
-        if form.cleaned_data.get('type') in ('M', 'C'):
+        if form.cleaned_data.get('type') in Question.OPTION_TYPES:
             self.save_formset(form.instance)
 
         return ret
@@ -772,32 +847,24 @@ class DescriptionCreate(QuestionCreate):
 def question_options_ajax(request, organizer, event, question):
     try:
         question_obj = request.event.questions.get(id=question)
-        
+
         if question_obj.type == Question.TYPE_BOOLEAN:
-            options = [
-                {'identifier': 'True', 'answer': str(_('Yes'))},
-                {'identifier': 'False', 'answer': str(_('No'))}
-            ]
+            options = [{'identifier': 'True', 'answer': str(_('Yes'))}, {'identifier': 'False', 'answer': str(_('No'))}]
         else:
             options = []
             for option in question_obj.options.all():
-                options.append({
-                    'identifier': option.identifier,
-                    'answer': str(option.answer)
-                })
-        
-        return JsonResponse({
-            'type': question_obj.type,
-            'options': options
-        })
+                options.append({'identifier': option.identifier, 'answer': str(option.answer)})
+
+        return JsonResponse({'type': question_obj.type, 'options': options})
     except Question.DoesNotExist:
         return JsonResponse({'error': 'Question not found'}, status=404)
 
 
-class QuotaList(PaginationMixin, ListView):
+class QuotaList(EventPermissionRequiredMixin, PaginationMixin, ListView):
     model = Quota
     context_object_name = 'quotas'
     template_name = 'pretixcontrol/items/quotas.html'
+    permission = 'can_change_items'
 
     def get_queryset(self):
         qs = self.request.event.quotas.prefetch_related(
@@ -887,7 +954,7 @@ class QuotaCreate(EventPermissionRequiredMixin, CreateView):
             kwargs['instance'] = i
             kwargs.setdefault('initial', {})
             kwargs['initial']['productvars'] = [str(i.pk) for i in self.copy_from.products.all()] + [
-                '{}-{}'.format(v.product_id, v.pk) for v in self.copy_from.variations.all()
+                f'{v.product_id}-{v.pk}' for v in self.copy_from.variations.all()
             ]
         else:
             kwargs['instance'] = Quota(event=self.request.event)
@@ -898,10 +965,11 @@ class QuotaCreate(EventPermissionRequiredMixin, CreateView):
         return super().form_invalid(form)
 
 
-class QuotaView(ChartContainingView, DetailView):
+class QuotaView(EventPermissionRequiredMixin, ChartContainingView, DetailView):
     model = Quota
     template_name = 'pretixcontrol/items/quota.html'
     context_object_name = 'quota'
+    permission = 'can_change_items'
 
     def get_context_data(self, *args, **kwargs):
         ctx = super().get_context_data()
@@ -1045,6 +1113,19 @@ class QuotaView(ChartContainingView, DetailView):
             quota.save(update_fields=['closed'])
             quota.log_action('eventyay.event.quota.opened', user=request.user)
             messages.success(request, _('The quota has been re-opened.'))
+
+            # Trigger waiting list assignment when quota is reopened
+            event = request.event
+            if (
+                event.settings.get('waiting_list_enabled', as_type=bool)
+                and event.settings.get('waiting_list_auto', as_type=bool)
+                and (event.presale_is_running or event.has_subevents)
+            ):
+                if quota.subevent:
+                    assign_automatically.apply_async(args=(event.pk, request.user.pk, quota.subevent.pk))
+                else:
+                    assign_automatically.apply_async(args=(event.pk, request.user.pk))
+
         if 'disable' in request.POST:
             quota.closed = False
             quota.close_when_sold_out = False
@@ -1056,6 +1137,19 @@ class QuotaView(ChartContainingView, DetailView):
                 data={'close_when_sold_out': False},
             )
             messages.success(request, _('The quota has been re-opened and will not close again.'))
+
+            # Trigger waiting list assignment when quota is reopened
+            event = request.event
+            if (
+                event.settings.get('waiting_list_enabled', as_type=bool)
+                and event.settings.get('waiting_list_auto', as_type=bool)
+                and (event.presale_is_running or event.has_subevents)
+            ):
+                if quota.subevent:
+                    assign_automatically.apply_async(args=(event.pk, request.user.pk, quota.subevent.pk))
+                else:
+                    assign_automatically.apply_async(args=(event.pk, request.user.pk))
+
         return redirect(
             reverse(
                 'control:event.products.quotas.show',
@@ -1111,6 +1205,28 @@ class QuotaUpdate(EventPermissionRequiredMixin, UpdateView):
                         data={'id': form.instance.pk},
                     )
             form.instance.rebuild_cache()
+
+            # Trigger waiting list assignment if quota size increased
+            if 'size' in form.changed_data:
+                old_size = form.initial.get('size')
+                new_size = form.cleaned_data.get('size')
+                # Check if size actually increased (handle None as unlimited)
+                if (old_size is not None and new_size is not None and new_size > old_size) or (
+                    old_size is not None and new_size is None
+                ):
+                    # Quota increased, trigger waiting list assignment if enabled
+                    event = self.request.event
+                    if (
+                        event.settings.get('waiting_list_enabled', as_type=bool)
+                        and event.settings.get('waiting_list_auto', as_type=bool)
+                        and (event.presale_is_running or event.has_subevents)
+                    ):
+                        if form.instance.subevent:
+                            assign_automatically.apply_async(
+                                args=(event.pk, self.request.user.pk, form.instance.subevent.pk)
+                            )
+                        else:
+                            assign_automatically.apply_async(args=(event.pk, self.request.user.pk))
         return super().form_valid(form)
 
     def get_success_url(self) -> str:
@@ -1198,7 +1314,7 @@ class MetaDataEditorMixin:
 
     def _make_meta_form(self, p, val_instances):
         return self.meta_form(
-            prefix='prop-{}'.format(p.pk),
+            prefix=f'prop-{p.pk}',
             property=p,
             instance=val_instances.get(p.pk, self.meta_model(property=p, product=self.object)),
             data=(self.request.POST if self.request.method == 'POST' else None),
@@ -1359,7 +1475,7 @@ class ProductUpdateGeneral(ProductDetailMixin, EventPermissionRequiredMixin, Met
             if serializer:
                 d.update(serializer(form.instance).data)
             self.get_object().log_action(
-                'eventyay.event.product.{}.{}'.format(log_base, rm_verb),
+                f'eventyay.event.product.{log_base}.{rm_verb}',
                 user=self.request.user,
                 data=d,
             )
@@ -1386,9 +1502,9 @@ class ProductUpdateGeneral(ProductDetailMixin, EventPermissionRequiredMixin, Met
                     change_data['value'] = form.instance.value
                 change_data['id'] = form.instance.pk
                 self.get_object().log_action(
-                    'eventyay.event.product.{}.changed'.format(log_base)
+                    f'eventyay.event.product.{log_base}.changed'
                     if not created
-                    else 'eventyay.event.product.{}.added'.format(log_base),
+                    else f'eventyay.event.product.{log_base}.added',
                     user=self.request.user,
                     data=change_data,
                 )
@@ -1526,10 +1642,10 @@ class ProductUpdateGeneral(ProductDetailMixin, EventPermissionRequiredMixin, Met
         for rec, resp in product_formsets.send(sender=self.request.event, product=self.product, request=self.request):
             if isinstance(resp, (list, tuple)):
                 for k in resp:
-                    f['p-{}'.format(i)] = k
+                    f[f'p-{i}'] = k
                     i += 1
             else:
-                f['p-{}'.format(i)] = resp
+                f[f'p-{i}'] = resp
                 i += 1
         return f
 
@@ -1595,21 +1711,230 @@ def question_options_ajax(request, organizer, event, question):
     try:
         question_obj = request.event.questions.get(id=question)
         if question_obj.type == Question.TYPE_BOOLEAN:
-            options = [
-                {'identifier': 'True', 'answer': str(_('Yes'))},
-                {'identifier': 'False', 'answer': str(_('No'))}
-            ]
+            options = [{'identifier': 'True', 'answer': str(_('Yes'))}, {'identifier': 'False', 'answer': str(_('No'))}]
         else:
             options = []
             for option in question_obj.options.all():
-                options.append({
-                    'identifier': option.identifier,
-                    'answer': str(option.answer)
-                })
-        
-        return JsonResponse({
-            'type': question_obj.type,
-            'options': options
-        })
+                options.append({'identifier': option.identifier, 'answer': str(option.answer)})
+
+        return JsonResponse({'type': question_obj.type, 'options': options})
     except Question.DoesNotExist:
         return JsonResponse({'error': 'Question not found'}, status=404)
+
+
+# Order Form Views (Placeholder implementation)
+class OrderFormList(EventPermissionRequiredMixin, FormView):
+    """
+    List view for Order Forms.
+    This handles the order form settings that were moved from event settings.
+    Includes custom fields (questions) integration.
+    """
+
+    template_name = 'pretixcontrol/items/orderforms.html'
+    permission = 'can_change_items'
+
+    def sform(self):
+        return OrderFormSettingsForm(
+            obj=self.request.event,
+            prefix='settings',
+            data=self.request.POST if self.request.method == 'POST' else None,
+            files=self.request.FILES if self.request.method == 'POST' else None,
+        )
+
+    def get_form(self, form_class=None):
+        return self.sform()
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['sform'] = self.sform()
+
+        # Include custom fields (questions) for attendee data section
+        questions = list(self.request.event.questions.prefetch_related('products').order_by('position'))
+
+        # Build sorted field order list for template rendering
+        system_question_order = self.request.event.settings.system_question_order or {}
+        system_fields = list(SYSTEM_QUESTION_FIELDS)
+        admission_products = list(self.request.event.products.filter(admission=True).order_by('position', 'id'))
+
+        # Create questions lookup map for O(1) access
+        questions_by_id = {str(q.id): q for q in questions}
+
+        # Create list of (field_id, position) tuples
+        field_order = []
+
+        # Add system fields with their saved positions (or default if not saved)
+        for idx, field_name in enumerate(system_fields):
+            # Check if field has a valid saved position (>= 0)
+            # Position -1 indicates field wasn't in drag-and-drop list
+            if system_question_order and field_name in system_question_order and system_question_order[field_name] >= 0:
+                position = system_question_order[field_name]
+            else:
+                # Use negative default positions to avoid conflicts with custom fields,
+                # whose positions start at 0. This ensures system fields always appear
+                # before custom questions when no explicit order is configured.
+                position = idx - len(system_fields)
+            field_order.append((field_name, position))
+
+        # Add custom fields with their positions
+        for q in questions:
+            field_order.append((str(q.id), q.position))
+
+        # Sort by position
+        field_order.sort(key=lambda x: x[1])
+
+        # Build ordered_fields structure for single-pass template rendering
+        # Each item is a simple object with 'id', 'type', and optionally 'question'
+        OrderedField = namedtuple('OrderedField', ['id', 'type', 'question'])
+        ordered_fields = []
+
+        for field_id, _ in field_order:
+            if field_id in system_fields:
+                ordered_fields.append(OrderedField(id=field_id, type='system', question=None))
+            else:
+                q = questions_by_id.get(field_id)
+                if q is not None:
+                    ordered_fields.append(OrderedField(id=field_id, type='question', question=q))
+
+        ctx['ordered_fields'] = ordered_fields
+        base_states = get_system_question_base_states(self.request.event)
+        product_overrides = get_system_question_product_overrides(self.request.event)
+        enabled_system_fields_by_product_id = {
+            product.pk: get_enabled_system_question_fields(
+                self.request.event,
+                product,
+                base_states=base_states,
+                product_overrides=product_overrides,
+            )
+            for product in admission_products
+        }
+        ctx['system_field_products'] = {
+            field_id: [
+                product
+                for product in admission_products
+                if field_id in enabled_system_fields_by_product_id[product.pk]
+            ]
+            for field_id in SYSTEM_QUESTION_FIELDS
+        }
+        ctx['system_field_effective_active'] = {
+            field_id: (
+                base_states.get(field_id) != STATE_DO_NOT_ASK
+                or bool(ctx['system_field_products'][field_id])
+            )
+            for field_id in SYSTEM_QUESTION_FIELDS
+        }
+
+        customer_field_ids = ['order_email', 'order_phone', 'name_address']
+        customer_field_order = []
+        for idx, field_id in enumerate(customer_field_ids):
+            if system_question_order and field_id in system_question_order and system_question_order[field_id] >= 0:
+                position = system_question_order[field_id]
+            else:
+                position = idx
+            customer_field_order.append((field_id, position))
+        customer_field_order.sort(key=lambda x: x[1])
+        ctx['ordered_customer_fields'] = [field_id for field_id, _ in customer_field_order]
+
+        return ctx
+
+    def form_valid(self, form):
+        form.save()
+        if form.has_changed():
+            self.request.event.log_action(
+                'eventyay.event.settings',
+                user=self.request.user,
+                data={k: form.cleaned_data.get(k) for k in form.changed_data},
+            )
+        messages.success(self.request, _('Your changes have been saved.'))
+        return super().form_valid(form)
+
+    def form_invalid(self, form):
+        messages.error(self.request, _('Please correct the errors below.'))
+        return super().form_invalid(form)
+
+    def get_success_url(self):
+        return reverse(
+            'control:event.products.orderforms',
+            kwargs={
+                'organizer': self.request.event.organizer.slug,
+                'event': self.request.event.slug,
+            },
+        )
+
+
+class OrderFormDefaultFieldSettings(EventPermissionRequiredMixin, FormView):
+    template_name = 'pretixcontrol/items/orderform_default_field_settings.html'
+    permission = 'can_change_items'
+
+    def dispatch(self, request, *args, **kwargs):
+        if kwargs.get('field') not in SYSTEM_QUESTION_FIELDS:
+            raise Http404(_('The requested default field does not exist.'))
+        return super().dispatch(request, *args, **kwargs)
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs['event'] = self.request.event
+        kwargs['field_id'] = self.kwargs['field']
+        return kwargs
+
+    def get_form_class(self):
+        return OrderFormDefaultFieldSettingsForm
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        field_id = self.kwargs['field']
+        form = context.get('form')
+        context['field_id'] = field_id
+        context['field_label'] = OrderFormDefaultFieldSettingsForm.FIELD_LABELS[field_id]
+        context['product_fields'] = [form[name] for name in form.product_field_names] if form else []
+        return context
+
+    def form_valid(self, form):
+        changed_settings = form.save()
+        self.request.event.log_action(
+            'eventyay.event.settings',
+            user=self.request.user,
+            data=changed_settings,
+        )
+        messages.success(self.request, _('Your changes have been saved.'))
+        return super().form_valid(form)
+
+    def get_success_url(self):
+        return reverse(
+            'control:event.products.orderforms.defaultfield',
+            kwargs={
+                'organizer': self.request.event.organizer.slug,
+                'event': self.request.event.slug,
+                'field': self.kwargs['field'],
+            },
+        )
+
+
+class OrderFormCustomerFieldSettings(EventSettingsFormView):
+    template_name = 'pretixcontrol/items/orderform_customer_field_settings.html'
+    permission = 'can_change_items'
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs['field_id'] = self.kwargs.get('field')
+        return kwargs
+
+    def get_form_class(self):
+        from eventyay.control.forms.event import OrderFormCustomerFieldSettingsForm
+        return OrderFormCustomerFieldSettingsForm
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        field_id = self.kwargs.get('field')
+        from eventyay.control.forms.event import OrderFormCustomerFieldSettingsForm
+        context['field_id'] = field_id
+        context['field_label'] = OrderFormCustomerFieldSettingsForm.FIELD_LABELS.get(field_id, field_id)
+        return context
+
+    def get_success_url(self):
+        return reverse(
+            'control:event.products.orderforms',
+            kwargs={
+                'organizer': self.request.event.organizer.slug,
+                'event': self.request.event.slug,
+            },
+        )

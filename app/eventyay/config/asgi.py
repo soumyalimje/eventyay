@@ -13,7 +13,7 @@ https://docs.djangoproject.com/en/5.1/howto/deployment/asgi/
 import os
 
 os.environ.setdefault('EVY_RUNNING_ENVIRONMENT', 'production')
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'eventyay.config.next_settings')
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'eventyay.config.settings')
 
 # Initialize Django ASGI application early to ensure apps are loaded
 from django.core.asgi import get_asgi_application
@@ -22,7 +22,7 @@ django_asgi_app = get_asgi_application()
 
 # TODO: We shouldn't need to push down these imports after get_asgi_application.
 
-# Now import modules that depend on Django apps
+from channels.auth import AuthMiddlewareStack
 from channels.routing import ProtocolTypeRouter, URLRouter
 from channels.security.websocket import AllowedHostsOriginValidator
 from django.conf import settings
@@ -33,7 +33,9 @@ from eventyay.features.live import routing as live
 # Configure ASGI application with WebSocket and HTTP support
 application = ProtocolTypeRouter(
     {
-        'websocket': AllowedHostsOriginValidator(URLRouter(live.websocket_urlpatterns)),
+        'websocket': AllowedHostsOriginValidator(
+            AuthMiddlewareStack(URLRouter(live.websocket_urlpatterns))
+        ),
         'http': django_asgi_app,
     }
 )

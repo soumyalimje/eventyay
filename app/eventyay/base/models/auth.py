@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import binascii
 import json
-import os
-import uuid
 import logging
+import os
+import time
+import uuid
 from datetime import timedelta
 from hashlib import md5
 from pathlib import Path
@@ -18,9 +21,9 @@ from django.contrib.auth.models import (
 )
 from django.contrib.auth.tokens import default_token_generator
 from django.contrib.contenttypes.models import ContentType
-from django.contrib.postgres.fields import ArrayField
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import models, transaction
-from django.db.models import Q, JSONField
+from django.db.models import JSONField, Q
 from django.http import HttpRequest
 from django.urls import reverse
 from django.utils.crypto import get_random_string, salted_hmac
@@ -36,7 +39,7 @@ from webauthn.helpers.structs import PublicKeyCredentialDescriptor
 
 from eventyay.base.i18n import language
 from eventyay.base.models.cache import VersionedModel
-from eventyay.common.image import create_thumbnail
+from eventyay.common.image import create_thumbnail, get_thumbnail
 from eventyay.common.text.path import path_with_hash
 from eventyay.common.urls import EventUrls
 from eventyay.helpers.urls import build_absolute_uri
@@ -45,6 +48,12 @@ from eventyay.talk_rules.person import is_administrator
 from ...helpers.u2f import pub_key_from_der, websafe_decode
 from .base import LoggingMixin
 from .mixins import FileCleanupMixin, GenerateCode
+
+
+if TYPE_CHECKING:
+    from .event import Event
+    from .profile import SpeakerProfile
+
 
 # from eventyay.person.signals import delete_user as delete_user_signal
 
@@ -56,6 +65,13 @@ def avatar_path(instance, filename):
         extension = Path(filename).suffix
         filename = f'{instance.code}{extension}'
     return path_with_hash(filename, base_path='avatars')
+
+
+def profile_picture_path(instance, filename):
+    if instance.code:
+        extension = Path(filename).suffix
+        filename = f'{instance.code}{extension}'
+    return path_with_hash(filename, base_path='profile_pictures')
 
 
 class UserQuerySet(models.QuerySet):
@@ -152,7 +168,7 @@ class User(
     :param is_staff: ``True`` for system operators.
     :type is_staff: bool
     :param date_joined: The datetime of the user's registration.
-    :type date_joined: datetime
+    :type date_joined: datetime.datetime
     :param locale: The user's preferred locale code.
     :type locale: str
     :param timezone: The user's preferred timezone.
@@ -181,6 +197,11 @@ class User(
     wikimedia_username = models.CharField(max_length=255, blank=True, null=True, verbose_name=('Wikimedia username'))
     is_active = models.BooleanField(default=True, verbose_name=_('Is active'))
     is_staff = models.BooleanField(default=False, verbose_name=_('Is site admin'))
+    is_spam = models.BooleanField(
+        default=False,
+        verbose_name=_('Is marked as spam'),
+        help_text=_('Spam accounts are blocked from logging in but remain in the database.'),
+    )
     date_joined = models.DateTimeField(auto_now_add=True, verbose_name=_('Date joined'))
     locale = models.CharField(
         max_length=50, choices=settings.LANGUAGES, default=settings.LANGUAGE_CODE, verbose_name=_('Language')
@@ -208,7 +229,7 @@ class User(
     type = models.CharField(
         max_length=8, default=UserType.PERSON, choices=UserType.choices
     )
-    show_publicly = models.BooleanField(default=True)
+    show_publicly = models.BooleanField(default=False)
     profile = JSONField(default=dict)
     client_state = JSONField(default=dict)
     traits = JSONField(blank=True, default=list)
@@ -249,6 +270,25 @@ class User(
     )
     avatar_thumbnail = models.ImageField(null=True, blank=True, upload_to='avatars/')
     avatar_thumbnail_tiny = models.ImageField(null=True, blank=True, upload_to='avatars/')
+    profile_picture = models.ImageField(
+        null=True,
+        blank=True,
+        verbose_name=_('Account profile picture'),
+        help_text=_(
+            'We recommend uploading a square image at least 400px wide.'
+        ),
+        upload_to=profile_picture_path,
+    )
+    profile_picture_thumbnail = models.ImageField(null=True, blank=True, upload_to='profile_pictures/')
+    profile_picture_thumbnail_tiny = models.ImageField(null=True, blank=True, upload_to='profile_pictures/')
+    default_organizer = models.ForeignKey(
+        'Organizer',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='default_for_users',
+        verbose_name=_('Default organizer'),
+    )
     get_gravatar = models.BooleanField(
         default=False,
         verbose_name=_('Retrieve profile picture via gravatar'),
@@ -301,19 +341,80 @@ class User(
             'administrator': is_administrator,
         }
 
-    @property
-    def name(self):
-        return self.fullname
-
     def save(self, *args, **kwargs):
         # In some flows (e.g., anonymous/kiosk or external auth), users can be created
         # without an email. Guard against calling lower() on None.
         if self.email:
             self.email = self.email.lower()
         is_new = not self.pk
+        update_fields = kwargs.get('update_fields')
+
+        # Invalidate avatar_url / profile_picture_url cache if images might have changed
+        if not is_new:
+            if update_fields is None or 'avatar' in update_fields:
+                if 'avatar_url' in self.__dict__:
+                    del self.__dict__['avatar_url']
+            if update_fields is None or 'profile_picture' in update_fields:
+                if 'profile_picture_url' in self.__dict__:
+                    del self.__dict__['profile_picture_url']
+
+        # Platform accounts back Video JWT uids via email hash. Refresh cached
+        # hash→account entries when identity fields change (or on create, so a
+        # prior negative miss cannot hide a newly registered account).
+        account_hash_refresh = None
+        account_hash_invalidate = None
+        if self.event_id is None:
+            identity_fields = ('email', 'wikimedia_username')
+            touches_identity = update_fields is None or any(
+                field in update_fields for field in identity_fields
+            )
+            if touches_identity:
+                new_email = (self.email or '').strip()
+                new_wiki = (self.wikimedia_username or '').strip()
+                if is_new:
+                    if new_email:
+                        account_hash_refresh = (new_email, new_wiki)
+                else:
+                    old = (
+                        type(self)
+                        .objects.filter(pk=self.pk)
+                        .values_list('email', 'wikimedia_username')
+                        .first()
+                    )
+                    if old:
+                        old_email = (old[0] or '').strip()
+                        old_wiki = (old[1] or '').strip()
+                        if old_email != new_email or old_wiki != new_wiki:
+                            stale = set()
+                            if old_email and old_email != new_email:
+                                stale.add(old_email)
+                            account_hash_invalidate = stale or None
+                            if new_email:
+                                account_hash_refresh = (new_email, new_wiki)
+                            elif stale:
+                                account_hash_invalidate = stale
+
         # Check if we need to get the profile picture from gravatar
-        update_gravatar = not kwargs.get('update_fields') or 'get_gravatar' in kwargs['update_fields']
+        update_gravatar = not update_fields or 'get_gravatar' in update_fields
+        should_invalidate_avatar_caches = not is_new and (
+            update_fields is None
+            or {'avatar', 'avatar_thumbnail', 'avatar_thumbnail_tiny'} & set(update_fields)
+        )
         super().save(*args, **kwargs)
+        if should_invalidate_avatar_caches:
+            from eventyay.common.image import invalidate_speaker_avatar_caches
+
+            invalidate_speaker_avatar_caches(self)
+        if account_hash_invalidate or account_hash_refresh:
+            from eventyay.base.services.user import (
+                invalidate_account_hash_cache_for_emails,
+                refresh_account_hash_cache,
+            )
+
+            if account_hash_invalidate:
+                invalidate_account_hash_cache_for_emails(account_hash_invalidate)
+            if account_hash_refresh:
+                refresh_account_hash_cache(*account_hash_refresh)
         if self.get_gravatar and update_gravatar:
             from eventyay.person.tasks import gravatar_cache
 
@@ -382,7 +483,7 @@ class User(
             mail(
                 email or self.email,
                 _('Account information changed'),
-                'eventyaycontrol/email/security_notice.txt',
+                'pretixcontrol/email/security_notice.txt',
                 {'user': self, 'messages': msg, 'url': build_absolute_uri('eventyay_common:account.general')},
                 event=None,
                 user=self,
@@ -425,16 +526,16 @@ class User(
         return LogEntry.objects.filter(content_type=ContentType.objects.get_for_model(User), object_id=self.pk)
 
     def _get_teams_for_organizer(self, organizer):
-        if 'o{}'.format(organizer.pk) not in self._teamcache:
-            self._teamcache['o{}'.format(organizer.pk)] = list(self.teams.filter(organizer=organizer))
-        return self._teamcache['o{}'.format(organizer.pk)]
+        if f'o{organizer.pk}' not in self._teamcache:
+            self._teamcache[f'o{organizer.pk}'] = list(self.teams.filter(organizer=organizer))
+        return self._teamcache[f'o{organizer.pk}']
 
     def _get_teams_for_event(self, organizer, event):
-        if 'e{}'.format(event.pk) not in self._teamcache:
-            self._teamcache['e{}'.format(event.pk)] = list(
+        if f'e{event.pk}' not in self._teamcache:
+            self._teamcache[f'e{event.pk}'] = list(
                 self.teams.filter(organizer=organizer).filter(Q(all_events=True) | Q(limit_events=event))
             )
-        return self._teamcache['e{}'.format(event.pk)]
+        return self._teamcache[f'e{event.pk}']
 
     def get_event_permission_set(self, organizer, event) -> set:
         """
@@ -480,7 +581,7 @@ class User(
             return True
         teams = self._get_teams_for_event(organizer, event)
         if teams:
-            self._teamcache['e{}'.format(event.pk)] = teams
+            self._teamcache[f'e{event.pk}'] = teams
             if isinstance(perm_name, (tuple, list)):
                 return any([any(team.has_permission(p) for team in teams) for p in perm_name])
             if not perm_name or any([team.has_permission(perm_name) for team in teams]):
@@ -538,11 +639,17 @@ class User(
         if request and self.has_active_staff_session(request.session.session_key):
             return Event.objects.all()
 
-        kwargs = {permission: True}
+        from .organizer import Team
+        implying_perms = [
+            p for p, implied in Team.PERMISSION_IMPLICATIONS.items() if permission in implied
+        ]
+        q = Q(**{permission: True})
+        for p in implying_perms:
+            q |= Q(**{p: True})
 
         return Event.objects.filter(
-            Q(organizer_id__in=self.teams.filter(all_events=True, **kwargs).values_list('organizer', flat=True))
-            | Q(id__in=self.teams.filter(**kwargs).values_list('limit_events__id', flat=True))
+            Q(organizer_id__in=self.teams.filter(q, all_events=True).values_list('organizer', flat=True))
+            | Q(id__in=self.teams.filter(q).values_list('limit_events__id', flat=True))
         )
 
     @scopes_disabled()
@@ -558,9 +665,41 @@ class User(
         if request and self.has_active_staff_session(request.session.session_key):
             return Organizer.objects.all()
 
-        kwargs = {permission: True}
+        from .organizer import Team
+        implying_perms = [
+            p for p, implied in Team.PERMISSION_IMPLICATIONS.items() if permission in implied
+        ]
+        q = Q(**{permission: True})
+        for p in implying_perms:
+            q |= Q(**{p: True})
 
-        return Organizer.objects.filter(id__in=self.teams.filter(**kwargs).values_list('organizer', flat=True))
+        return Organizer.objects.filter(id__in=self.teams.filter(q).values_list('organizer', flat=True))
+
+    @scopes_disabled()
+    def get_default_organizer(self, can_create_events=False):
+        """
+        Returns the user's default organizer.
+        If default_organizer is set and valid (the user still belongs to it), returns it.
+        If default_organizer is invalid or unset, dynamically returns the first organizer the user
+        was added to (or None if the user belongs to no organizers), without mutating the database.
+        """
+        if not self.pk:
+            return None
+
+        if self.default_organizer_id:
+            if self.teams.filter(organizer_id=self.default_organizer_id).exists():
+                if not can_create_events or self.teams.filter(
+                    organizer_id=self.default_organizer_id, can_create_events=True
+                ).exists():
+                    return self.default_organizer
+
+        # Fallback to the first organizer the user was added to
+        teams_qs = self.teams.all()
+        if can_create_events:
+            teams_qs = teams_qs.filter(can_create_events=True)
+
+        first_team = teams_qs.order_by('created', 'id').select_related('organizer').first()
+        return first_team.organizer if first_team else None
 
 
     def has_active_staff_session(self, session_key=None):
@@ -581,7 +720,7 @@ class User(
                 qs = qs.filter(session_key=session_key)
             sess = qs.first()
             if sess:
-                if sess.date_start < now() - timedelta(seconds=settings.PRETIX_SESSION_TIMEOUT_ABSOLUTE):
+                if sess.date_start < now() - timedelta(seconds=settings.EVENTYAY_SESSION_TIMEOUT_ABSOLUTE):
                     sess.date_end = now()
                     sess.save()
                     sess = None
@@ -617,13 +756,13 @@ class User(
         self.permission_cache[(perm, obj)] = result
         return result
 
-    def event_profile(self, event):
+    def event_profile(self, event: Event) -> SpeakerProfile:
         """Retrieve (and/or create) the event.
 
         :class:`~eventyay.base.models.profile.SpeakerProfile` for this user.
 
         :type event: :class:`eventyay.base.models.event.Event`
-        :retval: :class:`eventyay.base.models.profile.EventProfile`
+        :retval: :class:`eventyay.base.models.profile.SpeakerProfile`
         """
         if profile := self.event_profile_cache.get(event.pk):
             return profile
@@ -636,7 +775,7 @@ class User(
 
         try:
             profile = self.profiles.select_related('event').get(event=event)
-        except Exception:
+        except ObjectDoesNotExist:
             from eventyay.base.models.profile import SpeakerProfile
 
             profile = SpeakerProfile(event=event, user=self)
@@ -691,9 +830,12 @@ class User(
     def get_password_reset_url(self, event=None, orga=False):
         if event:
             path = 'orga:event.auth.recover' if orga else 'cfp:event.recover'
+            kwargs = {'token': self.pw_reset_token, 'event': event.slug}
+            if not orga:
+                kwargs['organizer'] = event.organizer.slug
             url = build_absolute_uri(
                 path,
-                kwargs={'token': self.pw_reset_token, 'event': event.slug},
+                kwargs=kwargs,
             )
         else:
             url = build_absolute_uri('orga:auth.recover', kwargs={'token': self.pw_reset_token})
@@ -751,7 +893,7 @@ the eventyay robot"""
         self.save()
 
         context = {
-            'name': self.name or '',
+            'name': self.fullname or '',
         }
         mail_text = _(
             """Hi {name},
@@ -834,37 +976,146 @@ the eventyay team"""
 
     @cached_property
     def guid(self) -> str:
-        return str(uuid.uuid5(uuid.NAMESPACE_URL, f'acct:{self.email.strip()}'))
+        identifier = (self.email or '').strip() or (self.code or str(self.pk))
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f'acct:{identifier}'))
 
     @cached_property
-    def gravatar_parameter(self) -> str:
+    def gravatar_parameter(self) -> str | None:
+        if not (self.email or '').strip():
+            return None
         return md5(self.email.strip().encode()).hexdigest()
 
     @cached_property
     def has_avatar(self) -> bool:
-        return bool(self.avatar) and self.avatar != 'False'
+        return (bool(self.avatar) and self.avatar != 'False') or bool(self.external_avatar_url)
+
+    @property
+    def external_avatar_url(self) -> str:
+        profile = self.profile if isinstance(self.profile, dict) else {}
+        avatar = profile.get('avatar')
+        if not isinstance(avatar, dict):
+            return ''
+        avatar_url = avatar.get('url')
+        if not isinstance(avatar_url, str):
+            return ''
+        return avatar_url.strip()
 
     @cached_property
     def avatar_url(self) -> str:
-        if self.has_avatar:
-            return self.avatar.url
+        """Returns avatar URL with cache-busting timestamp parameter.
+
+        Uses the avatar file's actual modification time for most accurate cache-busting.
+        Falls back to current time if file doesn't exist or can't be accessed.
+        """
+        if self.avatar and self.avatar != 'False':
+            try:
+                # Get the actual file modification time for most accurate cache-busting
+                file_path = self.avatar.path
+                file_mtime = os.path.getmtime(file_path)
+                timestamp = int(file_mtime * 1000)  # milliseconds for precision
+            except (OSError, ValueError, AttributeError):
+                # Fallback to current time if file doesn't exist or can't be accessed
+                timestamp = int(time.time() * 1000)
+
+            return f"{self.avatar.url}?v={timestamp}"
+        return self.external_avatar_url
 
     def get_avatar_url(self, event=None, thumbnail=None):
-        """Returns the full avatar URL, where user.avatar_url returns the
-        absolute URL."""
-        if not self.avatar_url:
-            return ''
+        """Returns the full avatar URL with cache-busting parameter.
+
+        Args:
+            event: Optional event for custom domain support
+            thumbnail: Optional thumbnail size ('tiny' or 'default')
+
+        Returns:
+            URL string with cache-busting query parameter
+        """
+        if not self.avatar or self.avatar == 'False':
+            external_avatar_url = self.external_avatar_url
+            if not external_avatar_url:
+                return ''
+            if external_avatar_url.startswith(('http://', 'https://')):
+                return external_avatar_url
+            if event and event.custom_domain:
+                return urljoin(event.custom_domain, external_avatar_url)
+            return urljoin(settings.SITE_URL, external_avatar_url)
+
+        # Determine which image to use
         if not thumbnail:
             image = self.avatar
         else:
-            image = self.avatar_thumbnail_tiny if thumbnail == 'tiny' else self.avatar_thumbnail
-            if not image:
-                image = create_thumbnail(self.avatar, thumbnail)
+            if str(self.avatar.name).lower().endswith('.svg'):
+                image = self.avatar
+            else:
+                image = get_thumbnail(self.avatar, thumbnail)
+
         if not image:
-            return
+            return ''
+
+        if not thumbnail and image.name and not image.storage.exists(image.name):
+            for size in ('default', 'tiny'):
+                fallback = get_thumbnail(self.avatar, size)
+                if fallback and fallback.name and fallback.storage.exists(fallback.name):
+                    image = fallback
+                    break
+            else:
+                return ''
+
+        # Build base URL with cache-busting
+        try:
+            # Get the actual file modification time for cache-busting
+            file_path = image.path
+            file_mtime = os.path.getmtime(file_path)
+            timestamp = int(file_mtime * 1000)
+        except (OSError, ValueError, AttributeError):
+            # Fallback to current time if file doesn't exist
+            timestamp = int(time.time() * 1000)
+
+        image_url = f"{image.url}?v={timestamp}"
+
         if event and event.custom_domain:
-            return urljoin(event.custom_domain, image.url)
-        return urljoin(settings.SITE_URL, image.url)
+            return urljoin(event.custom_domain, image_url)
+        return urljoin(settings.SITE_URL, image_url)
+
+    @property
+    def has_profile_picture(self) -> bool:
+        return bool(self.profile_picture) and self.profile_picture != 'False'
+
+    def get_profile_picture_url(self, event=None, thumbnail=None):
+        """Returns the profile picture URL with cache-busting timestamp."""
+        if not self.profile_picture or self.profile_picture == 'False':
+            return ''
+
+        if not thumbnail:
+            image = self.profile_picture
+        else:
+            image = (
+                self.profile_picture_thumbnail_tiny
+                if thumbnail == 'tiny'
+                else self.profile_picture_thumbnail
+            )
+            if not image:
+                image = create_thumbnail(self.profile_picture, thumbnail)
+
+        if not image:
+            return ''
+
+        try:
+            file_path = image.path
+            file_mtime = os.path.getmtime(file_path)
+            timestamp = int(file_mtime * 1000)
+        except (OSError, ValueError, AttributeError, NotImplementedError):
+            timestamp = int(time.time() * 1000)
+
+        image_url = f"{image.url}?v={timestamp}"
+
+        if event and event.custom_domain:
+            return urljoin(event.custom_domain, image_url)
+        return urljoin(settings.SITE_URL, image_url)
+
+    @cached_property
+    def profile_picture_url(self) -> str:
+        return self.get_profile_picture_url()
 
     def regenerate_token(self) -> Token:
         """Generates a new API access token, deleting the old one."""
@@ -918,8 +1169,6 @@ the eventyay team"""
                 "new": {"__redacted": True},
             }
         )
-        self.exhibitor_staff.all().delete()
-        self.poster_presenter.all().delete()
         self.chat_channels.filter(channel__room__isnull=False).delete()
 
         for dm_channel in self.chat_channels.filter(channel__room__isnull=True):
@@ -956,6 +1205,7 @@ the eventyay team"""
         include_admin_info=False,
         trait_badges_map=None,
         include_client_state=False,
+        include_personal_data=False,
     ):
         """Serialize user for public display in video/event context"""
         # Important: If this is updated, eventyay.base.services.user.get_public_users also needs to be updated!
@@ -985,8 +1235,13 @@ the eventyay team"""
         if include_admin_info:
             d["moderation_state"] = self.moderation_state
             d["token_id"] = self.token_id
+            d["email"] = self.email
+            d["wikimedia_username"] = self.wikimedia_username
         if include_client_state:
             d["client_state"] = self.client_state
+        if include_personal_data:
+            d["wikimedia_username"] = self.wikimedia_username
+            d["show_publicly"] = bool(self.show_publicly)
         return d
 
     @property
@@ -1151,7 +1406,7 @@ class U2FDevice(Device):
         # https://www.w3.org/TR/webauthn/#sctn-encoded-credPubKey-examples
         pub_key = pub_key_from_der(websafe_decode(d['publicKey'].replace('+', '-').replace('/', '_')))
         pub_key = binascii.unhexlify(
-            'A5010203262001215820{:064x}225820{:064x}'.format(pub_key.public_numbers().x, pub_key.public_numbers().y)
+            f'A5010203262001215820{pub_key.public_numbers().x:064x}225820{pub_key.public_numbers().y:064x}'
         )
         return pub_key
 

@@ -1,5 +1,6 @@
 import datetime as dt
 from http import HTTPMethod
+from urllib.parse import quote
 
 from django.conf import settings
 from django.contrib import messages
@@ -10,63 +11,39 @@ from django.utils.functional import cached_property
 from django.utils.timezone import now
 from django.views.generic import FormView
 
+from eventyay.base.auth import get_auth_backends
+from eventyay.base.models import User
 from eventyay.cfp.forms.auth import RecoverForm, ResetForm
 from eventyay.common.text.phrases import phrases
 from eventyay.common.views import GenericLoginView, GenericResetView
-from eventyay.base.models import User
 
 
-class LoginView(GenericLoginView):
-    template_name = "orga/auth/login.html"
 
-    def get_context_data(self, **kwargs):
-        context = super().get_context_data(**kwargs)
-        context["site_name"] = dict(settings.CONFIG.items("site")).get("name")
-        return context
-
-    @cached_property
-    def event(self):
-        return getattr(self.request, "event", None)
-
-    @cached_property
-    def success_url(self):
-        if self.event:
-            return self.event.orga_urls.base
-        return reverse("orga:event.list")
-
-    def get_password_reset_link(self):
-        if self.event:
-            return reverse("orga:event.auth.reset", kwargs={"event": self.event.slug})
-        return reverse("orga:auth.reset")
 
 
 def logout_view(request):
     if request.method == HTTPMethod.POST:
         logout(request)
-    response = redirect(
-        GenericLoginView.get_next_url_or_fallback(request, reverse("orga:login"))
-    )
+    response = redirect(GenericLoginView.get_next_url_or_fallback(request, reverse('auth.login')))
     if request.method == HTTPMethod.POST:
         # Remove the JWT cookie
-        response.delete_cookie("sso_token")  # Same domain used when setting the cookie
-        response.delete_cookie("customer_sso_token")
+        response.delete_cookie('sso_token')  # Same domain used when setting the cookie
+        response.delete_cookie('customer_sso_token')
     return response
 
 
 class ResetView(GenericResetView):
-    template_name = "orga/auth/reset.html"
+    template_name = 'orga/auth/reset.html'
     form_class = ResetForm
 
     def get_success_url(self):
-        if getattr(self.request, "event", None):
-            return reverse(
-                "orga:event.login", kwargs={"event": self.request.event.slug}
-            )
-        return reverse("orga:login")
+        if getattr(self.request, 'event', None):
+            return reverse('auth.login') + f"?next={quote(self.request.event.orga_urls.base)}"
+        return reverse('auth.login')
 
 
 class RecoverView(FormView):
-    template_name = "orga/auth/recover.html"
+    template_name = 'orga/auth/recover.html'
     form_class = RecoverForm
 
     def __init__(self, **kwargs):
@@ -75,7 +52,7 @@ class RecoverView(FormView):
 
     def get_user(self):
         return User.objects.get(
-            pw_reset_token=self.kwargs.get("token"),
+            pw_reset_token=self.kwargs.get('token'),
             pw_reset_time__gte=now() - dt.timedelta(days=1),
         )
 
@@ -84,14 +61,14 @@ class RecoverView(FormView):
             self.get_user()
         except User.DoesNotExist:
             messages.error(self.request, phrases.cfp.auth_reset_fail)
-            return redirect(reverse("orga:auth.reset"))
+            return redirect(reverse('orga:auth.reset'))
         return super().dispatch(request, *args, **kwargs)
 
     def form_valid(self, form):
         user = self.get_user()
-        user.change_password(form.cleaned_data["password"])
+        user.change_password(form.cleaned_data['password'])
         messages.success(self.request, phrases.cfp.auth_reset_success)
         return super().form_valid(form)
 
     def get_success_url(self):
-        return reverse("orga:login")
+        return reverse('auth.login')

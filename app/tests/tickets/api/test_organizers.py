@@ -1,0 +1,229 @@
+import pytest
+from django.core.files.base import ContentFile
+
+from tests.testutils.mock import mocker_context
+
+
+TEST_ORGANIZER_RES = {
+    'name': 'Dummy',
+    'slug': 'dummy',
+    'follower_count': 0,
+    'is_following': False,
+}
+
+
+@pytest.mark.django_db
+def test_organizer_list(token_client, organizer):
+    resp = token_client.get('/api/v1/organizers/')
+    assert resp.status_code == 200
+    assert TEST_ORGANIZER_RES in resp.data['results']
+
+
+@pytest.mark.django_db
+def test_organizer_detail(token_client, organizer):
+    resp = token_client.get('/api/v1/organizers/{}/'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert TEST_ORGANIZER_RES == resp.data
+
+
+@pytest.mark.django_db
+def test_organizer_follow_actions(user_client, organizer):
+    url = f'/api/v1/organizers/{organizer.slug}'
+
+    resp = user_client.post(f'{url}/follow/')
+    assert resp.status_code == 200
+    assert resp.data == {'following': True, 'created': True}
+
+    resp = user_client.get(f'{url}/followers/')
+    assert resp.status_code == 200
+    assert resp.data == {'follower_count': 1, 'is_following': True}
+
+    resp = user_client.post(f'{url}/unfollow/')
+    assert resp.status_code == 200
+    assert resp.data == {'following': False, 'deleted': True}
+
+    resp = user_client.get(f'{url}/followers/')
+    assert resp.status_code == 200
+    assert resp.data == {'follower_count': 0, 'is_following': False}
+
+
+@pytest.mark.django_db
+def test_organizer_follow_disabled(user_client, organizer):
+    organizer.settings.community_follow_enabled = False
+
+    resp = user_client.post(f'/api/v1/organizers/{organizer.slug}/follow/')
+
+    assert resp.status_code == 403
+    assert resp.data == {'detail': 'Following is not enabled for this organizer.'}
+
+
+@pytest.mark.django_db
+def test_organizer_follower_count_hidden(user_client, organizer):
+    organizer.settings.community_show_follower_count = False
+
+    resp = user_client.get(f'/api/v1/organizers/{organizer.slug}/followers/')
+
+    assert resp.status_code == 200
+    assert resp.data == {'follower_count': None, 'is_following': False}
+
+
+@pytest.mark.django_db
+def test_get_settings(token_client, organizer):
+    organizer.settings.event_list_type = 'week'
+    organizer.settings.header_background_color = '#ffee00'
+    organizer.settings.header_text_color = '#111111'
+    organizer.settings.navigation_text_color = '#222222'
+    resp = token_client.get(
+        '/api/v1/organizers/{}/settings/'.format(
+            organizer.slug,
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.data['event_list_type'] == 'week'
+    assert resp.data['header_background_color'] == '#ffee00'
+    assert resp.data['header_text_color'] == '#111111'
+    assert resp.data['navigation_text_color'] == '#222222'
+
+    resp = token_client.get(
+        '/api/v1/organizers/{}/settings/?explain=true'.format(organizer.slug),
+    )
+    assert resp.status_code == 200
+    assert resp.data['event_list_type'] == {
+        'value': 'week',
+        'label': 'Default overview style',
+        'help_text': 'If your event series has more than 50 dates in the future, only the month or week calendar can be used.',
+    }
+
+
+@pytest.mark.django_db
+def test_patch_settings(token_client, organizer):
+    with mocker_context() as mocker:
+        mocked = mocker.patch('eventyay.presale.style.regenerate_organizer_css.apply_async')
+
+        organizer.settings.event_list_type = 'week'
+        resp = token_client.patch(
+            '/api/v1/organizers/{}/settings/'.format(organizer.slug),
+            {'event_list_type': 'list'},
+            format='json',
+        )
+        assert resp.status_code == 200
+        assert resp.data['event_list_type'] == 'list'
+        organizer.settings.flush()
+        assert organizer.settings.event_list_type == 'list'
+
+        resp = token_client.patch(
+            '/api/v1/organizers/{}/settings/'.format(organizer.slug),
+            {
+                'event_list_type': None,
+            },
+            format='json',
+        )
+        assert resp.status_code == 200
+        assert resp.data['event_list_type'] == 'list'
+        organizer.settings.flush()
+        assert organizer.settings.event_list_type == 'list'
+        mocked.assert_not_called()
+
+        resp = token_client.put(
+            '/api/v1/organizers/{}/settings/'.format(organizer.slug),
+            {'event_list_type': 'put-not-allowed'},
+            format='json',
+        )
+        assert resp.status_code == 405
+
+        resp = token_client.patch(
+            '/api/v1/organizers/{}/settings/'.format(organizer.slug),
+            {'primary_color': 'invalid-color'},
+            format='json',
+        )
+        assert resp.status_code == 400
+
+        resp = token_client.patch(
+            '/api/v1/organizers/{}/settings/'.format(organizer.slug),
+            {'primary_color': '#ff0000'},
+            format='json',
+        )
+        assert resp.status_code == 200
+        mocked.assert_any_call(args=(organizer.pk,))
+
+        resp = token_client.patch(
+            '/api/v1/organizers/{}/settings/'.format(organizer.slug),
+            {
+                'header_background_color': '#ffee00',
+                'header_text_color': '#111111',
+                'navigation_text_color': '#222222',
+            },
+            format='json',
+        )
+        assert resp.status_code == 200
+        assert resp.data['header_background_color'] == '#ffee00'
+        assert resp.data['header_text_color'] == '#111111'
+        assert resp.data['navigation_text_color'] == '#222222'
+        organizer.settings.flush()
+        assert organizer.settings.header_background_color == '#ffee00'
+        assert organizer.settings.header_text_color == '#111111'
+        assert organizer.settings.navigation_text_color == '#222222'
+        mocked.assert_any_call(args=(organizer.pk,))
+
+
+@pytest.mark.django_db
+def test_patch_organizer_settings_file(token_client, organizer):
+    r = token_client.post(
+        '/api/v1/upload',
+        data={
+            'media_type': 'image/png',
+            'file': ContentFile('file.png', 'invalid png content'),
+        },
+        format='upload',
+        HTTP_CONTENT_DISPOSITION='attachment; filename="file.png"',
+    )
+    assert r.status_code == 201
+    file_id_png = r.data['id']
+
+    r = token_client.post(
+        '/api/v1/upload',
+        data={
+            'media_type': 'application/pdf',
+            'file': ContentFile('file.pdf', 'invalid pdf content'),
+        },
+        format='upload',
+        HTTP_CONTENT_DISPOSITION='attachment; filename="file.pdf"',
+    )
+    assert r.status_code == 201
+    file_id_pdf = r.data['id']
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/settings/'.format(organizer.slug),
+        {'organizer_logo_image': 'invalid'},
+        format='json',
+    )
+    assert resp.status_code == 400
+    assert resp.data == {'organizer_logo_image': ['The submitted file ID was not found.']}
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/settings/'.format(organizer.slug),
+        {'organizer_logo_image': file_id_pdf},
+        format='json',
+    )
+    assert resp.status_code == 400
+    assert resp.data == {
+        'organizer_logo_image': ['The submitted file has a file type that is not allowed in this field.']
+    }
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/settings/'.format(
+            organizer.slug,
+        ),
+        {'organizer_logo_image': file_id_png},
+        format='json',
+    )
+    assert resp.status_code == 200
+    assert resp.data['organizer_logo_image'].startswith('http')
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/settings/'.format(organizer.slug),
+        {'organizer_logo_image': None},
+        format='json',
+    )
+    assert resp.status_code == 200
+    assert resp.data['organizer_logo_image'] is None

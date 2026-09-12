@@ -74,39 +74,88 @@ class EventModule(BaseModule):
         )
 
     @command("config.get")
-    @require_event_permission(Permission.EVENT_UPDATE)
+    @require_event_permission(
+        [
+            Permission.EVENT_UPDATE,
+            Permission.EVENT_ROOMS_CREATE_STAGE,
+            Permission.EVENT_ROOMS_CREATE_BBB,
+        ]
+    )
     async def config_get(self, body):
-        await self.consumer.send_success(_config_serializer(self.consumer.event).data)
+        data = _config_serializer(self.consumer.event).data
+        has_general_update = await self.consumer.event.has_permission_async(
+            user=self.consumer.user, permission=Permission.EVENT_UPDATE
+        )
+        if not has_general_update:
+            data.pop("conftool_password", None)
+        await self.consumer.send_success(data)
 
     @command("config.patch")
-    @require_event_permission(Permission.EVENT_UPDATE)
+    @require_event_permission(
+        [
+            Permission.EVENT_UPDATE,
+            Permission.EVENT_ROOMS_CREATE_STAGE,
+            Permission.EVENT_ROOMS_CREATE_BBB,
+        ]
+    )
     async def config_patch(self, body):
+        # Staff Video permissions are assigned only via Organizer → Teams.
+        # Reject in-video role/trait editing so the Teams dashboard stays authoritative.
+        blocked = [key for key in ("roles", "trait_grants") if key in body]
+        if blocked:
+            await self.consumer.send_error(
+                code="config.permission_managed_externally",
+                details={
+                    key: (
+                        "Video staff permissions and role grants are managed in "
+                        "Organizer → Teams, not in the Video UI."
+                    )
+                    for key in blocked
+                },
+            )
+            return
+
+        has_general_update = await self.consumer.event.has_permission_async(
+            user=self.consumer.user, permission=Permission.EVENT_UPDATE
+        )
+        if not has_general_update:
+            allowed_keys = set()
+            if await self.consumer.event.has_permission_async(
+                user=self.consumer.user, permission=Permission.EVENT_ROOMS_CREATE_STAGE
+            ):
+                allowed_keys.update({"video_player", "videoPlayer"})
+            if await self.consumer.event.has_permission_async(
+                user=self.consumer.user, permission=Permission.EVENT_ROOMS_CREATE_BBB
+            ):
+                allowed_keys.add("bbb_defaults")
+            body = {k: v for k, v in body.items() if k in allowed_keys}
+
+        if "track_video_event_views" in body and "track_event_views" not in body:
+            body["track_event_views"] = body["track_video_event_views"]
+        elif "track_world_views" in body and "track_event_views" not in body:
+            body["track_event_views"] = body["track_world_views"]
+
         old = _config_serializer(self.consumer.event).data
         s = _config_serializer(self.consumer.event, data=body, partial=True)
         if s.is_valid():
             config_fields = (
-                "theme",
                 "date_locale",
                 "connection_limit",
                 "bbb_defaults",
                 "pretalx",
+                "video_player",
                 "videoPlayer",
-                "profile_fields",
                 "track_room_views",
                 "track_event_views",
-                "track_exhibitor_views",
+                "live_features",
                 "onsite_traits",
                 "conftool_url",
                 "conftool_password",
-                "iframe_blockers",
-                "social_logins",
             )
             model_fields = {
                 "title": "name",
                 "locale": "locale",
                 "timezone": "timezone",
-                "roles": "roles",
-                "trait_grants": "trait_grants",
             }
             update_fields = set()
 
@@ -117,15 +166,6 @@ class EventModule(BaseModule):
 
             for f in config_fields:
                 if f in body:
-                    if f == "pretalx":
-                        pretalx_data = s.validated_data["pretalx"]
-                        old_pretalx_data = self.consumer.event.config.get("pretalx", {})
-                        if any(
-                            (pretalx_data.get(key) or "")
-                            != (old_pretalx_data.get(key) or "")
-                            for key in ("domain", "url", "event")
-                        ):
-                            s.validated_data["pretalx"]["connected"] = False
                     self.consumer.event.config[f] = s.validated_data[f]
                     update_fields.add("config")
 

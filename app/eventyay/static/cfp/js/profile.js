@@ -52,20 +52,36 @@ const updateGravatarInput = async (ev) => {
     const imagePreview = form.querySelector('.form-image-preview');
 
     if (checkbox.checked) {
-        const gravatarCheckUrl = `https://www.gravatar.com/avatar/${gravatarHash}?d=404`;
-        const response = await fetch(gravatarCheckUrl);
+        const helpText = form.querySelector(".form-text");
+        if (!helpText.dataset.originalText) {
+            helpText.dataset.originalText = helpText.innerText;
+        }
 
-        if (response.status === 404) {
+        checkbox.disabled = true;
+        helpText.innerHTML = '<i class="fa fa-spinner fa-spin"></i> Checking for Gravatar...';
+
+        const gravatarCheckUrl = `https://www.gravatar.com/avatar/${gravatarHash}?d=404`;
+        try {
+            const response = await fetch(gravatarCheckUrl);
+            if (response.status === 404) {
+                checkbox.checked = false;
+                helpText.classList.add("text-warning");
+                helpText.classList.remove("text-muted");
+                helpText.innerText = "We couldn't find a Gravatar image associated with your email address.";
+                checkbox.parentElement.querySelector("label").classList.add("text-muted");
+            } else {
+                checkbox.disabled = false;
+                helpText.innerText = helpText.dataset.originalText;
+                form.querySelector('input[type=file]').value = '';
+                setImage(`https://www.gravatar.com/avatar/${gravatarHash}?s=512`);
+                form.querySelector(".avatar-upload").classList.add("d-none");
+            }
+        } catch (error) {
             checkbox.checked = false;
-            checkbox.disabled = true;
-            const helpText = checkbox.parentElement.querySelector(".form-text")
-            helpText.classList.add("text-warning")
-            helpText.classList.remove("text-muted")
-            checkbox.parentElement.querySelector("label").classList.add("text-muted")
-        } else {
-            form.querySelector('input[type=file]').value = '';
-            setImage(`https://www.gravatar.com/avatar/${gravatarHash}?s=512`);
-            form.querySelector(".avatar-upload").classList.add("d-none")
+            checkbox.disabled = false;
+            helpText.classList.add("text-warning");
+            helpText.classList.remove("text-muted");
+            helpText.innerText = "Failed to check Gravatar. Please try again later.";
         }
     }
     if (!checkbox.checked) {
@@ -80,7 +96,15 @@ const updateGravatarInput = async (ev) => {
 
 const initFileInput = function () {
     document.querySelectorAll(".avatar-form").forEach(form => {
-        form.querySelector(".form-image-preview").remove() // remove default preview
+        const preview = form.querySelector(".form-image-preview");
+        // Don't remove the preview element - it needs to persist
+        if (preview) {
+            const img = preview.querySelector('img');
+            if (img && !img.src) {
+                preview.classList.add('d-none');
+            }
+        }
+        
         document.querySelectorAll('.avatar-upload input[type=file]').forEach((element) => {
             element.addEventListener('change', updateFileInput)
         })
@@ -93,4 +117,56 @@ const initFileInput = function () {
     })
 }
 
+const initImageInput = function () {
+    document.querySelectorAll('.eventyay-image-input').forEach((container) => {
+        const fileInput = container.querySelector('.eventyay-image-file')
+        const nameSpan = container.querySelector('.eventyay-file-name')
+        const picker = container.querySelector('.eventyay-image-picker')
+        const clearCheckbox = container.querySelector('.eventyay-image-clear')
+        const current = container.querySelector('.eventyay-image-current')
+        const currentName = container.querySelector('.eventyay-image-name')
+        const deleteButton = container.querySelector('.eventyay-image-delete')
+        const replaceButton = container.querySelector('.eventyay-image-replace')
+
+        if (!fileInput) return
+
+        if (replaceButton) {
+            replaceButton.addEventListener('click', () => fileInput.click())
+        }
+
+        if (picker) {
+            picker.addEventListener('click', (event) => {
+                if (event.target.tagName !== 'LABEL') fileInput.click()
+            })
+        }
+
+        fileInput.addEventListener('change', () => {
+            const files = fileInput.files
+            const chosen = files && files.length ? files[0].name : ''
+            if (nameSpan) nameSpan.textContent = chosen
+            if (!chosen) return
+            // A new upload and a clear signal together make Django raise
+            // FILE_INPUT_CONTRADICTION, so picking a file always cancels the delete.
+            if (clearCheckbox) clearCheckbox.checked = false
+            if (currentName && current && !current.hidden) {
+                currentName.textContent = chosen
+                currentName.title = chosen
+            }
+        })
+
+        if (!deleteButton || !clearCheckbox) return
+
+        deleteButton.addEventListener('click', () => {
+            clearCheckbox.checked = true
+            clearCheckbox.dispatchEvent(new Event('change', { bubbles: true }))
+            fileInput.value = ''
+            if (nameSpan) nameSpan.textContent = ''
+            if (current) current.hidden = true
+            if (picker) picker.hidden = false
+            container.classList.remove('has-image')
+        })
+    })
+}
+
 onReady(initFileInput)
+onReady(initImageInput)

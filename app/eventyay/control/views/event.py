@@ -1,8 +1,11 @@
+import html
+import io
 import json
+import logging
 import operator
 import re
 from collections import OrderedDict
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from itertools import groupby
 from urllib.parse import urlsplit
 
@@ -19,6 +22,7 @@ from django.http import (
     HttpResponseBadRequest,
     HttpResponseNotAllowed,
     JsonResponse,
+    FileResponse,
 )
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
@@ -31,10 +35,12 @@ from django.views.generic.base import TemplateView, View
 from django.views.generic.detail import SingleObjectMixin
 from i18nfield.strings import LazyI18nString
 from i18nfield.utils import I18nJSONEncoder
-from pytz import timezone
 
 from eventyay.base.channels import get_all_sales_channels
 from eventyay.base.email import get_available_placeholders
+from eventyay.base.meetup import is_meetup_event
+from eventyay.common.sanitizers import sanitize_email_html
+from eventyay.timezones import localize_datetime
 from eventyay.base.models import (
     Event,
     LogEntry,
@@ -44,22 +50,27 @@ from eventyay.base.models import (
     Voucher,
 )
 from eventyay.base.models.event import EventMetaValue
+from eventyay.base.models.global_plugin_config import GlobalPluginConfig
+from eventyay.base.plugins import get_all_plugins
 from eventyay.base.services import tickets
 from eventyay.base.services.invoices import build_preview_invoice_pdf
 from eventyay.base.signals import register_ticket_outputs
-from eventyay.base.templatetags.rich_text import markdown_compile_email
+from eventyay.base.templatetags.rich_text import (
+    expand_email_preview_placeholders,
+    is_placeholder_html_sample,
+    markdown_compile_email,
+)
 from eventyay.control.forms.event import (
     CancelSettingsForm,
     CommentForm,
-    ConfirmTextFormset,
     EventDeleteForm,
     EventMetaValueForm,
-    EventSettingsForm,
+    GeneralEventSettingsForm,
     EventUpdateForm,
     InvoiceSettingsForm,
-    ProductMetaPropertyForm,
     MailSettingsForm,
     PaymentSettingsForm,
+    ProductMetaPropertyForm,
     ProviderForm,
     QuickSetupForm,
     QuickSetupProductFormSet,
@@ -89,6 +100,8 @@ from ...base.settings import SETTINGS_AFFECTING_CSS
 from ..logdisplay import OVERVIEW_BANLIST
 from . import CreateView, PaginationMixin, UpdateView
 
+logger = logging.getLogger(__name__)
+
 
 class EventSettingsViewMixin:
     def get_context_data(self, **kwargs):
@@ -116,7 +129,7 @@ class MetaDataEditorMixin:
 
     def _make_meta_form(self, p, val_instances):
         return self.meta_form(
-            prefix='prop-{}'.format(p.pk),
+            prefix=f'prop-{p.pk}',
             property=p,
             disabled=(
                 p.protected
@@ -172,7 +185,7 @@ class EventUpdate(
 
     @cached_property
     def sform(self):
-        return EventSettingsForm(
+        return GeneralEventSettingsForm(
             obj=self.object,
             prefix='settings',
             data=self.request.POST if self.request.method == 'POST' else None,
@@ -184,7 +197,6 @@ class EventUpdate(
         context['sform'] = self.sform
         context['meta_forms'] = self.meta_forms
         context['product_meta_property_formset'] = self.product_meta_property_formset
-        context['confirm_texts_formset'] = self.confirm_texts_formset
         return context
 
     @transaction.atomic
@@ -193,18 +205,14 @@ class EventUpdate(
         self.sform.save()
         form.instance.update_language_configuration(
             locales=self.sform.cleaned_data.get('locales'),
-            content_locales=self.sform.cleaned_data.get('content_locales'),
             default_locale=self.sform.cleaned_data.get('locale'),
         )
         self.save_meta()
         self.save_product_meta_property_formset(self.object)
-        self.save_confirm_texts_formset(self.object)
         change_css = False
 
-        if self.sform.has_changed() or self.confirm_texts_formset.has_changed():
+        if self.sform.has_changed():
             data = {k: self.request.event.settings.get(k) for k in self.sform.changed_data}
-            if self.confirm_texts_formset.has_changed():
-                data.update(confirm_texts=self.confirm_texts_formset.cleaned_data)
             self.request.event.log_action('eventyay.event.settings', user=self.request.user, data=data)
             if any(p in self.sform.changed_data for p in SETTINGS_AFFECTING_CSS):
                 change_css = True
@@ -254,10 +262,13 @@ class EventUpdate(
         sform_valid = self.sform.is_valid()
         meta_forms_valid = all([f.is_valid() for f in self.meta_forms])
         product_meta_property_formset_valid = self.product_meta_property_formset.is_valid()
-        confirm_texts_formset_valid = self.confirm_texts_formset.is_valid()
 
-        if (form_valid and sform_valid and meta_forms_valid and
-            product_meta_property_formset_valid and confirm_texts_formset_valid):
+        if (
+            form_valid
+            and sform_valid
+            and meta_forms_valid
+            and product_meta_property_formset_valid
+        ):
             # Timezone processing for presale_start and presale_end (fields in this form)
             # is now handled within form.clean()
             return self.form_valid(form)
@@ -265,15 +276,13 @@ class EventUpdate(
             # Add specific error messages for each form that failed validation
             error_messages = []
             if not form_valid:
-                error_messages.append("Main form validation failed.")
+                error_messages.append('Main form validation failed.')
             if not sform_valid:
-                error_messages.append("Settings form validation failed.")
+                error_messages.append('Settings form validation failed.')
             if not meta_forms_valid:
-                error_messages.append("Meta data form validation failed.")
+                error_messages.append('Meta data form validation failed.')
             if not product_meta_property_formset_valid:
-                error_messages.append("Product meta property form validation failed.")
-            if not confirm_texts_formset_valid:
-                error_messages.append("Confirmation texts form validation failed.")
+                error_messages.append('Product meta property form validation failed.')
 
             if error_messages:
                 for msg in error_messages:
@@ -286,8 +295,8 @@ class EventUpdate(
             return self.form_invalid(form)
 
     @staticmethod
-    def reset_timezone(tz, dt):
-        return tz.localize(dt.replace(tzinfo=None)) if dt is not None else None
+    def reset_timezone(zone, dt):
+        return localize_datetime(dt, zone)
 
     @cached_property
     def product_meta_property_formset(self):
@@ -324,29 +333,6 @@ class EventUpdate(
             form.instance.event = obj
             form.save()
 
-    @cached_property
-    def confirm_texts_formset(self):
-        initial = [
-            {'text': text, 'ORDER': order}
-            for order, text in enumerate(self.object.settings.get('confirm_texts', as_type=LazyI18nStringList))
-        ]
-        return ConfirmTextFormset(
-            self.request.POST if self.request.method == 'POST' else None,
-            event=self.object,
-            prefix='confirm-texts',
-            initial=initial,
-        )
-
-    def save_confirm_texts_formset(self, obj):
-        obj.settings.confirm_texts = LazyI18nStringList(
-            form_data['text'].data
-            for form_data in sorted(
-                self.confirm_texts_formset.cleaned_data,
-                key=operator.itemgetter('ORDER'),
-            )
-            if not form_data.get('DELETE', False)
-        )
-
 
 class EventPlugins(
     EventSettingsViewMixin,
@@ -363,11 +349,13 @@ class EventPlugins(
         return self.request.event
 
     def get_context_data(self, *args, **kwargs) -> dict:
-        from eventyay.base.plugins import get_all_plugins
-
         context = super().get_context_data(*args, **kwargs)
+        hidden_from_organizer = GlobalPluginConfig.get_hidden_from_organizer_modules()
         plugins = [
-            p for p in get_all_plugins(self.object) if not p.name.startswith('.') and getattr(p, 'visible', True)
+            p for p in get_all_plugins(self.object)
+            if not p.name.startswith('.')
+            and getattr(p, 'visible', True)
+            and p.module not in hidden_from_organizer
         ]
         order = [
             'FEATURE',
@@ -404,14 +392,15 @@ class EventPlugins(
         return self.render_to_response(context)
 
     def post(self, request, *args, **kwargs):
-        from eventyay.base.plugins import get_all_plugins
-
         self.object = self.get_object()
 
+        hidden_from_organizer = GlobalPluginConfig.get_hidden_from_organizer_modules()
         plugins_available = {
             p.module: p
             for p in get_all_plugins(self.object)
-            if not p.name.startswith('.') and getattr(p, 'visible', True)
+            if not p.name.startswith('.')
+            and getattr(p, 'visible', True)
+            and p.module not in hidden_from_organizer
         }
 
         with transaction.atomic():
@@ -667,27 +656,40 @@ class CancelSettings(EventSettingsViewMixin, EventSettingsFormView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data()
-        ctx['gets_notification'] = self.request.user.notifications_send and (
-            (
-                self.request.user.notification_settings.filter(
-                    event=self.request.event,
-                    action_type='eventyay.event.order.refund.requested',
-                    enabled=True,
-                ).exists()
+
+        # Check notification settings with fallback for errors
+        try:
+            ctx['gets_notification'] = self.request.user.notifications_send and (
+                (
+                    self.request.user.notification_settings.filter(
+                        event=self.request.event,
+                        action_type='eventyay.event.order.refund.requested',
+                        enabled=True,
+                    ).exists()
+                )
+                or (
+                    self.request.user.notification_settings.filter(
+                        event__isnull=True,
+                        action_type='eventyay.event.order.refund.requested',
+                        enabled=True,
+                    ).exists()
+                    and not self.request.user.notification_settings.filter(
+                        event=self.request.event,
+                        action_type='eventyay.event.order.refund.requested',
+                        enabled=False,
+                    ).exists()
+                )
             )
-            or (
-                self.request.user.notification_settings.filter(
-                    event__isnull=True,
-                    action_type='eventyay.event.order.refund.requested',
-                    enabled=True,
-                ).exists()
-                and not self.request.user.notification_settings.filter(
-                    event=self.request.event,
-                    action_type='eventyay.event.order.refund.requested',
-                    enabled=False,
-                ).exists()
+        except Exception as e:
+            # Log unexpected errors for debugging while maintaining functionality
+            logging.getLogger(__name__).warning(
+                'Error checking notification settings for user %s: %s',
+                getattr(self.request.user, 'pk', 'unknown'),
+                str(e),
+                exc_info=True,
             )
-        )
+            ctx['gets_notification'] = False
+
         return ctx
 
 
@@ -696,14 +698,16 @@ class InvoicePreview(EventPermissionRequiredMixin, View):
 
     def get(self, request, *args, **kwargs):
         fname, ftype, fcontent = build_preview_invoice_pdf(request.event)
-        resp = HttpResponse(fcontent, content_type=ftype)
-        resp['Content-Disposition'] = 'attachment; filename="{}"'.format(fname)
+        if isinstance(fcontent, bytes):
+            resp = FileResponse(io.BytesIO(fcontent), content_type=ftype)
+        else:
+            resp = HttpResponse(fcontent, content_type=ftype)
+        resp['Content-Disposition'] = f'inline; filename="{fname}"'
+        resp.xframe_options_exempt = True
         return resp
 
 
-class DangerZone(EventPermissionRequiredMixin, TemplateView):
-    permission = 'can_change_event_settings'
-    template_name = 'pretixcontrol/event/dangerzone.html'
+
 
 
 class DisplaySettings(View):
@@ -735,16 +739,23 @@ class MailSettings(EventSettingsViewMixin, EventSettingsFormView):
             },
         )
 
-    def get_context_data(self, **kwargs):
-        ctx = super().get_context_data(**kwargs)
-        ctx['renderers'] = self.request.event.get_html_mail_renderers()
-        return ctx
-
     def get_form(self):
         form = super().get_form()
 
-        # List of email-content fields to exclude
         exclude_fields = [
+            # Fields now managed in the common Email settings tab
+            'mail_prefix',
+            'mail_from',
+            'mail_from_name',
+            'mail_reply_to',
+            'mail_bcc',
+            'mail_text_signature',
+            'mail_html_renderer',
+            'mail_attach_tickets',
+            'mail_attach_ical',
+            'mail_sales_channel_placed_paid',
+            'mail_sales_channel_download_reminder',
+            # Email-content template fields (edited per-email on dedicated pages)
             'mail_text_order_placed',
             'mail_send_order_placed_attendee',
             'mail_text_order_placed_attendee',
@@ -754,6 +765,9 @@ class MailSettings(EventSettingsViewMixin, EventSettingsFormView):
             'mail_text_order_free',
             'mail_send_order_free_attendee',
             'mail_text_order_free_attendee',
+            'mail_text_meetup_registration',
+            'mail_send_meetup_registration_attendee',
+            'mail_text_meetup_registration_attendee',
             'mail_text_resend_link',
             'mail_text_resend_all_links',
             'mail_text_order_changed',
@@ -790,35 +804,7 @@ class MailSettings(EventSettingsViewMixin, EventSettingsFormView):
                     data={k: form.cleaned_data.get(k) for k in form.changed_data},
                 )
 
-            if request.POST.get('test', '0').strip() == '1':
-                backend = self.request.event.get_mail_backend(force_custom=True, timeout=10)
-                try:
-                    backend.test(self.request.event.settings.mail_from)
-                except Exception as e:
-                    messages.warning(
-                        self.request,
-                        _('An error occurred while contacting the SMTP server: %s') % str(e),
-                    )
-                else:
-                    if form.cleaned_data.get('smtp_use_custom'):
-                        messages.success(
-                            self.request,
-                            _(
-                                'Your changes have been saved and the connection attempt to '
-                                'your SMTP server was successful.'
-                            ),
-                        )
-                    else:
-                        messages.success(
-                            self.request,
-                            _(
-                                "We've been able to contact the SMTP server you configured. "
-                                'Remember to check the "use custom SMTP server" checkbox, '
-                                'otherwise your SMTP server will not be used.'
-                            ),
-                        )
-            else:
-                messages.success(self.request, _('Your changes have been saved.'))
+            messages.success(self.request, _('Your changes have been saved.'))
             return redirect(self.get_success_url())
         else:
             messages.error(
@@ -853,19 +839,28 @@ class MailSettingsPreview(EventPermissionRequiredMixin, View):
         for p in get_available_placeholders(self.request.event, MailSettingsForm.base_context[product]).values():
             s = str(p.render_sample(self.request.event)).strip()
 
-            if s.startswith('*'):
+            if s.startswith('*') or is_placeholder_html_sample(s):
                 ctx[p.identifier] = s
             elif url_pattern.match(s):
-                ctx[p.identifier] = '<a href="{}" target="_blank" rel="noopener noreferrer">{}</a>'.format(s, s)
+                ctx[p.identifier] = f'<a href="{s}" target="_blank" rel="noopener noreferrer">{s}</a>'
             else:
                 ctx[p.identifier] = '<span class="placeholder" title="{}">{}</span>'.format(
-                    _('This value will be replaced based on dynamic parameters.'), s
+                    _('This value will be replaced based on dynamic parameters.'),
+                    html.escape(s),
                 )
         return self.SafeDict(ctx)
 
     def post(self, request, *args, **kwargs):
         preview_product = request.POST.get('product', '')
         if preview_product not in MailSettingsForm.base_context:
+            return HttpResponseBadRequest(_('invalid product'))
+
+        # Meetup-only templates must not be previewed on non-meetup events.
+        meetup_only = {
+            'mail_text_meetup_registration',
+            'mail_text_meetup_registration_attendee',
+        }
+        if preview_product in meetup_only and not is_meetup_event(request.event):
             return HttpResponseBadRequest(_('invalid product'))
 
         regex = r'^' + re.escape(preview_product) + r'_(?P<idx>[\d+])$'
@@ -928,6 +923,72 @@ class MailSettingsRendererPreview(MailSettingsPreview):
             raise Http404(_('Unknown e-mail renderer.'))
 
 
+class EditorEmailPreview(EventPermissionRequiredMixin, View):
+    """AJAX endpoint for previewing email body HTML from the Tiptap email editor.
+
+    Supports two request formats:
+
+    1. JSON body ``{ "html": "<p>...</p>", "locale": "en" }`` — used by the
+       toolbar popup preview button.  Returns ``{ "html": "<p>...</p>" }``.
+
+    2. Form-encoded body with ``body_<locale>`` fields (one per locale) — used
+       by the tab-based Edit/Preview component (richtextPreview.js).
+       Returns ``{ "previews": { "en": "...", "de": "..." } }``.
+    """
+
+    permission = ('can_change_orders', 'can_change_event_settings')
+
+    def post(self, request, *args, **kwargs):
+        content_type = request.content_type or ''
+
+        if 'application/json' in content_type:
+            return self._handle_json(request)
+        return self._handle_form(request)
+
+    def _handle_json(self, request):
+        try:
+            payload = json.loads(request.body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return HttpResponseBadRequest('Invalid JSON body')
+
+        raw_html = payload.get('html', '')
+        if not isinstance(raw_html, str):
+            return HttpResponseBadRequest('html must be a string')
+
+        locale = payload.get('locale')
+        if locale is not None and not isinstance(locale, str):
+            return HttpResponseBadRequest('locale must be a string')
+
+        safe_html = sanitize_email_html(raw_html)
+        preview_html = expand_email_preview_placeholders(safe_html, request.event, locale=locale or None)
+        return JsonResponse({'html': preview_html})
+
+    def _handle_form(self, request):
+        event = request.event
+        previews = {}
+
+        for key, values in request.POST.lists():
+            if not key.startswith('body_') or not values:
+                continue
+            locale = key[5:]
+            body = values[0]
+            if not body:
+                continue
+            safe_html = sanitize_email_html(body)
+            previews[locale] = expand_email_preview_placeholders(safe_html, event, locale=locale)
+
+        if not previews:
+            body = request.POST.get('body', '')
+            if body:
+                safe_html = sanitize_email_html(body)
+                event_locales = list(event.settings.locales)
+                previews[event_locales[0] if event_locales else 'en'] = expand_email_preview_placeholders(
+                    safe_html, event
+                )
+
+        return JsonResponse({'previews': previews})
+
+
 class TicketSettingsPreview(EventPermissionRequiredMixin, View):
     permission = 'can_change_event_settings'
 
@@ -945,9 +1006,13 @@ class TicketSettingsPreview(EventPermissionRequiredMixin, View):
             return redirect(self.get_error_url())
 
         fname, mimet, data = tickets.preview(self.request.event.pk, self.output.identifier)
-        resp = HttpResponse(data, content_type=mimet)
+        if isinstance(data, bytes):
+            resp = FileResponse(io.BytesIO(data), content_type=mimet)
+        else:
+            resp = HttpResponse(data, content_type=mimet)
         ftype = fname.split('.')[-1]
-        resp['Content-Disposition'] = 'attachment; filename="ticket-preview.{}"'.format(ftype)
+        resp['Content-Disposition'] = f'inline; filename="ticket-preview.{ftype}"'
+        resp.xframe_options_exempt = True
         return resp
 
     def get_error_url(self) -> str:
@@ -974,6 +1039,8 @@ class TicketSettings(EventSettingsViewMixin, EventPermissionRequiredMixin, FormV
         responses = register_ticket_outputs.send(self.request.event)
         for receiver, response in responses:
             provider = response(self.request.event)
+            if provider.identifier == 'badge':
+                continue
             if provider.is_enabled:
                 context['any_enabled'] = True
                 break
@@ -1051,14 +1118,16 @@ class TicketSettings(EventSettingsViewMixin, EventPermissionRequiredMixin, FormV
         responses = register_ticket_outputs.send(self.request.event)
         for receiver, response in responses:
             provider = response(self.request.event)
+            if provider.identifier == 'badge':
+                continue
             provider.form = ProviderForm(
                 obj=self.request.event,
-                settingspref='ticketoutput_%s_' % provider.identifier,
+                settingspref=f'ticketoutput_{provider.identifier}_',
                 data=(self.request.POST if self.request.method == 'POST' else None),
                 files=(self.request.FILES if self.request.method == 'POST' else None),
             )
             provider.form.fields = OrderedDict(
-                [('ticketoutput_%s_%s' % (provider.identifier, k), v) for k, v in provider.settings_form_fields.items()]
+                [(f'ticketoutput_{provider.identifier}_{k}', v) for k, v in provider.settings_form_fields.items()]
             )
             provider.settings_content = provider.settings_content_render(self.request)
             provider.form.prepare_fields()
@@ -1069,7 +1138,7 @@ class TicketSettings(EventSettingsViewMixin, EventPermissionRequiredMixin, FormV
             else:
                 for k, v in provider.settings_form_fields.items():
                     if v.required and not self.request.event.settings.get(
-                        'ticketoutput_%s_%s' % (provider.identifier, k)
+                        f'ticketoutput_{provider.identifier}_{k}'
                     ):
                         provider.evaluated_preview_allowed = False
                         break
@@ -1082,79 +1151,23 @@ class EventPermissions(EventSettingsViewMixin, EventPermissionRequiredMixin, Tem
     template_name = 'pretixcontrol/event/permissions.html'
 
 
-class EventLive(EventPermissionRequiredMixin, TemplateView):
+class EventLive(EventPermissionRequiredMixin, View):
     permission = 'can_change_event_settings'
-    template_name = 'pretixcontrol/event/live.html'
 
-    def get_context_data(self, **kwargs):
-        ctx = super().get_context_data(**kwargs)
-        ctx['issues'] = self.request.event.live_issues
-        ctx['actual_orders'] = self.request.event.orders.filter(testmode=False).exists()
-        return ctx
-
-    def post(self, request, *args, **kwargs):
-        if request.POST.get('live') == 'true' and not self.request.event.live_issues:
-            with transaction.atomic():
-                request.event.live = True
-                request.event.save()
-                self.request.event.log_action('eventyay.event.live.activated', user=self.request.user, data={})
-            messages.success(self.request, _('Your shop is live now!'))
-        elif request.POST.get('live') == 'false':
-            with transaction.atomic():
-                request.event.live = False
-                request.event.save()
-                self.request.event.log_action('eventyay.event.live.deactivated', user=self.request.user, data={})
-            messages.success(
-                self.request,
-                _("We've taken your shop down. You can re-enable it whenever you want!"),
-            )
-        elif request.POST.get('testmode') == 'true':
-            with transaction.atomic():
-                request.event.testmode = True
-                request.event.save()
-                self.request.event.log_action('eventyay.event.testmode.activated', user=self.request.user, data={})
-            messages.success(self.request, _('Your shop is now in test mode!'))
-        elif request.POST.get('testmode') == 'false':
-            with transaction.atomic():
-                request.event.testmode = False
-                request.event.save()
-                self.request.event.log_action(
-                    'eventyay.event.testmode.deactivated',
-                    user=self.request.user,
-                    data={'delete': (request.POST.get('delete') == 'yes')},
-                )
-            request.event.cache.delete('complain_testmode_orders')
-            if request.POST.get('delete') == 'yes':
-                try:
-                    with transaction.atomic():
-                        for order in request.event.orders.filter(testmode=True):
-                            order.gracefully_delete(user=self.request.user)
-                except ProtectedError:
-                    messages.error(
-                        self.request,
-                        _(
-                            'An order could not be deleted as some constraints (e.g. data '
-                            'created by plug-ins) do not allow it.'
-                        ),
-                    )
-                else:
-                    request.event.cache.set('complain_testmode_orders', False, 30)
-            request.event.cartposition_set.filter(addon_to__isnull=False).delete()
-            request.event.cartposition_set.all().delete()
-            messages.success(
-                self.request,
-                _("We've disabled test mode for you. Let's sell some real tickets!"),
-            )
-        return redirect(self.get_success_url())
-
-    def get_success_url(self) -> str:
+    def _central_url(self):
         return reverse(
-            'control:event.live',
+            'eventyay_common:event.live',
             kwargs={
                 'organizer': self.request.event.organizer.slug,
                 'event': self.request.event.slug,
             },
         )
+
+    def get(self, request, *args, **kwargs):
+        return redirect(self._central_url())
+
+    def post(self, request, *args, **kwargs):
+        return redirect(self._central_url())
 
 
 class EventDelete(RecentAuthenticationRequiredMixin, EventPermissionRequiredMixin, FormView):
@@ -1201,7 +1214,7 @@ class EventDelete(RecentAuthenticationRequiredMixin, EventPermissionRequiredMixi
             return self.get(self.request, *self.args, **self.kwargs)
 
     def get_success_url(self) -> str:
-        return reverse('control:index')
+        return reverse('eventyay_common:dashboard')
 
 
 class EventLog(EventPermissionRequiredMixin, PaginationMixin, ListView):
@@ -1545,8 +1558,8 @@ class WidgetSettings(EventSettingsViewMixin, EventPermissionRequiredMixin, FormV
         if domain:
             siteurlsplit = urlsplit(settings.SITE_URL)
             if siteurlsplit.port and siteurlsplit.port not in (80, 443):
-                domain = '%s:%d' % (domain, siteurlsplit.port)
-            ctx['urlprefix'] = '%s://%s' % (siteurlsplit.scheme, domain)
+                domain = '%s:%d' % (domain, siteurlsplit.port)  # noqa: UP031
+            ctx['urlprefix'] = f'{siteurlsplit.scheme}://{domain}'
         return ctx
 
 
@@ -1580,17 +1593,59 @@ class QuickSetupView(FormView):
         return ctx
 
     def get_initial(self):
-        return {
+        initial = {
+            'currency': self.request.event.currency,
             'waiting_list_enabled': True,
             'ticket_download': True,
-            'contact_mail': self.request.event.settings.contact_mail,
-            'imprint_url': self.request.event.settings.imprint_url,
             'require_registered_account_for_tickets': True,
         }
+        draft_str = self.request.event.settings.get('quickstart_draft')
+        if draft_str:
+            try:
+                draft_data = json.loads(draft_str)
+                if draft_data.get('form'):
+                    initial.update(draft_data['form'])
+            except Exception:
+                pass
+        return initial
 
     def post(self, request, *args, **kwargs):
         form = self.get_form()
-        if form.is_valid() and self.formset.is_valid():
+        form_is_valid = form.is_valid()
+        formset_is_valid = self.formset.is_valid()
+        is_draft = request.POST.get('action') == 'draft'
+
+        if form_is_valid and formset_is_valid and not is_draft:
+            named_tickets = [
+                f
+                for f in self.formset
+                if f not in self.formset.deleted_forms
+                and f.cleaned_data.get('name')
+                and str(f.cleaned_data.get('name')).strip()
+            ]
+            if not named_tickets:
+                form.add_error(None, _('At least one ticket type is required to continue.'))
+                form_is_valid = False
+
+            has_paid_ticket = any(
+                (f.cleaned_data.get('default_price') or Decimal('0')) > Decimal('0')
+                for f in named_tickets
+            )
+            if has_paid_ticket:
+                payment_enabled = any(
+                    bool(form.cleaned_data.get(k))
+                    for k in (
+                        'payment_banktransfer__enabled',
+                        'payment_manualpayment__enabled',
+                        'payment_stripe__enabled',
+                        'payment_paypal__enabled',
+                    )
+                )
+                if not payment_enabled:
+                    form.add_error(None, _('At least one payment method is required for paid tickets.'))
+                    form_is_valid = False
+
+        if form_is_valid and formset_is_valid:
             return self.form_valid(form)
         else:
             plugins_active = self.request.event.get_plugins()
@@ -1616,16 +1671,61 @@ class QuickSetupView(FormView):
 
     @transaction.atomic
     def form_valid(self, form):
+        if self.request.POST.get('action') == 'draft':
+            draft_tickets = []
+            for f in self.formset:
+                if f in self.formset.deleted_forms:
+                    continue
+                name_val = f.cleaned_data.get('name')
+                if not name_val or not str(name_val).strip():
+                    continue
+                draft_tickets.append({
+                    'name': name_val.data if hasattr(name_val, 'data') else str(name_val),
+                    'default_price': str(f.cleaned_data.get('default_price') or '0.00'),
+                    'quota': f.cleaned_data.get('quota'),
+                })
+            draft_form = {}
+            for k, v in form.cleaned_data.items():
+                if isinstance(v, Decimal):
+                    draft_form[k] = str(v)
+                elif isinstance(v, (str, int, float, bool)) or v is None:
+                    draft_form[k] = v
+            draft_data = {
+                'form': draft_form,
+                'tickets': draft_tickets,
+            }
+            self.request.event.settings.set('quickstart_draft', json.dumps(draft_data))
+
+            if form.cleaned_data.get('currency'):
+                self.request.event.currency = form.cleaned_data['currency']
+                self.request.event.save(update_fields=['currency'])
+            if form.cleaned_data.get('show_quota_left') is not None:
+                self.request.event.settings.show_quota_left = form.cleaned_data['show_quota_left']
+            if form.cleaned_data.get('waiting_list_enabled') is not None:
+                self.request.event.settings.waiting_list_enabled = form.cleaned_data['waiting_list_enabled']
+            if form.cleaned_data.get('attendee_names_required') is not None:
+                self.request.event.settings.attendee_names_required = form.cleaned_data['attendee_names_required']
+            if form.cleaned_data.get('ticket_download') is not None:
+                self.request.event.settings.ticket_download = form.cleaned_data['ticket_download']
+            if form.cleaned_data.get('require_registered_account_for_tickets') is not None:
+                self.request.event.settings.require_registered_account_for_tickets = form.cleaned_data['require_registered_account_for_tickets']
+
+            messages.success(
+                self.request,
+                _('Your draft ticketing setup has been saved.'),
+            )
+            return redirect(
+                reverse(
+                    'control:event.index',
+                    kwargs={
+                        'organizer': self.request.event.organizer.slug,
+                        'event': self.request.event.slug,
+                    },
+                )
+            )
+
         plugins_active = self.request.event.get_plugins()
         if form.cleaned_data['ticket_download']:
-            if 'eventyay.plugins.ticketoutputpdf' not in plugins_active:
-                self.request.event.log_action(
-                    'eventyay.event.plugins.enabled',
-                    user=self.request.user,
-                    data={'plugin': 'eventyay.plugins.ticketoutputpdf'},
-                )
-                plugins_active.append('eventyay.plugins.ticketoutputpdf')
-
             self.request.event.settings.ticket_download = True
             self.request.event.settings.ticketoutput_pdf__enabled = True
 
@@ -1643,7 +1743,7 @@ class QuickSetupView(FormView):
                     plugins_active.append('eventyay_passbook')
                 self.request.event.settings.ticketoutput_passbook__enabled = True
 
-        if form.cleaned_data['payment_banktransfer__enabled']:
+        if form.cleaned_data.get('payment_banktransfer__enabled', None):
             if 'eventyay.plugins.banktransfer' not in plugins_active:
                 self.request.event.log_action(
                     'eventyay.event.plugins.enabled',
@@ -1662,7 +1762,7 @@ class QuickSetupView(FormView):
             ):
                 self.request.event.settings.set(
                     'payment_banktransfer_%s' % f,
-                    form.cleaned_data['payment_banktransfer_%s' % f],
+                    form.cleaned_data.get('payment_banktransfer_%s' % f),
                 )
 
         if form.cleaned_data.get('payment_stripe__enabled', None):
@@ -1674,23 +1774,66 @@ class QuickSetupView(FormView):
                 )
                 plugins_active.append('eventyay.plugins.stripe')
 
+        if form.cleaned_data.get('payment_paypal__enabled', None):
+            if 'eventyay.plugins.paypal' not in plugins_active:
+                self.request.event.log_action(
+                    'eventyay.event.plugins.enabled',
+                    user=self.request.user,
+                    data={'plugin': 'eventyay.plugins.paypal'},
+                )
+                plugins_active.append('eventyay.plugins.paypal')
+
+        if form.cleaned_data.get('payment_manualpayment__enabled', None):
+            if 'eventyay.plugins.manualpayment' not in plugins_active:
+                self.request.event.log_action(
+                    'eventyay.event.plugins.enabled',
+                    user=self.request.user,
+                    data={'plugin': 'eventyay.plugins.manualpayment'},
+                )
+                plugins_active.append('eventyay.plugins.manualpayment')
+
+        if form.cleaned_data['currency'] != self.request.event.currency:
+            self.request.event.currency = form.cleaned_data['currency']
+            self.request.event.save(update_fields=['currency'])
+            self.request.event.log_action(
+                'eventyay.event.changed',
+                user=self.request.user,
+                data={'currency': form.cleaned_data['currency']},
+            )
+
         self.request.event.settings.show_quota_left = form.cleaned_data['show_quota_left']
         self.request.event.settings.waiting_list_enabled = form.cleaned_data['waiting_list_enabled']
         self.request.event.settings.attendee_names_required = form.cleaned_data['attendee_names_required']
-        self.request.event.settings.contact_mail = form.cleaned_data['contact_mail']
-        self.request.event.settings.imprint_url = form.cleaned_data['imprint_url']
-        self.request.event.log_action(
-            'eventyay.event.settings',
-            user=self.request.user,
-            data={k: self.request.event.settings.get(k) for k in form.changed_data},
-        )
+        settings_changed_data = [k for k in form.changed_data if k != 'currency']
+        if settings_changed_data:
+            self.request.event.log_action(
+                'eventyay.event.settings',
+                user=self.request.user,
+                data={k: self.request.event.settings.get(k) for k in settings_changed_data},
+            )
         self.request.event.settings.require_registered_account_for_tickets = form.cleaned_data[
             'require_registered_account_for_tickets'
         ]
 
         products = []
         category = None
-        tax_rule = self.request.event.tax_rules.first()
+        if form.cleaned_data.get('tax_name') and form.cleaned_data.get('tax_rate') is not None:
+            tax_rule = self.request.event.tax_rules.create(
+                name=form.cleaned_data['tax_name'],
+                rate=form.cleaned_data['tax_rate'],
+                price_includes_tax=form.cleaned_data.get('tax_price_includes_tax', True),
+            )
+            tax_rule.log_action(
+                'eventyay.event.taxrule.added',
+                user=self.request.user,
+                data={
+                    'name': str(tax_rule.name),
+                    'rate': str(tax_rule.rate),
+                    'price_includes_tax': tax_rule.price_includes_tax,
+                },
+            )
+        else:
+            tax_rule = self.request.event.tax_rules.first()
         if any(f not in self.formset.deleted_forms for f in self.formset):
             category = self.request.event.categories.create(name=LazyI18nString.from_gettext(gettext('Tickets')))
             category.log_action(
@@ -1701,7 +1844,7 @@ class QuickSetupView(FormView):
 
         subevent = self.request.event.subevents.first()
         for i, f in enumerate(self.formset):
-            if f in self.formset.deleted_forms or not f.has_changed():
+            if f in self.formset.deleted_forms or not f.has_changed() or not f.cleaned_data.get('name'):
                 continue
 
             product = self.request.event.products.create(
@@ -1713,6 +1856,7 @@ class QuickSetupView(FormView):
                 admission=True,
                 position=i,
                 sales_channels=list(get_all_sales_channels().keys()),
+                available_until=self.request.event.date_to,
             )
             product.log_action(
                 'eventyay.event.product.added',
@@ -1748,6 +1892,7 @@ class QuickSetupView(FormView):
 
         self.request.event.plugins = ','.join(plugins_active)
         self.request.event.save()
+        self.request.event.settings.delete('quickstart_draft')
         messages.success(
             self.request,
             _(
@@ -1755,10 +1900,9 @@ class QuickSetupView(FormView):
                 'or take your event live to start selling!'
             ),
         )
-
         return redirect(
             reverse(
-                'control:event.index',
+                'control:event.live',
                 kwargs={
                     'organizer': self.request.event.organizer.slug,
                     'event': self.request.event.slug,
@@ -1768,21 +1912,57 @@ class QuickSetupView(FormView):
 
     @cached_property
     def formset(self):
+        initial = [
+            {
+                'name': LazyI18nString.from_gettext(gettext('Standard Ticket')),
+                'default_price': Decimal('49.00'),
+                'quota': 200,
+            },
+            {
+                'name': LazyI18nString.from_gettext(gettext('Virtual Ticket')),
+                'default_price': Decimal('0.00'),
+                'quota': 500,
+            },
+        ]
+        draft_str = self.request.event.settings.get('quickstart_draft')
+        if draft_str:
+            try:
+                draft_data = json.loads(draft_str)
+                if 'tickets' in draft_data and isinstance(draft_data['tickets'], list):
+                    parsed_tickets = []
+                    for t in draft_data['tickets']:
+                        if not isinstance(t, dict) or 'name' not in t:
+                            continue
+                        name_val = t.get('name')
+                        if not name_val or not str(name_val).strip():
+                            continue
+                        raw_price = t.get('default_price')
+                        if raw_price is None or raw_price == '':
+                            price = Decimal('0.00')
+                        else:
+                            try:
+                                price = Decimal(str(raw_price))
+                            except (InvalidOperation, TypeError, ValueError):
+                                continue
+                        quota = t.get('quota')
+                        if quota is not None and quota != '':
+                            try:
+                                quota = int(quota)
+                            except (TypeError, ValueError):
+                                quota = None
+                        else:
+                            quota = None
+                        parsed_tickets.append({
+                            'name': LazyI18nString(name_val) if isinstance(name_val, (dict, str)) else str(name_val),
+                            'default_price': price,
+                            'quota': quota,
+                        })
+                    initial = parsed_tickets
+            except (json.JSONDecodeError, TypeError, KeyError, ValueError, InvalidOperation):
+                pass
+
         return QuickSetupProductFormSet(
             data=self.request.POST if self.request.method == 'POST' else None,
             event=self.request.event,
-            initial=[
-                {
-                    'name': LazyI18nString.from_gettext(gettext('Regular ticket')),
-                    'default_price': Decimal('35.00'),
-                    'quota': 100,
-                },
-                {
-                    'name': LazyI18nString.from_gettext(gettext('Reduced ticket')),
-                    'default_price': Decimal('29.00'),
-                    'quota': 50,
-                },
-            ]
-            if self.request.method != 'POST'
-            else [],
+            initial=initial if self.request.method != 'POST' else [],
         )

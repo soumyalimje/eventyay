@@ -23,6 +23,8 @@ from eventyay.helpers.security import (
     SessionReauthRequired,
     assert_session_valid,
 )
+from eventyay.eventyay_common.permissions import user_has_ticket_dashboard_access
+
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +38,15 @@ class PermissionMiddleware:
 
     EXCEPTIONS = (
         'auth.login',
+        'auth.login.legacy',
         'auth.login.2fa',
-        'auth.register',
+        'auth.login.2fa.legacy',
+        'account_signup',
         'auth.forgot',
         'auth.forgot.recover',
         'auth.invite',
-        'user.settings.notifications.off',
+        'account.locale',
+        'account.notification.flip-off',
         'oauth2_provider',
     )
 
@@ -87,8 +92,15 @@ class PermissionMiddleware:
 
         if not request.path.startswith(get_script_prefix() + 'control') and not request.path.startswith(
             get_script_prefix() + 'common'
-        ) and not request.path.startswith(get_script_prefix() + 'admin'):
-            # This middleware should only touch the /control, /common, and /admin subpaths
+        ) and not request.path.startswith(get_script_prefix() + 'admin') and not request.path.startswith(
+            get_script_prefix() + 'teamshifts'
+        ) and not request.path.startswith(
+            get_script_prefix() + 'exhibitors'
+        ) and not request.path.startswith(
+            get_script_prefix() + 'social'
+        ):
+            # This middleware should only touch the /control, /common,
+            # /admin, /teamshifts, /exhibitors, and /social subpaths
             return self.get_response(request)
 
         if hasattr(request, 'organizer'):
@@ -146,7 +158,13 @@ class PermissionMiddleware:
                     .first()
                 )
             request.event = event
-            if not event or not request.user.has_event_permission(event.organizer, event, request=request):
+            if not event:
+                raise Http404(_('The selected event was not found or you have no permission to administrate it.'))
+
+            if request.path.startswith(get_script_prefix() + 'control'):
+                if not user_has_ticket_dashboard_access(request.user, event.organizer, event, request=request):
+                    raise Http404(_('The selected event was not found or you have no permission to administrate it.'))
+            elif not request.user.has_event_permission(event.organizer, event, request=request):
                 raise Http404(_('The selected event was not found or you have no permission to administrate it.'))
             logger.info(
                 'Found organizer %s from event %s. Attaching to request.',
@@ -187,7 +205,7 @@ class AuditLogMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        if (request.path.startswith(get_script_prefix() + 'control') or 
+        if (request.path.startswith(get_script_prefix() + 'control') or
             request.path.startswith(get_script_prefix() + 'admin')) and request.user.is_authenticated:
             if getattr(request.user, 'is_hijacked', False):
                 hijack_history = request.session.get('hijack_history', False)

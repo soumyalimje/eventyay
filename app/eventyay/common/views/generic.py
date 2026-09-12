@@ -1,9 +1,11 @@
 import datetime as dt
+import logging
 from contextlib import suppress
-from urllib.parse import quote
 
 from django.contrib import messages
 from django.contrib.auth import login
+from django.core.exceptions import SuspiciousFileOperation
+from django.core.files.storage import default_storage
 from django.core.paginator import InvalidPage, Paginator
 from django.db import transaction
 from django.http import Http404, HttpResponseRedirect
@@ -24,6 +26,8 @@ from eventyay.cfp.forms.auth import ResetForm
 from eventyay.common.exceptions import SendMailException
 from eventyay.common.permissions import is_admin_mode_active
 from eventyay.common.text.phrases import phrases
+from eventyay.common.urls import get_file_url_path, is_file_url, is_http_url
+from eventyay.common.views.helpers import build_login_url_with_next
 from eventyay.common.views.mixins import (
     Filterable,
     PaginationMixin,
@@ -31,6 +35,9 @@ from eventyay.common.views.mixins import (
 )
 from eventyay.base.forms import user
 from eventyay.base.models import User
+from eventyay.base.forms.auth import LoginForm
+
+logger = logging.getLogger(__name__)
 
 
 def get_next_url(request):
@@ -59,7 +66,8 @@ class CreateOrUpdateView(SingleObjectTemplateResponseMixin, ModelFormMixin, Proc
 
 
 class GenericLoginView(FormView):
-    form_class = user
+    form_class = LoginForm
+
 
     @context
     def password_reset_link(self):
@@ -136,7 +144,19 @@ class GenericResetView(FormView):
 
 
 class EventSocialMediaCard(SocialMediaCardMixin, View):
-    pass
+    def get_image(self):
+        og_image = self.request.event.settings.get('og_image', as_type=str, default='') or ''
+        if og_image:
+            og_image_path = og_image
+            if is_file_url(og_image):
+                og_image_path = get_file_url_path(og_image) or ''
+            if og_image_path and not is_http_url(og_image):
+                try:
+                    if default_storage.exists(og_image_path):
+                        return default_storage.open(og_image_path)
+                except (OSError, SuspiciousFileOperation) as exc:
+                    logger.warning('Failed to open og_image from storage for %s: %s', og_image_path, exc)
+        return None
 
 
 CRUDHandlerMap = {
@@ -177,14 +197,16 @@ class CRUDView(PaginationMixin, Filterable, View):
         'delete': phrases.base.deleted,
     }
 
+    def get_backend(self):
+        return None
+
     def permission_denied(self):
         if (
             getattr(self.request, 'event', None)
             and self.request.user.is_anonymous
             and 'cfp' in self.request.resolver_match.namespaces
         ):
-            params = '&' + self.request.GET.urlencode() if self.request.GET else ''
-            return redirect(self.request.event.urls.login + f'?next={quote(self.request.path)}' + params)
+            return redirect(build_login_url_with_next(self.request.get_full_path()))
         raise Http404()
 
     def dispatch(self, request, *args, **kwargs):
@@ -268,6 +290,10 @@ class CRUDView(PaginationMixin, Filterable, View):
         event = getattr(self.request, 'event', None)
         if event and issubclass(self.form_class, I18nModelForm):
             kwargs['locales'] = event.locales
+        backend = self.get_backend()
+        if backend is not None:
+            backend.url = backend.authentication_url(self.request)
+            kwargs['backend'] = backend
         return kwargs
 
     def get_form(self, instance, data=None, files=None, **kwargs):
@@ -467,6 +493,7 @@ class OrgaCRUDView(CRUDView):
     def get_reverse_kwargs(self, *args, **kwargs):
         result = super().get_reverse_kwargs(*args, **kwargs)
         if self.event:
+            result['organizer'] = self.event.organizer.slug
             result['event'] = self.event.slug
         elif self.organizer:
             result['organizer'] = self.organizer.slug

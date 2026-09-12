@@ -153,16 +153,16 @@ textarea[lang="bm"] {
 div[lang="bn"],
 input[lang="bn"],
 textarea[lang="bn"] {
-  background-image: url("/static/vendored/flags/bn.png");
+  background-image: url("/static/vendored/flags/bd.png");
 }
 div[lang="bo"],
 input[lang="bo"],
 textarea[lang="bo"] {
   background-image: url("/static/vendored/flags/bo.png");
 }
-div[lang="pt-BR"],
-input[lang="pt-BR"],
-textarea[lang="pt-BR"] {
+div[lang="pt-br"],
+input[lang="pt-br"],
+textarea[lang="pt-br"] {
   background-image: url("/static/vendored/flags/br.png");
 }
 div[lang="bs"],
@@ -198,7 +198,7 @@ textarea[lang="bz"] {
 div[lang="ca"],
 input[lang="ca"],
 textarea[lang="ca"] {
-  background-image: url("/static/vendored/flags/ca.png");
+  background-image: url("/static/vendored/flags/ad.png");
 }
 div[lang="cc"],
 input[lang="cc"],
@@ -293,6 +293,7 @@ textarea[lang="cy"] {
 div[lang="de"],
 input[lang="de"],
 textarea[lang="de"],
+div[lang="de-formal"],
 input[lang="de-formal"],
 textarea[lang="de-formal"] {
   background-image: url("/static/vendored/flags/de.png");
@@ -465,7 +466,7 @@ textarea[lang="gt"] {
 div[lang="gu"],
 input[lang="gu"],
 textarea[lang="gu"] {
-  background-image: url("/static/vendored/flags/gu.png");
+  background-image: url("/static/vendored/flags/in.png");
 }
 div[lang="gw"],
 input[lang="gw"],
@@ -565,6 +566,7 @@ textarea[lang="jo"] {
 div[lang="jp"],
 input[lang="jp"],
 textarea[lang="jp"],
+div[lang="ja-jp"],
 input[lang="ja-jp"],
 textarea[lang="ja-jp"] {
   background-image: url("/static/vendored/flags/jp.png");
@@ -717,7 +719,7 @@ textarea[lang="mk"] {
 div[lang="ml"],
 input[lang="ml"],
 textarea[lang="ml"] {
-  background-image: url("/static/vendored/flags/ml.png");
+  background-image: url("/static/vendored/flags/in.png");
 }
 div[lang="mm"],
 input[lang="mm"],
@@ -747,12 +749,12 @@ textarea[lang="mq"] {
 div[lang="mr"],
 input[lang="mr"],
 textarea[lang="mr"] {
-  background-image: url("/static/vendored/flags/mr.png");
+  background-image: url("/static/vendored/flags/in.png");
 }
 div[lang="ms"],
 input[lang="ms"],
 textarea[lang="ms"] {
-  background-image: url("/static/vendored/flags/ms.png");
+  background-image: url("/static/vendored/flags/my.png");
 }
 div[lang="mt"],
 input[lang="mt"],
@@ -997,7 +999,7 @@ textarea[lang="sh"] {
 div[lang="si"],
 input[lang="si"],
 textarea[lang="si"] {
-  background-image: url("/static/vendored/flags/si.png");
+  background-image: url("/static/vendored/flags/lk.png");
 }
 div[lang="sj"],
 input[lang="sj"],
@@ -1012,7 +1014,7 @@ textarea[lang="sk"] {
 div[lang="sl"],
 input[lang="sl"],
 textarea[lang="sl"] {
-  background-image: url("/static/vendored/flags/sl.png");
+  background-image: url("/static/vendored/flags/si.png");
 }
 div[lang="sm"],
 input[lang="sm"],
@@ -1127,6 +1129,7 @@ textarea[lang="tv"] {
 div[lang="tw"],
 input[lang="tw"],
 textarea[lang="tw"],
+div[lang="zh-hant"],
 input[lang="zh-hant"],
 textarea[lang="zh-hant"] {
   background-image: url("/static/vendored/flags/tw.png");
@@ -1189,7 +1192,7 @@ textarea[lang="vg"] {
 div[lang="vi"],
 input[lang="vi"],
 textarea[lang="vi"] {
-  background-image: url("/static/vendored/flags/vi.png");
+  background-image: url("/static/vendored/flags/vn.png");
 }
 div[lang="vn"],
 input[lang="vn"],
@@ -1240,4 +1243,84 @@ div[lang="en"],
 input[lang="en"],
 textarea[lang="en"] {
   background-image: url("/static/vendored/flags/gb.png");
+}
+div[lang="en-us"],
+input[lang="en-us"],
+textarea[lang="en-us"] {
+  background-image: url("/static/vendored/flags/us.png");
+}
+div[lang="en-gb"],
+input[lang="en-gb"],
+textarea[lang="en-gb"] {
+  background-image: url("/static/vendored/flags/gb.png");
+}
+div[lang="en-au"],
+input[lang="en-au"],
+textarea[lang="en-au"] {
+  background-image: url("/static/vendored/flags/au.png");
+}
+div[lang="en-ca"],
+input[lang="en-ca"],
+textarea[lang="en-ca"] {
+  background-image: url("/static/vendored/flags/ca.png");
+}
+div[lang="da"],
+input[lang="da"],
+textarea[lang="da"] {
+  background-image: url("/static/vendored/flags/dk.png");
+}
+div[lang="fa-ir"],
+input[lang="fa-ir"],
+textarea[lang="fa-ir"] {
+  background-image: url("/static/vendored/flags/ir.png");
+}
+div[lang="ko"],
+input[lang="ko"],
+textarea[lang="ko"] {
+  background-image: url("/static/vendored/flags/kr.png");
+}
+div[lang="nb-no"],
+input[lang="nb-no"],
+textarea[lang="nb-no"] {
+  background-image: url("/static/vendored/flags/no.png");
+}
+div[lang="nl-informal"],
+input[lang="nl-informal"],
+textarea[lang="nl-informal"] {
+  background-image: url("/static/vendored/flags/nl.png");
+}
+div[lang="pl-informal"],
+input[lang="pl-informal"],
+textarea[lang="pl-informal"] {
+  background-image: url("/static/vendored/flags/pl.png");
+}
+div[lang="sw"],
+input[lang="sw"],
+textarea[lang="sw"] {
+  background-image: url("/static/vendored/flags/tz.png");
+}
+div[lang="uk"],
+input[lang="uk"],
+textarea[lang="uk"] {
+  background-image: url("/static/vendored/flags/ua.png");
+}
+div[lang="ta"],
+input[lang="ta"],
+textarea[lang="ta"] {
+  background-image: url("/static/vendored/flags/in.png");
+}
+div[lang="te"],
+input[lang="te"],
+textarea[lang="te"] {
+  background-image: url("/static/vendored/flags/in.png");
+}
+div[lang="ur"],
+input[lang="ur"],
+textarea[lang="ur"] {
+  background-image: url("/static/vendored/flags/pk.png");
+}
+div[lang="hi"],
+input[lang="hi"],
+textarea[lang="hi"] {
+  background-image: url("/static/vendored/flags/in.png");
 }

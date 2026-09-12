@@ -55,8 +55,10 @@ class PaginationMixin:
         if self.request.GET.get('page_size'):
             try:
                 size = min(250, int(self.request.GET.get('page_size')))
+                if size <= 0:
+                    return default
                 self.request.session[skey] = size
-                return min(250, int(self.request.GET.get('page_size')))
+                return size
             except ValueError:
                 return default
         return default
@@ -184,7 +186,6 @@ class LargeResultSetPaginator(object):
 
 # Import all views from admin_views.py to maintain backward compatibility
 from .admin_views import (
-    AdminBase,
     EventAdminToken,
     EventCalendar,
     EventClear,
@@ -193,32 +194,29 @@ from .admin_views import (
     BBBCall,
     BBBServerCreate,
     BBBServerDelete,
-    BBBServerList,
     BBBServerUpdate,
     BBBMoveRoom,
-    ConftoolSyncPosters,
     SystemLogDetail,
     SystemLogList,
     FormsetMixin,
-    IndexView,
     JanusServerCreate,
     JanusServerDelete,
-    JanusServerList,
     JanusServerUpdate,
+    JitsiServerCreate,
+    JitsiServerDelete,
+    JitsiServerUpdate,
     ProfileView,
     SignupView,
-    StreamkeyGenerator,
     StreamingServerCreate,
     StreamingServerDelete,
-    StreamingServerList,
     StreamingServerUpdate,
     SuperuserBase,
     TurnServerCreate,
     TurnServerDelete,
-    TurnServerList,
     TurnServerUpdate,
     UserList,
     UserUpdate,
+    VideoSettings,
 )
 
 # Make all views available at the module level
@@ -230,7 +228,6 @@ __all__ = [
     'PaginationMixin',
     'LargeResultSetPage',
     'LargeResultSetPaginator',
-    'AdminBase',
     'EventAdminToken',
     'EventCalendar',
     'EventClear',
@@ -239,30 +236,27 @@ __all__ = [
     'BBBCall',
     'BBBServerCreate',
     'BBBServerDelete',
-    'BBBServerList',
     'BBBServerUpdate',
     'BBBMoveRoom',
-    'ConftoolSyncPosters',
     'SystemLogDetail',
     'SystemLogList',
     'FormsetMixin',
-    'IndexView',
     'JanusServerCreate',
     'JanusServerDelete',
-    'JanusServerList',
     'JanusServerUpdate',
+    'JitsiServerCreate',
+    'JitsiServerDelete',
+    'JitsiServerUpdate',
     'ProfileView',
     'SignupView',
-    'StreamkeyGenerator',
     'StreamingServerCreate',
     'StreamingServerDelete',
-    'StreamingServerList',
     'StreamingServerUpdate',
     'SuperuserBase',
     'TurnServerCreate',
     'TurnServerDelete',
-    'TurnServerList',
     'TurnServerUpdate',
     'UserList',
     'UserUpdate',
+    'VideoSettings',
 ]

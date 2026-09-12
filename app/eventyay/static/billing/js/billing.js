@@ -96,10 +96,10 @@ $(document).ready(function () {
     document.getElementById("back-btn").addEventListener("click", function () {
         if (!organizerSlug) {
             console.error('Organizer slug not found');
-            window.location.href = `${basePath}/control/organizers/`
+            window.location.href = `${basePath}/common/organizers/`;
             return;
         }
-        window.location.href = `${basePath}/control/organizer/${organizerSlug}/settings/billing`;
+        window.location.href = `${basePath}/common/organizer/${organizerSlug}/billing`;
     });
 
 
@@ -113,7 +113,7 @@ $(document).ready(function () {
                 redirect: 'if_required'
             });
 
-            const csrfToken = document.cookie.match(/pretix_csrftoken=([^;]+)/)[1];
+            const csrfToken = (document.cookie.match(/eventyay_csrftoken=([^;]+)/) || [])[1];
 
             if (!organizerSlug || !result?.setupIntent?.id || !csrfToken) {
                 notification.style.display = 'block';

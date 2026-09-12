@@ -1,58 +1,75 @@
 from django import forms
 from django.db.models import Count, Exists, OuterRef, Q
+from django.utils.functional import cached_property
 from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
 from django_scopes.forms import SafeModelChoiceField
 
-from eventyay.cfp.forms.cfp import CfPFormMixin
-from eventyay.common.forms.fields import ImageField
-from eventyay.common.forms.mixins import PublicContent, RequestRequire
-from eventyay.common.forms.renderers import InlineFormRenderer
-from eventyay.common.forms.widgets import (
-    EnhancedSelect,
-    MarkdownWidget,
-    SearchInput,
-    SelectMultipleWithCount,
-)
-from eventyay.common.text.phrases import phrases
-from eventyay.common.views.mixins import Filterable
 from eventyay.base.models import (
     Answer,
     Question,
     Submission,
     SubmissionStates,
     Tag,
+    TalkQuestionTarget,
     Track,
+)
+from eventyay.base.models.cfp import default_fields
+from eventyay.base.models.resource import get_slide_resources
+from eventyay.cfp.forms.cfp import CfPFormMixin
+from eventyay.common.forms.fields import ImageField
+from eventyay.common.forms.mixins import ConfiguredFieldOrderMixin, PublicContent, QuestionFieldsMixin, RequestRequire
+from eventyay.common.forms.renderers import InlineFormRenderer
+from eventyay.common.forms.widgets import (
+    EnhancedSelect,
+    RichTextWidget,
+    SearchInput,
+    SelectMultipleWithCount,
+)
+from eventyay.common.text.phrases import phrases
+from eventyay.common.utils.language import localize_event_text
+from eventyay.common.views.mixins import Filterable
+from eventyay.submission.constants import AUTO_DRAFT_TITLE
+from eventyay.submission.forms.resource import (
+    SlidesField,
+    SlidesData,
+    get_slides_max_count,
+    save_slides_resource,
 )
 
 
-class InfoForm(CfPFormMixin, RequestRequire, PublicContent, forms.ModelForm):
-    additional_speaker = forms.EmailField(
-        label=_('Additional Speaker'),
-        help_text=_(
-            'If you have a co-speaker, please add their email address here, and we will invite them to create an account. If you have more than one co-speaker, you can add more speakers after finishing the proposal process.'
-        ),
-        required=False,
-    )
+class EventLocalizedSafeModelChoiceField(SafeModelChoiceField):
+    def label_from_instance(self, obj):
+        return localize_event_text(getattr(obj, 'name', obj))
+
+
+class InfoForm(
+    CfPFormMixin, ConfiguredFieldOrderMixin, QuestionFieldsMixin, RequestRequire, PublicContent, forms.ModelForm
+):
     image = ImageField(
         required=False,
         label=_('Session image'),
         help_text=_('Use this if you want an illustration to go with your proposal.'),
     )
+    slides = SlidesField(required=False, label=_('Slides'))
     content_locale = forms.ChoiceField(label=phrases.base.language)
 
-    def __init__(self, event, remove_additional_speaker=False, **kwargs):
+    def __init__(self, event, **kwargs):
         self.event = event
         self.readonly = kwargs.pop('readonly', False)
         self.access_code = kwargs.pop('access_code', None)
         self.default_values = {}
         instance = kwargs.get('instance')
+        self.original_instance_title = getattr(instance, 'title', None)
         initial = kwargs.pop('initial', {}) or {}
+        if initial.get('title') == AUTO_DRAFT_TITLE or getattr(instance, 'title', None) == AUTO_DRAFT_TITLE:
+            initial['title'] = ''
         if not instance or not instance.submission_type:
             initial['submission_type'] = (
                 getattr(self.access_code, 'submission_type', None)
                 or initial.get('submission_type')
-                or self.event.cfp.default_type
+                or (self.event.cfp.default_type if hasattr(self.event, 'cfp') else None)
+                or ''
             )
         if not instance and self.access_code:
             initial['track'] = self.access_code.track
@@ -60,9 +77,8 @@ class InfoForm(CfPFormMixin, RequestRequire, PublicContent, forms.ModelForm):
             initial['content_locale'] = self.event.locale
 
         super().__init__(initial=initial, **kwargs)
+        self.submission = self.instance
 
-        if remove_additional_speaker and 'additional_speaker' in self.fields:
-            self.fields.pop('additional_speaker')
         if 'abstract' in self.fields:
             self.fields['abstract'].widget.attrs['rows'] = 2
 
@@ -70,6 +86,26 @@ class InfoForm(CfPFormMixin, RequestRequire, PublicContent, forms.ModelForm):
         self._set_submission_types(instance=instance)
         self._set_locales()
         self._set_slot_count(instance=instance)
+        if 'slides' in self.fields:
+            slides_resources = list(get_slide_resources(instance)) if instance and instance.pk else []
+            session_slides = initial.get('slides_files', [])
+            if session_slides:
+                slides_resources.extend(session_slides)
+            self.initial['slides'] = slides_resources
+            self.fields['slides'].existing_resources = slides_resources
+            self.fields['slides'].widget.existing_resources = slides_resources
+            self.fields['slides'].set_max_items(get_slides_max_count(self.event))
+
+        self.inject_questions_into_fields(
+            target=TalkQuestionTarget.SUBMISSION,
+            event=self.event,
+            submission=instance,
+            track=initial.get('track'),
+            submission_type=initial.get('submission_type'),
+            readonly=self.readonly,
+        )
+
+        self.order_fields_by_config('session')
 
         if self.readonly:
             for field in self.fields.values():
@@ -102,7 +138,10 @@ class InfoForm(CfPFormMixin, RequestRequire, PublicContent, forms.ModelForm):
     def _set_submission_types(self, instance=None):
         _now = now()
         submission_types = self.event.submission_types
-        if instance and instance.pk and (instance.state != SubmissionStates.SUBMITTED or not self.event.cfp.is_open):
+        if instance and instance.pk and (
+            instance.state != SubmissionStates.SUBMITTED
+            or not (hasattr(self.event, 'cfp') and self.event.cfp.is_open)
+        ):
             self.fields['submission_type'].queryset = submission_types.filter(pk=instance.submission_type_id)
             self.fields['submission_type'].disabled = True
             return
@@ -113,7 +152,8 @@ class InfoForm(CfPFormMixin, RequestRequire, PublicContent, forms.ModelForm):
             pks = {access_code.submission_type.pk}
         else:
             queryset = submission_types.filter(requires_access_code=False)
-            if not self.event.cfp.deadline or self.event.cfp.deadline >= _now:
+            _cfp = getattr(self.event, 'cfp', None) if hasattr(self.event, 'cfp') else None
+            if not _cfp or not _cfp.deadline or _cfp.deadline >= _now:
                 # No global deadline or still open
                 types = queryset.exclude(deadline__lt=_now)
             else:
@@ -122,10 +162,23 @@ class InfoForm(CfPFormMixin, RequestRequire, PublicContent, forms.ModelForm):
         if instance and instance.pk:
             pks |= {instance.submission_type.pk}
         if len(pks) == 1:
-            self.default_values['submission_type'] = submission_types.get(pk=list(pks)[0])
-            self.fields.pop('submission_type')
+            single_type = submission_types.get(pk=list(pks)[0])
+            self.default_values['submission_type'] = single_type
+            # Keep the field visible but disabled — speakers can see which session
+            # type they are submitting for even when there is only one available.
+            self.fields['submission_type'].queryset = submission_types.filter(pk=single_type.pk)
+            self.fields['submission_type'].required = True
+            self.fields['submission_type'].empty_label = None
+            self.fields['submission_type'].disabled = True
+            # Ensure the initial value is set so Django's disabled-field logic picks it up.
+            self.initial['submission_type'] = single_type
         else:
             self.fields['submission_type'].queryset = submission_types.filter(pk__in=pks)
+            self.fields['submission_type'].required = True
+            if hasattr(self.event, 'cfp') and self.event.cfp.default_type:
+                self.fields['submission_type'].empty_label = None
+            else:
+                self.fields['submission_type'].empty_label = _('Select a session type')
             if 'duration' in self.fields and not self.fields['duration'].required:
                 self.fields['duration'].help_text += ' ' + str(
                     _('Leave empty to use the default duration for the session type.')
@@ -133,11 +186,19 @@ class InfoForm(CfPFormMixin, RequestRequire, PublicContent, forms.ModelForm):
 
     def _set_locales(self):
         if 'content_locale' in self.fields:
-            if len(self.event.content_locales) == 1:
-                self.default_values['content_locale'] = self.event.content_locales[0]
+            _cfp = getattr(self.event, 'cfp', None) if hasattr(self.event, 'cfp') else None
+            saved_visibility = (_cfp.fields.get('content_locale', default_fields()['content_locale']).get('visibility') if _cfp else 'do_not_ask')
+            if len(self.event.content_locales) <= 1 or saved_visibility == 'do_not_ask':
+                default_locale = self.event.content_locales[0] if self.event.content_locales else self.event.locale
+                self.default_values['content_locale'] = default_locale
                 self.fields.pop('content_locale')
             else:
-                self.fields['content_locale'].choices = self.event.named_content_locales
+                choices = list(self.event.named_content_locales)
+                if self.instance and self.instance.pk and self.instance.content_locale:
+                    choice_codes = {c[0] for c in choices}
+                    if self.instance.content_locale not in choice_codes:
+                        choices.append((self.instance.content_locale, self.instance.get_content_locale_display()))
+                self.fields['content_locale'].choices = choices
 
     def _set_slot_count(self, instance=None):
         if not self.event.get_feature_flag('present_multiple_times'):
@@ -151,10 +212,183 @@ class InfoForm(CfPFormMixin, RequestRequire, PublicContent, forms.ModelForm):
     def save(self, *args, **kwargs):
         for key, value in self.default_values.items():
             setattr(self.instance, key, value)
+        self.errors
+        self._preserve_auto_draft_title()
         result = super().save(*args, **kwargs)
         if 'image' in self.cleaned_data:
             self.instance.process_image('image')
+        if 'slides' in self.cleaned_data:
+            save_slides_resource(self.instance, self.cleaned_data['slides'])
+        for key, value in self.cleaned_data.items():
+            if key.startswith('question_'):
+                self.save_questions(key, value)
         return result
+
+    def clean(self):
+        cleaned_data = super().clean()
+
+        if self.not_strict and not self.draft_save:
+            self._validate_required_step_fields(cleaned_data)
+            return cleaned_data
+
+        if not (self.draft_save or self.not_strict):
+            return cleaned_data
+
+        draft_field_names = [name for name in self.fields if self._is_draft_content_field_name(name)]
+        has_real_user_data = any(
+            self._counts_as_draft_content(key, value)
+            for key, value in cleaned_data.items()
+            if key in draft_field_names
+        )
+        if not has_real_user_data:
+            raise forms.ValidationError(self._get_empty_content_error_message())
+        return cleaned_data
+
+    def _validate_required_step_fields(self, cleaned_data):
+        _cfp_fields = (
+            self.event.cfp.fields if hasattr(self.event, 'cfp') else default_fields()
+        )
+        for key in self.Meta.request_require:
+            visibility = _cfp_fields.get(key, default_fields()[key])['visibility']
+            if visibility != 'required':
+                continue
+            if key in self.default_values or key not in self.fields:
+                continue
+            value = cleaned_data.get(key)
+            if not self._has_real_draft_value(key, value):
+                self.add_error(key, forms.ValidationError(_('This field is required.'), code='required_step_field'))
+
+        question_cache = {
+            field.question.pk: field.question
+            for field_name, field in self.fields.items()
+            if field_name.startswith('question_') and hasattr(field, 'question')
+        }
+
+        def question_is_visible(parent_id, dep_values):
+            if parent_id not in question_cache:
+                return False
+            parent_question = question_cache[parent_id]
+            if parent_question.dependency_question_id and not question_is_visible(
+                parent_question.dependency_question_id,
+                parent_question.dependency_values,
+            ):
+                return False
+            parent_field_name = f'question_{parent_id}'
+            if parent_field_name not in cleaned_data:
+                return False
+            parent_value = cleaned_data[parent_field_name]
+            if parent_value is None or parent_value == '':
+                return False
+            if isinstance(parent_value, bool):
+                return ('True' in dep_values and parent_value) or ('False' in dep_values and not parent_value)
+            if isinstance(parent_value, str):
+                return parent_value in dep_values
+            if hasattr(parent_value, '__iter__'):
+                return any(
+                    (str(v.pk) if hasattr(v, 'pk') else str(v)) in dep_values
+                    for v in parent_value
+                )
+            if hasattr(parent_value, 'pk'):
+                return str(parent_value.pk) in dep_values
+            return str(parent_value) in dep_values
+
+        for field_name, field in self.fields.items():
+            if not field_name.startswith('question_') or not hasattr(field, 'question'):
+                continue
+            question = field.question
+            if not question.required:
+                continue
+            if question.dependency_question_id and not question_is_visible(
+                question.dependency_question_id,
+                question.dependency_values,
+            ):
+                continue
+            value = cleaned_data.get(field_name)
+            if not self._has_real_draft_value(field_name, value):
+                self.add_error(field_name, forms.ValidationError(_('This field is required.'), code='required_step_field'))
+
+    def _get_empty_content_error_message(self):
+        return _('Please fill at least one field.')
+
+    def _preserve_auto_draft_title(self):
+        if not hasattr(self, 'cleaned_data'):
+            return
+        cleaned_title = (self.cleaned_data.get('title') or '').strip()
+        if self.draft_save and not cleaned_title:
+            self.cleaned_data['title'] = AUTO_DRAFT_TITLE
+            self.instance.title = AUTO_DRAFT_TITLE
+
+    @staticmethod
+    def _is_draft_content_field_name(name):
+        return name not in {'submission_type', 'content_locale'}
+
+    def _counts_as_draft_content(self, key, value):
+        if key.startswith('question_'):
+            field = self.fields.get(key)
+            if not self._question_field_has_user_content(field, value):
+                return False
+        return self._has_real_draft_value(key, value)
+
+    def _question_field_has_user_content(self, field, value):
+        if not self._has_real_draft_value(getattr(field, 'question', None), value):
+            return False
+        if getattr(field, 'answer', None):
+            return True
+        return self._normalize_draft_value(value) != self._normalize_draft_value(getattr(field, 'initial', None))
+
+    @staticmethod
+    def _has_real_draft_value(key, value):
+        if key == 'title' and value == AUTO_DRAFT_TITLE:
+            return False
+        if key == 'slot_count' and value == 1:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, SlidesData):
+            return value.has_value
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (list, tuple, set, dict)):
+            return bool(value)
+        if hasattr(value, '__len__'):
+            return len(value) > 0
+        return value is not None
+
+    @classmethod
+    def _normalize_draft_value(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, SlidesData):
+            return value.serialize()
+        if hasattr(value, 'pk'):
+            return value.pk
+        if hasattr(value, 'code'):
+            return value.code
+        if isinstance(value, dict):
+            return {key: cls._normalize_draft_value(val) for key, val in value.items()}
+        if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)):
+            return [cls._normalize_draft_value(element) for element in value]
+        return value
+
+    @cached_property
+    def submission_fields(self):
+        return [
+            self[name]
+            for name, field in self.fields.items()
+            if getattr(field, 'question', None) and field.question.target == TalkQuestionTarget.SUBMISSION
+        ]
+
+    @cached_property
+    def speaker_fields(self):
+        return [
+            self[name]
+            for name, field in self.fields.items()
+            if getattr(field, 'question', None) and field.question.target == TalkQuestionTarget.SPEAKER
+        ]
 
     class Meta:
         model = Submission
@@ -169,6 +403,7 @@ class InfoForm(CfPFormMixin, RequestRequire, PublicContent, forms.ModelForm):
             'slot_count',
             'do_not_record',
             'image',
+            'slides',
             'duration',
         ]
         request_require = [
@@ -176,23 +411,24 @@ class InfoForm(CfPFormMixin, RequestRequire, PublicContent, forms.ModelForm):
             'abstract',
             'description',
             'notes',
+            'slot_count',
             'image',
+            'slides',
             'do_not_record',
             'track',
             'duration',
             'content_locale',
-            'additional_speaker',
         ]
-        public_fields = ['title', 'abstract', 'description', 'image']
+        public_fields = ['title', 'abstract', 'description', 'image', 'slides']
         widgets = {
-            'abstract': MarkdownWidget,
-            'description': MarkdownWidget,
-            'notes': MarkdownWidget,
+            'abstract': RichTextWidget,
+            'description': RichTextWidget,
+            'notes': RichTextWidget,
             'track': EnhancedSelect(description_field='description', color_field='color'),
         }
         field_classes = {
-            'submission_type': SafeModelChoiceField,
-            'track': SafeModelChoiceField,
+            'submission_type': EventLocalizedSafeModelChoiceField,
+            'track': EventLocalizedSafeModelChoiceField,
         }
 
 
@@ -248,12 +484,12 @@ class SubmissionFilterForm(forms.Form):
 
     default_renderer = InlineFormRenderer
 
-    def __init__(self, event, *args, limit_tracks=False, search_fields=None, **kwargs):
+    def __init__(self, event, *args, limit_tracks=False, search_fields=None, show_all_filters=False, **kwargs):
         self.event = event
         self.search_fields = search_fields or (
             'code__icontains',
             'title__icontains',
-            'speakers__name__icontains',
+            'speakers__fullname__icontains',
         )
         usable_states = kwargs.pop('usable_states', None)
         initial = kwargs.pop('initial', {}) or {}
@@ -281,7 +517,7 @@ class SubmissionFilterForm(forms.Form):
             limit_tracks = event.tracks.filter(pk__in=[track.pk for track in limit_tracks])
         tracks = limit_tracks or event.tracks.all()
         languages = event.named_content_locales
-        if len(sub_types) > 1:
+        if len(sub_types) > 1 or show_all_filters:
             type_count = {
                 d['submission_type_id']: d['submission_type_id__count']
                 for d in qs.order_by('submission_type_id')
@@ -297,7 +533,7 @@ class SubmissionFilterForm(forms.Form):
             ]
         else:
             self.fields.pop('submission_type', None)
-        if len(tracks) > 1:
+        if len(tracks) > 1 or show_all_filters:
             self.fields['track'].queryset = tracks.annotate(
                 count=Count(
                     'submissions',
@@ -313,7 +549,7 @@ class SubmissionFilterForm(forms.Form):
             ).order_by('-count')
         else:
             self.fields.pop('track', None)
-        if len(languages) > 1:
+        if len(languages) > 1 or show_all_filters:
             language_count = {
                 d['content_locale']: d['content_locale__count']
                 for d in qs.order_by('content_locale').values('content_locale').annotate(Count('content_locale'))
@@ -324,12 +560,12 @@ class SubmissionFilterForm(forms.Form):
         else:
             self.fields.pop('content_locale', None)
 
-        if not self.event.tags.all().exists():
-            self.fields.pop('tags', None)
-        else:
+        if self.event.tags.all().exists() or show_all_filters:
             self.fields['tags'].queryset = event.tags.prefetch_related('submissions').annotate(
                 submission_count=Count('submissions', distinct=True)
             )
+        else:
+            self.fields.pop('tags', None)
 
         if usable_states:
             usable_states = [choice for choice in self.fields['state'].choices if choice[0] in usable_states]

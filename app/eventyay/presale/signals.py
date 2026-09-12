@@ -1,6 +1,10 @@
-from django.dispatch import Signal
+from django.dispatch import Signal, receiver
+from django.template.loader import get_template
+from django.utils.timezone import now
 
-from eventyay.base.signals import EventPluginSignal
+from eventyay.base.models import Event, Order
+from eventyay.base.signals import EventPluginSignal, event_copy_data, product_copy_data
+
 
 global_html_head = Signal()
 """
@@ -101,6 +105,16 @@ Arguments: ``request``
 
 The signal ``pretix.presale.signals.footer_link`` allows you to add links to the footer of an event page. You
 are expected to return a dictionary containing the keys ``label`` and ``url``.
+
+As with all plugin signals, the ``sender`` keyword argument will contain the event.
+"""
+
+header_nav_tabs = EventPluginSignal()
+"""
+Arguments: ``request``
+
+This signal allows plugins to add extra tabs to the public presale navigation.
+Receivers are expected to return plain HTML anchor elements.
 
 As with all plugin signals, the ``sender`` keyword argument will contain the event.
 """
@@ -270,6 +284,104 @@ This signal is sent out to display additional information on top of the position
 As with all plugin signals, the ``sender`` keyword argument will contain the event.
 """
 
+
+@receiver(order_info_top, dispatch_uid='venueless_order_info')
+def w_order_info(sender: Event, request, order: Order, **kwargs):
+    if (
+        (
+            order.status != Order.STATUS_PAID
+            and not (order.status == Order.STATUS_PENDING and sender.settings.venueless_allow_pending)
+        )
+        or not order.positions.exists()
+        or not sender.settings.venueless_secret
+        or not sender.settings.get('venueless_show_public_link', False)
+    ):
+        return
+
+    positions = [p for p in order.positions.filter(product__admission=True, addon_to__isnull=True)]
+    positions = [
+        p
+        for p in positions
+        if (
+            (
+                not sender.settings.venueless_start
+                or sender.settings.venueless_start.datetime(p.subevent or sender) <= now()
+            )
+            and (sender.settings.venueless_all_products or p.product_id in (p.event.settings.venueless_products or []))
+        )
+    ]
+    if not positions:
+        return
+
+    template = get_template('pretix_venueless/order_info.html')
+    ctx = {
+        'order': order,
+        'event': sender,
+        'positions': positions,
+    }
+    return template.render(ctx, request=request)
+
+
+@receiver(position_info_top, dispatch_uid='venueless_position_info')
+def w_pos_info(sender: Event, request, order: Order, position, **kwargs):
+    if (
+        (
+            order.status != Order.STATUS_PAID
+            and not (order.status == Order.STATUS_PENDING and sender.settings.venueless_allow_pending)
+        )
+        or not order.positions.exists()
+        or position.canceled
+        or not position.product.admission
+        or (
+            not sender.settings.venueless_all_products
+            and position.product_id not in (position.event.settings.venueless_products or [])
+        )
+        or not sender.settings.venueless_secret
+        or not sender.settings.get('venueless_show_public_link', False)
+    ):
+        return
+
+    if (
+        sender.settings.venueless_start
+        and sender.settings.venueless_start.datetime(position.subevent or sender) > now()
+    ):
+        positions = []
+    else:
+        positions = [position]
+
+    template = get_template('pretix_venueless/order_info.html')
+    ctx = {
+        'order': order,
+        'event': sender,
+        'positions': positions,
+    }
+    return template.render(ctx, request=request)
+
+
+@receiver(signal=event_copy_data, dispatch_uid='venueless_event_copy_data')
+def venueless_event_copy_data(sender, other, product_map, question_map, **kwargs):
+    clone_options = kwargs.get('clone_options') or {}
+    if not clone_options.get('clone_ticketing_data', True):
+        return
+
+    sender.settings['venueless_products'] = [
+        product_map[product].pk
+        for product in other.settings.get('venueless_products', default=[])
+        if product in product_map
+    ]
+    sender.settings['venueless_questions'] = [
+        question_map[q].pk for q in other.settings.get('venueless_questions', default=[]) if q in question_map
+    ]
+
+
+@receiver(signal=product_copy_data, dispatch_uid='venueless_product_copy_data')
+def venueless_product_copy_data(sender, source, target, **kwargs):
+    products = sender.settings.get('venueless_products') or []
+    if target.pk not in products:
+        products.append(target.pk)
+        sender.settings['venueless_products'] = products
+
+
 process_request = EventPluginSignal()
 """
 Arguments: ``request``
@@ -343,6 +455,17 @@ Arguments: ``request``, ``subevent``
 
 This signal is sent out to display additional information on the frontpage below the list
 of products if the front page is shown in the widget.
+
+As with all plugin signals, the ``sender`` keyword argument will contain the event. The
+receivers are expected to return HTML.
+"""
+
+front_page_after_content = EventPluginSignal()
+"""
+Arguments: ``request``, ``subevent``
+
+This signal is sent out to display additional information at the very bottom of the
+frontpage, below tickets, vouchers, order links, and other standard content.
 
 As with all plugin signals, the ``sender`` keyword argument will contain the event. The
 receivers are expected to return HTML.

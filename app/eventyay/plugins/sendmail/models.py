@@ -1,16 +1,21 @@
 import logging
+from collections import defaultdict
 
 from django.contrib.postgres.fields import ArrayField
 from django.db import models
+from django.urls import reverse
 from django.utils.timezone import now
+from django.utils.translation import gettext_lazy as _
 from i18nfield.fields import I18nTextField
 
 from eventyay.base.email import get_email_context
+from eventyay.mail.context import get_mail_context
 from eventyay.base.models.auth import User
 from eventyay.base.models.event import Event
 from eventyay.base.models.orders import InvoiceAddress, Order, OrderPosition
 from eventyay.base.i18n import LazyI18nString
-from eventyay.base.services.mail import mail
+from eventyay.base.services.mail import mail, SendMailException as MailTransportError
+from eventyay.common.exceptions import SendMailException
 
 
 logger = logging.getLogger(__name__)
@@ -25,6 +30,7 @@ class Recipients(models.TextChoices):
     ORDERS = 'orders', 'Orders'
     ATTENDEES = 'attendees', 'Attendees'
     BOTH = 'both', 'Both'
+    INDIVIDUAL = 'individual', 'Individual'
 
 
 
@@ -60,13 +66,13 @@ class EmailQueue(models.Model):
     :type attachments: list[str]
 
     :param created: Timestamp of when the queued mail was created.
-    :type created: datetime
+    :type created: datetime.datetime
 
     :param updated: Timestamp of the last update.
-    :type updated: datetime
+    :type updated: datetime.datetime
 
     :param sent_at: When the email was sent (fully completed).
-    :type sent_at: datetime or None
+    :type sent_at: datetime.datetime or None
     """
     event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="email_queue")
     user = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
@@ -83,12 +89,102 @@ class EmailQueue(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     sent_at = models.DateTimeField(null=True, blank=True)
+    scheduled_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=_('If set, the email will be sent at this time instead of immediately.'),
+    )
+    is_draft = models.BooleanField(
+        default=False,
+        verbose_name=_('Draft'),
+        help_text=_('Drafts are kept out of the outbox and are never sent until they are moved there.')
+    )
 
     class Meta:
         ordering = ["-created_at"]
 
     def __str__(self):
         return f"EmailQueue(event={self.event.slug}, sent_at={self.sent_at})"
+
+    @property
+    def email_type_display(self):
+        if self.composing_for == ComposingFor.TEAMS:
+            return _('Team members')
+        return _('Attendees, orders, tickets')
+
+    def get_edit_url(self):
+        if self.composing_for == ComposingFor.TEAMS:
+            return reverse('control:event.mail.compose_teams', kwargs={
+                'organizer': self.event.organizer.slug,
+                'event': self.event.slug
+            }) + f'?draft={self.pk}'
+        return reverse('control:event.mail.send', kwargs={
+            'organizer': self.event.organizer.slug,
+            'event': self.event.slug
+        }) + f'?draft={self.pk}'
+
+    def duplicate(self):
+        """
+        Creates a copy of this EmailQueue as a draft and copies its filter data and recipients.
+        """
+        new_mail = EmailQueue.objects.create(
+            event=self.event,
+            user=self.user,
+            composing_for=self.composing_for,
+            subject=self.subject,
+            message=self.message,
+            reply_to=self.reply_to,
+            bcc=self.bcc,
+            locale=self.locale,
+            attachments=list(self.attachments),
+            scheduled_at=self.scheduled_at,
+            is_draft=True,
+            sent_at=None,
+        )
+
+        if hasattr(self, 'filters_data'):
+            orig_filter = self.filters_data
+            EmailQueueFilter.objects.create(
+                mail=new_mail,
+                recipients=orig_filter.recipients,
+                order_status=list(orig_filter.order_status),
+                products=list(orig_filter.products),
+                checkin_lists=list(orig_filter.checkin_lists),
+                has_filter_checkins=orig_filter.has_filter_checkins,
+                not_checked_in=orig_filter.not_checked_in,
+                subevent=orig_filter.subevent,
+                subevents_from=orig_filter.subevents_from,
+                subevents_to=orig_filter.subevents_to,
+                order_created_from=orig_filter.order_created_from,
+                order_created_to=orig_filter.order_created_to,
+                orders=list(orig_filter.orders),
+                teams=list(orig_filter.teams),
+                team_role=orig_filter.team_role,
+                permission_level=orig_filter.permission_level,
+                status=orig_filter.status,
+                specific_people=list(orig_filter.specific_people),
+                exclude_me=orig_filter.exclude_me,
+                individual_attendees=list(getattr(orig_filter, 'individual_attendees', []) or []),
+            )
+
+        recipients = [
+            EmailQueueToUser(
+                mail=new_mail,
+                email=r.email,
+                orders=list(r.orders),
+                positions=list(r.positions),
+                products=list(r.products),
+                team=r.team,
+                sent=False,
+                error=None,
+            )
+            for r in self.recipients.all()
+        ]
+        if recipients:
+            EmailQueueToUser.objects.bulk_create(recipients)
+
+        return new_mail
 
     def subject_localized(self, locale=None):
         """
@@ -111,9 +207,19 @@ class EmailQueue(models.Model):
         """
         if self.sent_at:
             return False  # Already sent
+
+        if self.is_draft:
+            return False  # Do not send drafts
+
+        if self.scheduled_at and self.scheduled_at > now():
+            raise SendMailException(_('This email is scheduled for the future and cannot be sent yet.'))
+
         recipients = self.recipients.all()
         if not recipients.exists():
-            return False  # Nothing to send
+            if self.scheduled_at is not None:
+                self.scheduled_at = None
+                self.save(update_fields=['scheduled_at'])
+            return False
 
         subject = LazyI18nString(self.subject)
         message = LazyI18nString(self.message)
@@ -121,34 +227,54 @@ class EmailQueue(models.Model):
         for recipient in recipients:
             if recipient.sent:
                 continue
-            self._send_to_recipient(recipient, subject, message)
+            self._send_to_recipient(recipient, subject, message, async_send=async_send)
 
         self._finalize_send_status()
         return True
 
     def _build_email_context(self, order, position, position_or_address, recipient):
         try:
-            if self.composing_for == ComposingFor.ATTENDEES:
-                return get_email_context(
-                    event=self.event,
-                    order=order,
-                    position=position,
-                    position_or_address=position_or_address,
+            if self.composing_for != ComposingFor.ATTENDEES:
+                user_obj = User.objects.filter(email__iexact=recipient.email).first()
+                ctx = get_email_context(event=self.event, user=user_obj)
+                ctx.update(get_mail_context(event=self.event, user=user_obj))
+                return ctx
+
+            # Only pass keys that are present. ``position=None`` still counts as
+            # provided to get_email_context and would break position placeholders.
+            if order is not None and position is None:
+                positions = list(
+                    order.positions.select_related('product', 'order__event').order_by('positionid')
                 )
-            else:
-                return get_email_context(event=self.event)
-        except Exception as e:
-            logger.exception("Error while generating email context")
-            recipient.error = f"Context error: {str(e)}"
-            recipient.save(update_fields=["error"])
+                position = next((pos for pos in positions if pos.generate_ticket), None) or (
+                    positions[0] if positions else None
+                )
+                position_or_address = position_or_address or position
+
+            kwargs = {'event': self.event}
+            if order is not None:
+                kwargs['order'] = order
+            if position is not None:
+                kwargs['position'] = position
+            if position_or_address is not None:
+                kwargs['position_or_address'] = position_or_address
+            return get_email_context(**kwargs)
+        except (AttributeError, KeyError, TypeError, ValueError) as e:
+            logger.exception('Error while generating email context')
+            recipient.error = f'Context error: {e}'
+            recipient.save(update_fields=['error'])
             return None
 
     def _finalize_send_status(self):
         self.sent_at = now() if all(r.sent for r in self.recipients.all()) else None
-        self.save(update_fields=["sent_at"])
+        # Clear scheduled_at after the first send attempt so the periodic poller
+        # does not keep picking this row up when some recipients permanently
+        # failed (bounces, invalid addresses). Users can still retry failed
+        # recipients manually from the outbox.
+        self.scheduled_at = None
+        self.save(update_fields=["sent_at", "scheduled_at"])
 
-    def _send_to_recipient(self, recipient, subject, message):
-        from eventyay.base.services.mail import SendMailException
+    def _send_to_recipient(self, recipient, subject, message, async_send=True):
         email = recipient.email
         if not email:
             return False
@@ -185,15 +311,16 @@ class EmailQueue(models.Model):
                 attach_cached_files=self.attachments,
                 user=self.user,
                 auto_email=False,
+                sync_send=not async_send,
             )
             recipient.sent = True
             recipient.error = None
             recipient.save(update_fields=["sent", "error"])
-        except SendMailException as se:
+        except MailTransportError as se:
             recipient.sent = False
             recipient.error = str(se)
             recipient.save(update_fields=["sent", "error"])
-            logger.exception("SendMailException error while sending to %s", email)
+            logger.exception("Mail transport error while sending to %s", email)
         except Exception as e:
             recipient.sent = False
             recipient.error = f"Internal error: {str(e)}"
@@ -213,7 +340,6 @@ class EmailQueue(models.Model):
         """
         Resolves recipients and populates to_users with metadata.
         """
-        from collections import defaultdict
 
         filters = getattr(self, 'filters_data', None)
         if not filters:
@@ -234,8 +360,11 @@ class EmailQueue(models.Model):
         for order in orders_qs:
             order_fallback_needed = False
             attendee_found = False
+            individual_positions = set(filters.individual_attendees) if recipients_mode == "individual" else None
 
             for pos in order.positions.all():
+                if individual_positions is not None and pos.pk not in individual_positions:
+                    continue
                 if pos.attendee_email:
                     attendee_found = True
                     email = pos.attendee_email.strip().lower()
@@ -255,15 +384,18 @@ class EmailQueue(models.Model):
             ):
                 email = order.email.strip().lower()
                 recipients[email]["orders"].add(order.pk)
-                product_ids = order.positions.values_list('product__pk', flat=True)
-                recipients[email]["products"].update(pid for pid in product_ids)
+                for pos in order.positions.all():
+                    recipients[email]["positions"].add(pos.pk)
+                    recipients[email]["products"].add(pos.product_id)
 
-            # Explicit inclusion of orders
+            # Explicit inclusion of orders (include positions so QR/attendee
+            # placeholders can resolve for buyer/order contact emails).
             if recipients_mode in ("both", "orders") and order.email:
                 email = order.email.strip().lower()
                 recipients[email]["orders"].add(order.pk)
-                product_ids = order.positions.values_list('product__pk', flat=True)
-                recipients[email]["products"].update(pid for pid in product_ids)
+                for pos in order.positions.all():
+                    recipients[email]["positions"].add(pos.pk)
+                    recipients[email]["products"].add(pos.product_id)
 
         # Clear and insert fresh records
         self.recipients.all().delete()
@@ -359,16 +491,16 @@ class EmailQueueFilter(models.Model):
     :type subevent: int or None
     
     :param subevents_from: Filter subevents from this date/time onward.
-    :type subevents_from: datetime or None
+    :type subevents_from: datetime.datetime or None
     
     :param subevents_to: Filter subevents up to this date/time.
-    :type subevents_to: datetime or None
+    :type subevents_to: datetime.datetime or None
     
     :param order_created_from: Include orders created after this date/time.
-    :type order_created_from: datetime or None
+    :type order_created_from: datetime.datetime or None
     
     :param order_created_to: Include orders created before this date/time.
-    :type order_created_to: datetime or None
+    :type order_created_to: datetime.datetime or None
     
     :param orders: Explicit order IDs to include.
     :type orders: list[int]
@@ -390,7 +522,15 @@ class EmailQueueFilter(models.Model):
     order_created_from = models.DateTimeField(null=True, blank=True)
     order_created_to = models.DateTimeField(null=True, blank=True)
     orders = ArrayField(models.IntegerField(), blank=True, default=list)
+
     teams = ArrayField(models.IntegerField(), blank=True, default=list)
+    team_role = models.CharField(max_length=20, blank=True, default='')
+    permission_level = models.CharField(max_length=50, blank=True, default='')
+    status = models.CharField(max_length=10, blank=True, default='')
+    specific_people = ArrayField(models.IntegerField(), blank=True, default=list)
+    exclude_me = models.BooleanField(default=False)
+
+    individual_attendees = ArrayField(models.IntegerField(), blank=True, default=list)
 
     def __str__(self):
         return f"Filters for mail {self.mail_id}"

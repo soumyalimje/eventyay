@@ -1,0 +1,108 @@
+.ui-page-header
+	flex: none
+	display: flex
+	align-items: center
+	padding: 0 16px
+	height: 56px
+	min-height: 56px
+	box-sizing: border-box
+	border-bottom: border-separator()
+	background-color: $clr-white
+	gap: 8px
+
+	> .bunt-icon-button:first-child
+		flex: none
+		margin-right: 4px
+
+	h1, h2
+		flex: auto
+		font-size: 20px
+		font-weight: 600
+		margin: 0
+		ellipsis()
+
+	.actions
+		display: flex
+		align-items: center
+		gap: 8px
+		margin-left: auto
+
+.ui-form-actions
+	flex: none
+	display: flex
+	align-items: center
+	padding: 8px
+	height: 56px
+	box-sizing: border-box
+	border-top: border-separator()
+	background-color: $clr-grey-50
+	.btn-save
+		themed-button-primary()
+	.errors
+		color: $clr-danger
+		font-weight: 600
+		margin-left: 16px
+
+.ui-form-actions-wrapper
+	position: fixed
+	bottom: 0
+	width: 100%
+
+.ui-form-body
+	flex: auto
+	display: flex
+	flex-direction: column
+	padding: 16px
+
+	h2
+		font-size: 24px
+		margin: 16px 0 4px 0
+
+#app.has-background-room
+	.ui-page-header
+		padding-right: 8px + 280px + 4px
+
+.ui-badge
+	display: inline-block
+	font-size: 11px
+	font-weight: 500
+	box-sizing: border-box
+	height: 16px
+	line-height: 13px
+	vertical-align: middle
+	border: 2px solid var(--clr-primary)
+	border-radius: 8px
+	padding: 0 4px
+	margin-left: 4px
+
+.ui-background-blocker
+	position: fixed
+	top: 0
+	left: 0
+	width: 100vw
+	height: var(--vh100)
+	z-index: 800
+
+.ui-radio-options
+	display: flex
+	flex-direction: column
+	border: border-separator()
+	border-radius: 4px
+.ui-radio-option
+	display: flex
+	gap: 10px
+	padding: 10px 12px
+	cursor: pointer
+	color: $clr-primary-text-light
+	&:not(:last-child)
+		border-bottom: border-separator()
+	input
+		margin-top: 3px
+		flex: none
+	.ui-radio-title
+		font-weight: 500
+		line-height: 20px
+	.ui-radio-description
+		color: $clr-secondary-text-light
+		font-size: 12px
+		line-height: 18px

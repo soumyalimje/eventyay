@@ -1,3 +1,6 @@
+import functools
+import logging
+from collections import defaultdict
 from copy import deepcopy
 
 import rules
@@ -11,17 +14,41 @@ from django.utils.translation import override, pgettext_lazy
 from i18nfield.fields import I18nCharField, I18nTextField
 
 from eventyay.common.exceptions import SendMailException
+from eventyay.common.mail import get_reply_to_address
 from eventyay.common.urls import EventUrls
-from eventyay.mail.context import get_available_placeholders, get_mail_context
+from eventyay.mail.context import get_available_placeholders, get_mail_context, get_used_placeholders
 from eventyay.mail.placeholders import SimpleFunctionalMailTextPlaceholder
 from eventyay.mail.signals import queuedmail_post_send, queuedmail_pre_send
 from eventyay.talk_rules.submission import orga_can_change_submissions
+from eventyay.helpers.i18n import is_rtl
 
 from .mixins import PretalxModel
 
+logger = logging.getLogger(__name__)
+
+
+_missing_placeholder_warning_seen = {}
+
+
+def _should_warn_missing_placeholders(template_pk, missing) -> bool:
+    """Returns True once per unique (template_pk, missing) combination,
+    bounded to 128 entries so long-running workers don't leak memory."""
+    key = (template_pk, missing)
+    if key in _missing_placeholder_warning_seen:
+        return False
+
+    _missing_placeholder_warning_seen[key] = None
+    if len(_missing_placeholder_warning_seen) > 128:
+        _missing_placeholder_warning_seen.pop(next(iter(_missing_placeholder_warning_seen)))
+    return True
+
 
 def get_prefixed_subject(event, subject):
-    if not (prefix := event.mail_settings['subject_prefix']):
+    prefix = (
+        event.settings.get('mail_prefix')
+        or event.mail_settings.get('subject_prefix', '')
+    )
+    if not prefix:
         return subject
     if not (prefix.startswith('[') and prefix.endswith(']')):
         prefix = f'[{prefix}]'
@@ -174,7 +201,17 @@ class MailTemplate(PretalxModel):
         else:
             raise TypeError('First argument to to_mail must be a string or a User, not ' + str(type(user)))
         if users and not commit:
-            address = ','.join(user.email for user in users)
+            addresses = [
+                email for user in users if (email := (user.email or '').strip())
+            ]
+            if not addresses:
+                if skip_queue:
+                    raise SendMailException(
+                        'Cannot create mail without at least one valid recipient email address.'
+                    )
+                address = None
+            else:
+                address = ','.join(addresses)
             users = None
         event = event or self.event
 
@@ -184,20 +221,38 @@ class MailTemplate(PretalxModel):
             default_context = get_mail_context(**context_kwargs)
             default_context.update(context or {})
             context = default_context
+            used = get_used_placeholders(self.subject) | get_used_placeholders(self.text)
+            missing = used - set(context.keys())
+            if missing and _should_warn_missing_placeholders(self.pk, frozenset(missing)):
+                logger.warning(
+                    'Mail template "%s" (pk=%s, role=%s) for event "%s" uses '
+                    'placeholders not available in this context: %s',
+                    self.subject, self.pk, self.role, event.slug,
+                    ', '.join(sorted(missing)),
+                )
             try:
-                subject = str(self.subject).format(**context)
-                text = str(self.text).format(**context)
-            except KeyError as e:
-                raise SendMailException(f'Experienced KeyError when rendering email text: {str(e)}')
+                subject = str(self.subject).format_map(defaultdict(str, context))
+                text = str(self.text).format_map(defaultdict(str, context))
+            except (KeyError, IndexError, ValueError) as e:
+                raise SendMailException(f'Experienced error when rendering email text: {e}') from e
 
             if len(subject) > 200:
                 subject = subject[:198] + '…'
+
+            sender = event.settings.get('mail_from') if event else settings.DEFAULT_FROM_EMAIL
+            sender = sender or settings.DEFAULT_FROM_EMAIL
+
+            resolved_reply_to = (
+                get_reply_to_address(event, template=self, sender_email=sender)
+                if event
+                else self.reply_to
+            )
 
             mail = QueuedMail(
                 event=event,
                 template=self,
                 to=address,
-                reply_to=self.reply_to,
+                reply_to=resolved_reply_to,
                 bcc=self.bcc,
                 subject=subject,
                 text=text,
@@ -308,7 +363,7 @@ class QueuedMail(PretalxModel):
         null=True,
         blank=True,
         verbose_name=_('Reply-To'),
-        help_text=_('By default, the organiser address is used as Reply-To.'),
+        help_text=_('By default, the organizer email is used as Reply-To when the platform sender is used. With a custom sender, replies go to the sender address unless overridden here.'),
     )
     cc = models.CharField(
         max_length=1000,
@@ -327,6 +382,18 @@ class QueuedMail(PretalxModel):
     subject = models.CharField(max_length=200, verbose_name=pgettext_lazy('email subject', 'Subject'))
     text = models.TextField(verbose_name=_('Text'))
     sent = models.DateTimeField(null=True, blank=True, verbose_name=_('Sent at'))
+    is_draft = models.BooleanField(
+        default=False,
+        verbose_name=_('Draft'),
+        help_text=_('Drafts are kept out of the outbox and are never sent until they are moved there.'),
+    )
+    scheduled_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name=_('Scheduled for'),
+        help_text=_('If set, the email will be sent at this time instead of immediately.'),
+    )
     locale = models.CharField(max_length=32, null=True, blank=True)
     attachments = models.JSONField(default=None, null=True, blank=True)
     submissions = models.ManyToManyField(
@@ -349,6 +416,7 @@ class QueuedMail(PretalxModel):
         base = edit = '{self.event.orga_urls.mail}{self.pk}/'
         delete = '{base}delete'
         send = '{base}send'
+        to_outbox = '{base}to-outbox'
         copy = '{base}copy'
 
     def __str__(self):
@@ -357,21 +425,24 @@ class QueuedMail(PretalxModel):
         return f'OutboxMail(to={self.to}, subject={self.subject}, sent={sent})'
 
     def make_html(self):
-        from eventyay.base.templatetags.rich_text import render_markdown_abslinks
+        from eventyay.base.templatetags.rich_text import compile_email_body
 
         event = getattr(self, 'event', None)
         sig = None
         if event:
-            sig = event.mail_settings['signature']
-            if sig.strip().startswith('-- '):
+            sig = (
+                str(event.settings.get('mail_text_signature') or '')
+                or event.mail_settings.get('signature', '')
+            )
+            if sig and sig.strip().startswith('-- '):
                 sig = sig.strip()[3:].strip()
-        body_md = render_markdown_abslinks(self.text)
+        body_md = compile_email_body(self.text)
         html_context = {
             'body': body_md,
             'event': event,
             'color': (event.visible_primary_color if event else '') or settings.DEFAULT_EVENT_PRIMARY_COLOR,
             'locale': self.locale,
-            'rtl': self.locale in settings.LANGUAGES_BIDI,
+            'rtl': is_rtl(self.locale),
             'subject': self.subject,
             'signature': sig,
         }
@@ -379,9 +450,14 @@ class QueuedMail(PretalxModel):
 
     def make_text(self):
         event = getattr(self, 'event', None)
-        if not event or not event.mail_settings['signature']:
+        sig = None
+        if event:
+            sig = (
+                str(event.settings.get('mail_text_signature') or '')
+                or event.mail_settings.get('signature', '')
+            ) or None
+        if not sig:
             return self.text
-        sig = event.mail_settings['signature']
         if not sig.strip().startswith('-- '):
             sig = f'-- \n{sig}'
         return f'{self.text}\n{sig}'
@@ -403,6 +479,9 @@ class QueuedMail(PretalxModel):
         """
         if self.sent:
             raise Exception(_('This mail has been sent already. It cannot be sent again.'))
+
+        if self.scheduled_at and self.scheduled_at > now():
+            raise SendMailException(_('This mail is scheduled for the future and cannot be sent yet.'))
 
         has_event = getattr(self, 'event', None)
 
@@ -442,7 +521,7 @@ class QueuedMail(PretalxModel):
 
         if self.pk:
             self.log_action(
-                'pretalx.mail.sent',
+                'eventyay.mail.sent',
                 person=requestor,
                 orga=orga,
                 data={'to_users': [(user.pk, user.email) for user in self.to_users.all()]},

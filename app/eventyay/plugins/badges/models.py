@@ -27,9 +27,19 @@ class BadgeLayout(LoggedModel):
         default=False,
     )
     name = models.CharField(max_length=190, verbose_name=_('Name'))
+    allow_customization = models.BooleanField(
+        verbose_name=_('Allow badge customization'),
+        default=False,
+    )
+    allow_badge_editing = models.BooleanField(
+        verbose_name=_('Allow badge editing'),
+        default=False,
+    )
     layout = models.TextField(
         default='[{"type":"textarea","left":"0","bottom":"85","fontsize":"12.0","color":[0,0,0,1],"fontfamily":"Open Sans","bold":true,"italic":false,"width":"80","content":"attendee_name","text":"John Doe","align":"center"},{"type":"barcodearea","left":"24.87","bottom":"34","size":"30.00","content":"secret"},{"type":"textarea","left":"0","bottom":"83","fontsize":"10.0","color":[0,0,0,1],"fontfamily":"Open Sans","bold":false,"italic":false,"width":"80.00","downward":true,"content":"attendee_job_title","text":"Developer","align":"center"},{"type":"textarea","left":"0","bottom":"76","fontsize":"12.0","color":[0,0,0,1],"fontfamily":"Open Sans","bold":false,"italic":false,"width":"80","downward":true,"content":"attendee_company","text":"FOSSASIA","align":"center"}]'
     )
+    ask_user_fields = models.TextField(default='[]', blank=True)
+    required_badge_fields = models.TextField(default='[]', blank=True)
 
     size = models.TextField(default='[{"width": 148, "height": 105, "orientation": "landscape"}]')
 
@@ -55,6 +65,41 @@ class BadgeLayout(LoggedModel):
             self.size = json.dumps([{'width': width, 'height': height, 'orientation': orientation}])
         super().save(*args, **kwargs)
 
+    @property
+    def ask_user_fields_data(self):
+        if self.ask_user_fields:
+            try:
+                return json.loads(self.ask_user_fields)
+            except ValueError:
+                return []
+        return []
+
+    @ask_user_fields_data.setter
+    def ask_user_fields_data(self, values):
+        self.ask_user_fields = json.dumps(list(values or []))
+
+    @property
+    def required_badge_fields_data(self):
+        if self.required_badge_fields:
+            try:
+                return json.loads(self.required_badge_fields)
+            except ValueError:
+                return []
+        return []
+
+    @required_badge_fields_data.setter
+    def required_badge_fields_data(self, values):
+        self.required_badge_fields = json.dumps(list(values or []))
+
+    @property
+    def layout_data(self):
+        if self.layout:
+            try:
+                return json.loads(self.layout)
+            except ValueError:
+                return []
+        return []
+
 
 class BadgeProduct(models.Model):
     # If no BadgeProduct exists => use default
@@ -70,6 +115,28 @@ class BadgeProduct(models.Model):
         'BadgeLayout',
         on_delete=models.CASCADE,
         related_name='product_assignments',
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ('id',)
+
+
+class BadgeVoucher(models.Model):
+    # If no BadgeVoucher exists => fall back to product/default layout
+    # If BadgeVoucher exists with layout=None => don't print
+    voucher = models.OneToOneField(
+        'base.Voucher',
+        null=True,
+        blank=True,
+        related_name='badge_assignment',
+        on_delete=models.CASCADE,
+    )
+    layout = models.ForeignKey(
+        'BadgeLayout',
+        on_delete=models.CASCADE,
+        related_name='voucher_assignments',
         null=True,
         blank=True,
     )

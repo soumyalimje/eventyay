@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import operator
 from typing import Any
@@ -21,6 +22,7 @@ from eventyay.base.configurations.lazy_i18n_string_list_base import (
 )
 from eventyay.base.reldate import RelativeDateWrapper
 
+
 DEFAULTS = DEFAULT_SETTINGS.copy()
 SETTINGS_AFFECTING_CSS = CSS_SETTINGS.copy()
 PERSON_NAME_TITLE_GROUPS = TITLE_GROUP.copy()
@@ -35,6 +37,50 @@ settings_hierarkey = Hierarkey(attribute_name='settings')
 for k, v in DEFAULTS.items():
     settings_hierarkey.add_default(k, v['default'], v['type'])
 
+# Eventyay Video (integrated)
+settings_hierarkey.add_default('venueless_start', None, RelativeDateWrapper)
+settings_hierarkey.add_default('venueless_text', None, LazyI18nString)
+settings_hierarkey.add_default('review_help_text', None, LazyI18nString)
+settings_hierarkey.add_default('venueless_allow_pending', 'False', bool)
+settings_hierarkey.add_default('venueless_all_products', 'True', bool)
+settings_hierarkey.add_default('venueless_products', '[]', list)
+settings_hierarkey.add_default('venueless_questions', '[]', list)
+settings_hierarkey.add_default('venueless_url', '', str)
+settings_hierarkey.add_default('venueless_secret', '', str)
+settings_hierarkey.add_default('venueless_issuer', '', str)
+settings_hierarkey.add_default('venueless_audience', '', str)
+settings_hierarkey.add_default('venueless_talk_schedule_url', '', str)
+settings_hierarkey.add_default('venueless_show_public_link', False, bool)
+settings_hierarkey.add_default('talk_schedule_public', None, bool)
+settings_hierarkey.add_default('create_for', 'all', str)
+settings_hierarkey.add_default('event_type', '', str)
+
+# Etherpad collaborative notes integration
+settings_hierarkey.add_default('etherpad_enabled', False, bool)
+settings_hierarkey.add_default('etherpad_base_url', '', str)
+settings_hierarkey.add_default('etherpad_api_key', '', str)
+settings_hierarkey.add_default('etherpad_pad_name_pattern', '{event}-{submission}-{token}', str)
+
+# Telemetry settings for anonymous usage data collection
+# These are used by GlobalSettingsObject via settings_hierarkey
+settings_hierarkey.add_default('telemetry_enabled', False, bool)
+settings_hierarkey.add_default('telemetry_last_sent', None, dt.datetime)
+settings_hierarkey.add_default('telemetry_endpoint', '', str)
+settings_hierarkey.add_default('telemetry_api_key', '', str)
+settings_hierarkey.add_default('telemetry_contact_email', '', str)
+
+# Cloudflare Turnstile anti-abuse settings
+settings_hierarkey.add_default('anti_abuse_provider', 'disabled', str)
+settings_hierarkey.add_default('turnstile_site_key', '', str)
+settings_hierarkey.add_default('turnstile_secret_key', '', str)
+settings_hierarkey.add_default('turnstile_on_registration', False, bool)
+settings_hierarkey.add_default('turnstile_login_mode', 'disabled', str)
+settings_hierarkey.add_default('turnstile_failed_login_threshold', 3, int)
+settings_hierarkey.add_default('turnstile_on_password_reset', False, bool)
+settings_hierarkey.add_default('turnstile_on_organizer_create', False, bool)
+settings_hierarkey.add_default('turnstile_on_contact', False, bool)
+
+
 
 def i18n_uns(v):
     try:
@@ -43,21 +89,60 @@ def i18n_uns(v):
         return LazyI18nString(str(v))
 
 
-def _serialize_i18n(s): return json.dumps(s.data)
+def _serialize_i18n(s):
+    return json.dumps(s.data)
+
+
 settings_hierarkey.add_type(LazyI18nString, serialize=_serialize_i18n, unserialize=i18n_uns)
 settings_hierarkey.add_type(
     LazyI18nStringList,
     serialize=operator.methodcaller('serialize'),
     unserialize=LazyI18nStringList.unserialize,
 )
-def _serialize_rdw(rdw): return rdw.to_string()
-def _unserialize_rdw(s): return RelativeDateWrapper.from_string(s)
+
+
+def _serialize_rdw(rdw):
+    return rdw.to_string()
+
+
+def _unserialize_rdw(s):
+    return RelativeDateWrapper.from_string(s)
+
+
 settings_hierarkey.add_type(RelativeDateWrapper, serialize=_serialize_rdw, unserialize=_unserialize_rdw)
 
 
 @settings_hierarkey.set_global(cache_namespace='global')
 class GlobalSettingsObject(GlobalSettingsBase):
     slug = '_global'
+
+
+EVENT_SERIES_CREATION_ENABLED = 'event_series_creation_enabled'
+
+
+def is_event_series_creation_enabled(request=None) -> bool:
+    _cache_attr = '_event_series_creation_enabled'
+    if request is not None and hasattr(request, _cache_attr):
+        return getattr(request, _cache_attr)
+    gs = GlobalSettingsObject()
+    result = gs.settings.get(EVENT_SERIES_CREATION_ENABLED, as_type=bool, default=True)
+    if request is not None:
+        setattr(request, _cache_attr, result)
+    return result
+
+
+MEETUP_CREATION_ENABLED = 'meetup_creation_enabled'
+
+
+def is_meetup_creation_enabled(request=None) -> bool:
+    _cache_attr = '_meetup_creation_enabled'
+    if request is not None and hasattr(request, _cache_attr):
+        return getattr(request, _cache_attr)
+    gs = GlobalSettingsObject()
+    result = gs.settings.get(MEETUP_CREATION_ENABLED, as_type=bool, default=False)
+    if request is not None:
+        setattr(request, _cache_attr, result)
+    return result
 
 
 class SettingsSandbox:
@@ -75,10 +160,10 @@ class SettingsSandbox:
         self._key = key
 
     def get_prefix(self):
-        return '%s_%s_' % (self._type, self._key)
+        return f'{self._type}_{self._key}_'
 
     def _convert_key(self, key: str) -> str:
-        return '%s_%s_%s' % (self._type, self._key, key)
+        return f'{self._type}_{self._key}_{key}'
 
     def __setitem__(self, key: str, value: Any) -> None:
         self.set(key, value)
@@ -107,9 +192,20 @@ class SettingsSandbox:
         self._event.settings.set(self._convert_key(key), value)
 
 
+def validate_primary_font(primary_font):
+    if primary_font:
+        from eventyay.presale.style import SYSTEM_FONTS, get_fonts  # noqa: PLC0415
+        if primary_font not in SYSTEM_FONTS and primary_font not in get_fonts():
+            raise ValidationError(
+                {'primary_font': _('The selected font is not allowed.')}
+            )
+
+
 def validate_event_settings(event, settings_dict):
-    from eventyay.base.models import Event
-    from eventyay.base.signals import validate_event_settings
+    from eventyay.base.models import Event  # noqa: PLC0415
+    from eventyay.base.signals import validate_event_settings  # noqa: PLC0415
+
+    validate_primary_font(settings_dict.get('primary_font'))
 
     default_locale = settings_dict.get('locale')
     locales = settings_dict.get('locales', [])
@@ -117,16 +213,6 @@ def validate_event_settings(event, settings_dict):
         locales = list(locales)
     if default_locale and default_locale not in locales:
         raise ValidationError({'locale': _('Your default locale must also be enabled for your event (see box above).')})
-    content_locales = settings_dict.get('content_locales')
-    if content_locales is None:
-        content_locales = locales
-    elif not isinstance(content_locales, list):
-        content_locales = list(content_locales)
-    if content_locales:
-        if invalid_content_locales := set(content_locales) - set(locales):
-            raise ValidationError(
-                {'content_locales': _('Content languages must be a subset of the active languages.')}
-            )
     if settings_dict.get('attendee_names_required') and not settings_dict.get('attendee_names_asked'):
         raise ValidationError(
             {'attendee_names_required': _('You cannot require specifying attendee names if you do not ask for them.')}
@@ -134,6 +220,14 @@ def validate_event_settings(event, settings_dict):
     if settings_dict.get('attendee_emails_required') and not settings_dict.get('attendee_emails_asked'):
         raise ValidationError(
             {'attendee_emails_required': _('You have to ask for attendee emails if you want to make them required.')}
+        )
+    if settings_dict.get('attendee_job_title_required') and not settings_dict.get('attendee_job_title_asked'):
+        raise ValidationError(
+            {
+                'attendee_job_title_required': _(
+                    'You have to ask for attendee job titles if you want to make them required.'
+                )
+            }
         )
     if settings_dict.get('order_email_required') and not settings_dict.get('order_email_asked'):
         raise ValidationError(
@@ -164,12 +258,7 @@ def validate_event_settings(event, settings_dict):
 
 
 def validate_organizer_settings(organizer, settings_dict):
-    # This is not doing anything for the time being.
-    # But earlier we called validate_event_settings for the organizer, too - and that didn't do anything for
-    # organizer-settings either.
-    #
-    # N.B.: When actually fleshing out this stub, adding it to the OrganizerUpdateForm should be considered.
-    pass
+    validate_primary_font(settings_dict.get('primary_font'))
 
 
 def global_settings_object(holder):

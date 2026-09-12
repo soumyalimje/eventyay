@@ -48,7 +48,7 @@ def get_used_placeholders(text):
     if not text:
         return set()
     if isinstance(text, str):
-        return {element[1] for element in string.Formatter().parse(text) if element[1]}
+        return {element[1].replace('\\_', '_') for element in string.Formatter().parse(text) if element[1]}
     if getattr(text, 'data', None):
         return get_used_placeholders(text.data)
     if isinstance(text, dict):
@@ -129,9 +129,9 @@ def base_placeholders(sender, **kwargs):
         SimpleFunctionalMailTextPlaceholder(
             'event_cfp_url',
             ['event'],
-            lambda event: event.cfp.urls.base.full(),
+            lambda event: event.cfp.urls.base.full() if hasattr(event, 'cfp') else '',
             lambda event: f'https://eventyay.com/{event.slug}/cfp',
-            _('The event’s public CfP URL'),
+            _('The event\'s public CfP URL'),
         ),
         SimpleFunctionalMailTextPlaceholder(
             'all_submissions_url',
@@ -144,10 +144,12 @@ def base_placeholders(sender, **kwargs):
             'deadline',
             ['event'],
             lambda event: (
-                _date(event.cfp.deadline.astimezone(event.tz), 'SHORT_DATETIME_FORMAT') if event.cfp.deadline else ''
+                _date(event.cfp.deadline.astimezone(event.tz), 'SHORT_DATETIME_FORMAT')
+                if hasattr(event, 'cfp') and event.cfp.deadline else ''
             ),
             lambda event: (
-                _date(event.cfp.deadline.astimezone(event.tz), 'SHORT_DATETIME_FORMAT') if event.cfp.deadline else ''
+                _date(event.cfp.deadline.astimezone(event.tz), 'SHORT_DATETIME_FORMAT')
+                if hasattr(event, 'cfp') and event.cfp.deadline else ''
             ),
             _('The general CfP deadline'),
         ),

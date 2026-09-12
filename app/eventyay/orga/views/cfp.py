@@ -1,23 +1,41 @@
+import http
 import json
 import logging
 from collections import defaultdict
 
 from csp.decorators import csp_update
 from django.contrib import messages
-from django.db import transaction
-from django.db.models import Count
+from django.db import models, transaction
+from django.db.models import Count, Q
 from django.db.models.deletion import ProtectedError
 from django.forms.models import inlineformset_factory
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
+from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
+from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.generic import FormView, TemplateView, UpdateView, View
 from django_context_decorator import context
 
+from eventyay.base.models import (
+    AnswerOption,
+    Availability,
+    CfP,
+    MailTemplateRoles,
+    ResourceKind,
+    SpeakerProfile,
+    SubmissionType,
+    SubmitterAccessCode,
+    TalkQuestion,
+    TalkQuestionRequired,
+    TalkQuestionTarget,
+    Track,
+)
 from eventyay.cfp.flow import CfPFlow
 from eventyay.common.forms import I18nFormSet
+from eventyay.common.language import get_language_choices_native_with_ui_name
 from eventyay.common.text.phrases import phrases
 from eventyay.common.text.serialize import I18nStrJSONEncoder
 from eventyay.common.views.generic import OrgaCRUDView
@@ -27,26 +45,35 @@ from eventyay.common.views.mixins import (
     OrderActionMixin,
     PermissionRequired,
 )
-from eventyay.base.models import MailTemplateRoles
-from eventyay.orga.forms import CfPForm, TalkQuestionForm, SubmissionTypeForm, TrackForm
+from eventyay.orga.forms import CfPForm, SubmissionTypeForm, TalkQuestionForm, TrackForm
 from eventyay.orga.forms.cfp import (
     AccessCodeSendForm,
     AnswerOptionForm,
+    CfPGeneralSettingsForm,
     CfPSettingsForm,
     QuestionFilterForm,
     ReminderFilterForm,
     SubmitterAccessCodeForm,
+    CfPGeneralSettingsForm,
 )
 from eventyay.base.models import (
     AnswerOption,
+    BUILTIN_FIELD_KEYS,
     CfP,
+    normalize_field_order,
     TalkQuestion,
+    TalkQuestionRequired,
     TalkQuestionTarget,
+    TalkQuestionVariant,
     SubmissionType,
     SubmitterAccessCode,
     Track,
+    SpeakerProfile,
+    Availability,
 )
+from eventyay.common.session_video import exclude_session_video_from_cfp_questions
 from eventyay.talk_rules.submission import questions_for_user
+
 
 logger = logging.getLogger(__name__)
 
@@ -60,19 +87,17 @@ class CfPTextDetail(PermissionRequired, ActionFromUrl, UpdateView):
 
     @context
     def tablist(self):
-        return {
-            'general': _('General information'),
-            'fields': _('Fields'),
-        }
+        return {'general': _('General information')}
 
     @context
     @cached_property
     def sform(self):
-        return CfPSettingsForm(
+        # Use simple form as we only edit general settings here, no custom questions
+        return CfPGeneralSettingsForm(
             read_only=(self.action == 'view'),
             locales=self.request.event.locales,
             obj=self.request.event,
-            data=self.request.POST if self.request.method == 'POST' else None,
+            data=self.request.POST if self.request.method == http.HTTPMethod.POST else None,
             prefix='settings',
         )
 
@@ -106,6 +131,282 @@ class CfPTextDetail(PermissionRequired, ActionFromUrl, UpdateView):
         return result
 
 
+class CfPForms(EventPermissionRequired, TemplateView):
+    template_name = 'orga/cfp/forms.html'
+    permission_required = 'base.update_event'
+
+    @context
+    @cached_property
+    def sform(self):
+        # Use full form to include custom questions and field configuration
+        return CfPSettingsForm(
+            read_only=False,
+            locales=self.request.event.locales,
+            obj=self.request.event,
+            data=self.request.POST if self.request.method == http.HTTPMethod.POST else None,
+            prefix='settings',
+        )
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['generic_title'] = _('Forms')
+        context['has_create_permission'] = True
+        context['question_list'] = exclude_session_video_from_cfp_questions(
+            questions_for_user(self.request, self.request.event, self.request.user)
+            .filter(is_imported=False)
+            .annotate(answer_count=Count('answers'))
+            .order_by('position')
+        )
+        context['create_url'] = reverse(
+            'orga:cfp.questions.create',
+            kwargs={'organizer': self.request.event.organizer.slug,
+                    'event': self.request.event.slug},
+        )
+
+        available_codes = [code for code, _ in self.request.event.available_content_locales]
+        choices = get_language_choices_native_with_ui_name(codes=available_codes)
+        existing_codes = {c[0] for c in choices}
+        for code, name in self.request.event.available_content_locales:
+            if code not in existing_codes:
+                choices.append((code, name))
+        event_languages = list(self.request.event.settings.locales or [])
+        context['event_languages'] = event_languages
+        selected_content_locales = self.request.event.settings.content_locales
+        context['selected_content_locales'] = selected_content_locales
+        sform = self.sform
+        content_locales_key = sform.add_prefix('content_locales')
+        if sform.is_bound and content_locales_key in sform.data:
+            effective_content_locales = sform.data.getlist(content_locales_key)
+        else:
+            effective_content_locales = selected_content_locales if selected_content_locales is not None else event_languages
+        effective_set = set(effective_content_locales)
+        context['all_languages'] = sorted(choices, key=lambda x: (x[0] not in effective_set, x[1]))
+        context['effective_content_locales'] = effective_content_locales
+
+        # Pass saved field order to template for JavaScript reordering.
+        # normalize_field_order ensures every built-in field is present at
+        # its canonical position — covering both configs with no built-ins
+        # (newly created custom-only config) and partially-populated configs
+        # (built-ins added to the platform after the config was saved).
+        fields_config = self.request.event.cfp.settings.get('fields_config', {})
+
+        context['session_field_order'] = json.dumps(
+            normalize_field_order(fields_config.get('session', []), 'session')
+        )
+        context['speaker_field_order'] = json.dumps(
+            normalize_field_order(fields_config.get('speaker', []), 'speaker')
+        )
+        context['reviewer_field_order'] = json.dumps(
+            normalize_field_order(fields_config.get('reviewer', []), 'reviewer')
+        )
+        sform = self.sform
+
+        def get_field_data(targets, config_key):
+            questions = exclude_session_video_from_cfp_questions(
+                TalkQuestion.all_objects.filter(
+                    event=self.request.event,
+                    target__in=targets,
+                    is_imported=False,
+                )
+            ).annotate(answer_count=Count('answers'))
+
+            question_map = {str(q.id): q for q in questions if f'question_{q.pk}' in sform.fields}
+            saved_order = fields_config.get(config_key, [])
+
+            ordered_questions = []
+            processed_ids = set()
+
+            for item in saved_order:
+                if item.isdigit() and item in question_map:
+                    ordered_questions.append(question_map[item])
+                    processed_ids.add(item)
+
+            remaining_questions = sorted(
+                [q for q_id, q in question_map.items() if q_id not in processed_ids], key=lambda x: (x.position, x.id)
+            )
+            ordered_questions.extend(remaining_questions)
+
+            data = []
+            for q in ordered_questions:
+                data.append({'question': q, 'field': sform[f'question_{q.pk}']})
+            return data
+
+        context['custom_session_fields'] = get_field_data([TalkQuestionTarget.SUBMISSION], 'session')
+        context['custom_speaker_fields'] = get_field_data([TalkQuestionTarget.SPEAKER], 'speaker')
+        context['custom_reviewer_fields'] = get_field_data([TalkQuestionTarget.REVIEWER], 'reviewer')
+
+        event = self.request.event
+        submission_counts = event.submissions.aggregate(
+            title=Count('id', filter=~Q(title='')),
+            submission_type=Count('id', filter=Q(submission_type__isnull=False)),
+            abstract=Count('id', filter=~Q(abstract='')),
+            description=Count('id', filter=~Q(description='')),
+            notes=Count('id', filter=~Q(notes='')),
+            slot_count=Count('id'),
+            do_not_record=Count('id', filter=Q(do_not_record=True)),
+            image=Count('id', filter=~Q(image='')),
+            track=Count('id', filter=Q(track__isnull=False)),
+            duration=Count('id', filter=Q(duration__isnull=False)),
+            content_locale=Count('id', filter=~Q(content_locale='')),
+        )
+        submission_counts['slides'] = event.submissions.filter(resources__kind=ResourceKind.SLIDES).distinct().count()
+
+        speaker_counts = SpeakerProfile.objects.filter(event=event).aggregate(
+            name=Count('id', filter=~Q(user__fullname='') & Q(user__fullname__isnull=False)),
+            biography=Count('id', filter=~Q(biography='') & Q(biography__isnull=False)),
+            avatar=Count('id', filter=~Q(user__avatar='') & Q(user__avatar__isnull=False)),
+            avatar_source=Count('id', filter=~Q(user__avatar_source='') & Q(user__avatar_source__isnull=False)),
+            avatar_license=Count('id', filter=~Q(user__avatar_license='') & Q(user__avatar_license__isnull=False)),
+        )
+
+        additional_speaker_count = event.submissions.annotate(sc=Count('speakers')).filter(sc__gt=1).count()
+        availabilities_count = (
+            Availability.objects.filter(event=event, person__isnull=False).values('person').distinct().count()
+        )
+        social_links_count = (
+            SpeakerProfile.objects.filter(event=event, social_links__isnull=False).distinct().count()
+        )
+
+        context['field_counts'] = {
+            **submission_counts,
+            **speaker_counts,
+            'additional_speaker': additional_speaker_count,
+            'availabilities': availabilities_count,
+            'social_links': social_links_count,
+        }
+
+        question_texts = {
+            'title': str(_('Proposal title')),
+            'submission_type': str(_('Session type')),
+            'track': str(_('Track')),
+            'content_locale': str(_('Language')),
+            'abstract': str(_('Abstract')),
+            'description': str(_('Description')),
+            'notes': str(_('Notes')),
+            'slot_count': str(_('Slot Count')),
+            'do_not_record': str(_('Don’t record this session.')),
+            'image': str(_('Session image')),
+            'slides': str(_('Slides')),
+            'duration': str(_('Duration')),
+            'biography': str(_('Biography')),
+            'availabilities': str(_('Availability')),
+            'additional_speaker': str(_('Additional Speaker')),
+            'fullname': str(_('Full name')),
+            'avatar': str(_('Profile picture')),
+            'avatar_source': str(_('Profile Picture Source')),
+            'avatar_license': str(_('Profile Picture License')),
+        }
+
+        try:
+            if event.cfp_flow:
+                config = event.cfp_flow.config
+                if isinstance(config, dict) and 'steps' in config:
+                    for step_data in config['steps'].values():
+                        if isinstance(step_data, dict) and 'fields' in step_data:
+                            for field_key, field_data in step_data['fields'].items():
+                                if isinstance(field_data, dict) and 'label' in field_data:
+                                    question_texts[field_key] = str(field_data['label'])
+        except Exception as e:
+            logger.warning('Failed to parse cfp_flow config for event %s: %s', event.id, e)
+
+        context['question_texts'] = question_texts
+
+        return context
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        # Handle drag-drop reordering (AJAX request with 'order' parameter)
+        order_param = request.POST.get('order')
+        if order_param:
+            self._handle_field_reordering(order_param)
+            return HttpResponse(status=204)  # No content response for AJAX
+
+        # Handle regular form submission
+        if self.sform.is_valid():
+            self.sform.save()
+            messages.success(request, phrases.base.saved)
+            return redirect(request.path)
+        messages.error(request, phrases.base.error_saving_changes)
+        return self.get(request, *args, **kwargs)
+
+    def _handle_field_reordering(self, order_str):
+        """Handle field reordering for both default fields and custom questions."""
+        order_list = order_str.split(',')
+        event = self.request.event
+
+        custom_question_ids = []
+        for item in order_list:
+            if item.isdigit():
+                custom_question_ids.append(int(item))
+
+        fields_config = event.cfp.settings.get('fields_config', {})
+
+        session_keys = set(BUILTIN_FIELD_KEYS.get('session', ()))
+        speaker_keys = set(BUILTIN_FIELD_KEYS.get('speaker', ()))
+
+        has_session_fields = any(item in session_keys for item in order_list)
+        has_speaker_fields = any(item in speaker_keys for item in order_list)
+        has_reviewer_fields = False
+
+        if has_session_fields and has_speaker_fields:
+            logger.warning(
+                'Ambiguous field reordering: contains both session and speaker fields. '
+                'Skipping fields_config update for event %s.',
+                event.id,
+            )
+            return
+
+        target_type = None
+        if not has_session_fields and not has_speaker_fields and custom_question_ids:
+            all_speaker = True
+            all_session = True
+            all_reviewer = True
+            valid_question_count = 0
+            for qid in custom_question_ids:
+                q = TalkQuestion.all_objects.filter(id=qid, event=event).first()
+                if not q:
+                    continue
+                valid_question_count += 1
+                if q.target != TalkQuestionTarget.SPEAKER:
+                    all_speaker = False
+                if q.target != TalkQuestionTarget.SUBMISSION:
+                    all_session = False
+                if q.target != TalkQuestionTarget.REVIEWER:
+                    all_reviewer = False
+
+            has_session_fields = all_session and valid_question_count > 0
+            has_speaker_fields = all_speaker and valid_question_count > 0
+            has_reviewer_fields = all_reviewer and valid_question_count > 0
+        if has_session_fields:
+            fields_config['session'] = order_list
+            target_type = TalkQuestionTarget.SUBMISSION
+        elif has_speaker_fields:
+            fields_config['speaker'] = order_list
+            target_type = TalkQuestionTarget.SPEAKER
+        elif has_reviewer_fields:
+            fields_config['reviewer'] = order_list
+            target_type = TalkQuestionTarget.REVIEWER
+
+        if target_type:
+            for index, question_id in enumerate(custom_question_ids):
+                try:
+                    question = TalkQuestion.all_objects.get(id=question_id, event=event, target=target_type)
+                    question.position = index
+                    question.save(update_fields=['position'])
+                except TalkQuestion.DoesNotExist:
+                    logger.warning(
+                        'Skipping missing TalkQuestion %s for event %s and target %s',
+                        question_id,
+                        event.id,
+                        target_type,
+                    )
+
+        # Only save if changes were actually made
+        if fields_config:
+            event.cfp.settings['fields_config'] = fields_config
+            event.cfp.save(update_fields=['settings'])
+
+
 class QuestionView(OrderActionMixin, OrgaCRUDView):
     model = TalkQuestion
     form_class = TalkQuestionForm
@@ -113,8 +414,17 @@ class QuestionView(OrderActionMixin, OrgaCRUDView):
     context_object_name = 'question'
     detail_is_update = False
 
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs['event'] = self.request.event
+        target = self.request.GET.get('target')
+        if target:
+            kwargs.setdefault('initial', {})
+            kwargs['initial']['target'] = target
+        return kwargs
+
     def get_queryset(self):
-        return (
+        return exclude_session_video_from_cfp_questions(
             questions_for_user(self.request, self.request.event, self.request.user)
             .annotate(answer_count=Count('answers'))
             .order_by('position')
@@ -145,7 +455,7 @@ class QuestionView(OrderActionMixin, OrgaCRUDView):
             extra=0,
         )
         return formset_class(
-            self.request.POST if self.request.method == 'POST' else None,
+            self.request.POST if self.request.method == http.HTTPMethod.POST else None,
             queryset=(
                 AnswerOption.objects.filter(question=self.object) if self.object else AnswerOption.objects.none()
             ),
@@ -180,7 +490,7 @@ class QuestionView(OrderActionMixin, OrgaCRUDView):
                 )
 
         extra_forms = [
-            form for form in self.formset.extra_forms if form.has_changed and not self.formset._should_delete_form(form)
+            form for form in self.formset.extra_forms if form.has_changed() and not self.formset._should_delete_form(form)
         ]
         for form in extra_forms:
             form.instance.question = obj
@@ -237,7 +547,15 @@ class QuestionView(OrderActionMixin, OrgaCRUDView):
     def form_valid(self, form):
         form.instance.event = self.request.event
         self.instance = form.instance
-        if form.cleaned_data.get('variant') in ('choices', 'multiple_choice'):
+
+        is_new = not form.instance.pk
+        if is_new:
+            max_position = TalkQuestion.objects.filter(event=self.request.event, target=form.instance.target).aggregate(
+                models.Max('position')
+            )['position__max']
+            form.instance.position = (max_position or -1) + 1
+
+        if form.cleaned_data.get('variant') in ('choices', 'multiple_choice', 'select'):
             changed_options = [form.changed_data for form in self.formset if form.has_changed()]
             if form.cleaned_data.get('options') and changed_options:
                 messages.error(
@@ -245,10 +563,50 @@ class QuestionView(OrderActionMixin, OrgaCRUDView):
                     _('You cannot change the options and upload an option file at the same time.'),
                 )
                 return self.form_invalid(form)
+
+            if not form.cleaned_data.get('options'):
+                if not self.formset.is_valid():
+                    return self.form_invalid(form)
+
+                remaining_options = sum(
+                    1 for f in self.formset.initial_forms if f not in self.formset.deleted_forms
+                ) + sum(
+                    1 for f in self.formset.extra_forms if f.has_changed() and not self.formset._should_delete_form(f)
+                )
+
+                if remaining_options == 0:
+                    messages.error(
+                        self.request,
+                        _('Please provide at least one option for this question type.'),
+                    )
+                    return self.form_invalid(form)
+
         result = super().form_valid(form)
+
+        if is_new:
+            event = self.request.event
+            fields_config = event.cfp.settings.get('fields_config', {})
+            if form.instance.target == TalkQuestionTarget.SUBMISSION:
+                config_key = 'session'
+            elif form.instance.target == TalkQuestionTarget.SPEAKER:
+                config_key = 'speaker'
+            elif form.instance.target == TalkQuestionTarget.REVIEWER:
+                config_key = 'reviewer'
+            else:
+                config_key = None
+
+            if config_key:
+                if config_key not in fields_config:
+                    fields_config[config_key] = []
+                if str(form.instance.pk) not in fields_config[config_key]:
+                    fields_config[config_key].append(str(form.instance.pk))
+                    event.cfp.settings['fields_config'] = fields_config
+                    event.cfp.save(update_fields=['settings'])
+
         if form.cleaned_data.get('variant') in (
             'choices',
             'multiple_choice',
+            'select',
         ) and not form.cleaned_data.get('options'):
             formset = self.save_formset(self.instance)
             if not formset:
@@ -284,19 +642,108 @@ class QuestionView(OrderActionMixin, OrgaCRUDView):
             )
 
 
+@method_decorator(ensure_csrf_cookie, name='dispatch')
 class CfPQuestionToggle(PermissionRequired, View):
+    """Toggle question field states via AJAX POST or legacy GET."""
+
     permission_required = 'base.update_talkquestion'
 
     def get_object(self) -> TalkQuestion:
-        return TalkQuestion.all_objects.filter(event=self.request.event, pk=self.kwargs.get('pk')).first()
+        return get_object_or_404(TalkQuestion.all_objects, event=self.request.event, pk=self.kwargs.get('pk'))
 
     def dispatch(self, request, *args, **kwargs):
-        super().dispatch(request, *args, **kwargs)
+        # Check permissions first
+        if not self.has_permission():
+            return self.handle_no_permission()
+
         question = self.get_object()
 
-        question.active = not question.active
-        question.save(update_fields=['active'])
-        return redirect(question.urls.base)
+        # Legacy GET: toggle active
+        if request.method == http.HTTPMethod.GET:
+            question.active = not question.active
+            question.save(update_fields=['active'])
+            return redirect(question.urls.base)
+
+        # AJAX POST: toggle specific field
+        if request.method == http.HTTPMethod.POST:
+            return self._handle_post(request, question)
+
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+    @transaction.atomic
+    def _handle_post(self, request, question):
+        try:
+            data = json.loads(request.body.decode())
+        except json.JSONDecodeError:
+            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+        field = data.get('field')
+        value = data.get('value')
+
+        # Validate that both field and value are present
+        if field is None:
+            return JsonResponse({'error': 'Missing field parameter'}, status=400)
+        if value is None:
+            return JsonResponse({'error': 'Missing value parameter'}, status=400)
+
+        if field == 'active':
+            # Validate type for boolean fields
+            if not isinstance(value, bool):
+                return JsonResponse({'error': 'Value must be boolean for active field'}, status=400)
+            question.active = value
+            question.save(update_fields=['active'])
+        elif field == 'is_public':
+            # Validate type for boolean fields
+            if not isinstance(value, bool):
+                return JsonResponse({'error': 'Value must be boolean for is_public field'}, status=400)
+            question.is_public = value
+            question.save(update_fields=['is_public'])
+        elif field == 'question_required':
+            # Validate type for string fields
+            if not isinstance(value, str):
+                return JsonResponse({'error': 'Value must be string for question_required field'}, status=400)
+            allowed_values = [
+                TalkQuestionRequired.OPTIONAL,
+                TalkQuestionRequired.REQUIRED,
+                TalkQuestionRequired.AFTER_DEADLINE,
+            ]
+            if value not in allowed_values:
+                return JsonResponse({'error': 'Invalid value for question_required field'}, status=400)
+            question.question_required = value
+            question.save(update_fields=['question_required'])
+        else:
+            return JsonResponse({'error': f'Invalid field: {field}'}, status=400)
+
+        return JsonResponse({'success': True, 'field': field, 'value': getattr(question, field)})
+
+
+@method_decorator(ensure_csrf_cookie, name='dispatch')
+class QuestionOptionsAjax(EventPermissionRequired, View):
+    """AJAX endpoint to fetch question options for dependency configuration."""
+    permission_required = 'base.orga_view_talkquestion'
+
+    def get(self, request, *args, **kwargs):
+        question_id = kwargs.get('question')
+        try:
+            question_obj = TalkQuestion.all_objects.get(event=request.event, id=question_id)
+            if question_obj.variant == TalkQuestionVariant.BOOLEAN:
+                options = [
+                    {'id': 'True', 'answer': str(_('Yes'))},
+                    {'id': 'False', 'answer': str(_('No'))}
+                ]
+            else:
+                options = []
+                for option in question_obj.options.all():
+                    options.append({
+                        'id': str(option.pk),
+                        'answer': str(option.answer)
+                    })
+            return JsonResponse({
+                'variant': question_obj.variant,
+                'options': options
+            })
+        except TalkQuestion.DoesNotExist:
+            return JsonResponse({'error': str(_('Question not found'))}, status=404)
 
 
 class CfPQuestionRemind(EventPermissionRequired, FormView):
@@ -362,7 +809,7 @@ class SubmissionTypeView(OrderActionMixin, OrgaCRUDView):
     template_namespace = 'orga/cfp'
 
     def get_queryset(self):
-        return self.request.event.submission_types.all().order_by('default_duration')
+        return self.request.event.submission_types.all()
 
     def get_permission_required(self):
         permission_map = {'list': 'orga_list', 'detail': 'orga_detail'}
@@ -388,6 +835,8 @@ class SubmissionTypeView(OrderActionMixin, OrgaCRUDView):
 
 
 class SubmissionTypeDefault(PermissionRequired, View):
+    """Toggle default submission type. If the clicked type is already default, remove it."""
+
     permission_required = 'base.update_submissiontype'
 
     def get_object(self):
@@ -396,10 +845,20 @@ class SubmissionTypeDefault(PermissionRequired, View):
     def dispatch(self, request, *args, **kwargs):
         super().dispatch(request, *args, **kwargs)
         submission_type = self.get_object()
-        self.request.event.cfp.default_type = submission_type
-        self.request.event.cfp.save(update_fields=['default_type'])
-        submission_type.log_action('eventyay.submission_type.make_default', person=self.request.user, orga=True)
-        messages.success(request, _('The Session Type has been made default.'))
+        cfp = self.request.event.cfp
+
+        if cfp.default_type == submission_type:
+            # Already default - remove it
+            cfp.default_type = None
+            cfp.save(update_fields=['default_type'])
+            messages.success(request, _('The default Session Type has been removed.'))
+        else:
+            # Set as new default
+            cfp.default_type = submission_type
+            cfp.save(update_fields=['default_type'])
+            submission_type.log_action('eventyay.submission_type.make_default', person=self.request.user, orga=True)
+            messages.success(request, _('The Session Type has been made default.'))
+
         return redirect(self.request.event.cfp.urls.types)
 
 
@@ -467,7 +926,8 @@ class AccessCodeView(OrderActionMixin, OrgaCRUDView):
             messages.error(
                 request,
                 _(
-                    'This access code has been used for a proposal and cannot be deleted. To disable it, you can set its validity date to the past.'
+                    'This access code has been used for a proposal and cannot be deleted. '
+                    'To disable it, you can set its validity date to the past.'
                 ),
             )
             return self.delete_view(request, *args, **kwargs)
@@ -505,6 +965,7 @@ class AccessCodeSend(PermissionRequired, UpdateView):
             data={'email': form.cleaned_data['to']},
         )
         return result
+
 
 @method_decorator(csp_update({'SCRIPT_SRC': "'self' 'unsafe-eval'"}), name='dispatch')
 class CfPFlowEditor(EventPermissionRequired, TemplateView):

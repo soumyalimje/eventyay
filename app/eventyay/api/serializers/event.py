@@ -1,21 +1,25 @@
 import logging
 
 from django.conf import settings
-from django.core.exceptions import ValidationError
+from django.core.exceptions import SuspiciousFileOperation, ValidationError
+from django.core.files.storage import default_storage
 from django.db import transaction
 from django.utils.crypto import get_random_string
 from django.utils.functional import cached_property
 from django.utils.translation import gettext as _
 from django_countries.serializers import CountryFieldMixin
-from pytz import common_timezones
+from eventyay.timezones import common_timezones
+from rest_framework import serializers
 from rest_framework.fields import ChoiceField, Field
 from rest_framework.relations import SlugRelatedField
 
+from eventyay.api.serializers.fields import UploadedFileOrURLField
 from eventyay.api.serializers.i18n import I18nAwareModelSerializer
 from eventyay.api.serializers.settings import SettingsSerializer
-from eventyay.base.models import Device, Event, TaxRule, TeamAPIToken
+from eventyay.base.models import Device, Event, GlobalPluginConfig, TaxRule, TeamAPIToken
 from eventyay.base.models.event import SubEvent
 from eventyay.base.models.product import SubEventProduct, SubEventProductVariation
+from eventyay.base.plugins import get_all_plugins
 from eventyay.base.services.seating import (
     SeatProtected,
     generate_seats,
@@ -23,6 +27,7 @@ from eventyay.base.services.seating import (
 )
 from eventyay.base.settings import validate_event_settings
 from eventyay.base.signals import api_event_settings_fields
+from eventyay.common.urls import get_file_url_path
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +76,6 @@ class SeatCategoryMappingField(Field):
 
 class PluginsField(Field):
     def to_representation(self, obj):
-        from eventyay.base.plugins import get_all_plugins
-
         return sorted(
             [
                 p.module
@@ -87,7 +90,8 @@ class PluginsField(Field):
 
 class TimeZoneField(ChoiceField):
     def get_attribute(self, instance):
-        return instance.cache.get_or_set('timezone_name', lambda: instance.settings.timezone, 3600)
+        timezone_name = instance.settings.timezone
+        return instance.cache.get_or_set('timezone_name', timezone_name, 3600)
 
 
 class ValidKeysField(Field):
@@ -116,6 +120,8 @@ class EventSerializer(I18nAwareModelSerializer):
             'name',
             'slug',
             'live',
+            'startpage_visible',
+            'startpage_featured',
             'testmode',
             'currency',
             'date_from',
@@ -140,8 +146,26 @@ class EventSerializer(I18nAwareModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not hasattr(self.context['request'], 'event'):
-            self.fields.pop('valid_keys')
+        request = self.context.get('request')
+        if request and not hasattr(request, 'event'):
+            self.fields.pop('valid_keys', None)
+        # Hide startpage fields for non-admin callers
+        if not self._has_startpage_admin_permission(request):
+            for field_name in ('startpage_visible', 'startpage_featured'):
+                self.fields.pop(field_name, None)
+
+    @staticmethod
+    def _has_startpage_admin_permission(request):
+        if not request or isinstance(getattr(request, 'auth', None), (Device, TeamAPIToken)):
+            return False
+
+        user = getattr(request, 'user', None)
+        if not (user and getattr(user, 'is_authenticated', False) and (getattr(user, 'is_staff', False) or getattr(user, 'is_superuser', False))):
+            return False
+
+        session_key = getattr(getattr(request, 'session', None), 'session_key', None)
+        session_key = session_key if isinstance(session_key, str) and session_key else None
+        return bool(hasattr(user, 'has_active_staff_session') and user.has_active_staff_session(session_key))
 
     def validate(self, data):
         data = super().validate(data)
@@ -222,8 +246,6 @@ class EventSerializer(I18nAwareModelSerializer):
         return {'seat_category_mapping': result}
 
     def validate_plugins(self, value):
-        from eventyay.base.plugins import get_all_plugins
-
         plugins_available = {
             p.module
             for p in get_all_plugins(self.instance)
@@ -252,7 +274,11 @@ class EventSerializer(I18nAwareModelSerializer):
         meta_data = validated_data.pop('meta_data', None)
         product_meta_properties = validated_data.pop('product_meta_properties', None)
         validated_data.pop('seat_category_mapping', None)
-        plugins = validated_data.pop('plugins', settings.PRETIX_PLUGINS_DEFAULT.split(','))
+        plugins = validated_data.pop('plugins', list(settings.EVENTYAY_PLUGINS_DEFAULT))
+        global_defaults = GlobalPluginConfig.get_default_enabled_modules()
+        globally_disabled = GlobalPluginConfig.get_disabled_modules()
+        plugins = [m for m in dict.fromkeys(plugins + global_defaults) if m not in globally_disabled]
+
         tz = validated_data.pop('timezone', None)
         event = super().create(validated_data)
 
@@ -634,6 +660,13 @@ class SubEventSerializer(I18nAwareModelSerializer):
 
 
 class TaxRuleSerializer(CountryFieldMixin, I18nAwareModelSerializer):
+    rate = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=0,
+        max_value=100,
+    )
+
     class Meta:
         model = TaxRule
         fields = (
@@ -655,7 +688,6 @@ class EventSettingsSerializer(SettingsSerializer):
         'checkout_success_text',
         'banner_text',
         'banner_text_bottom',
-        'show_dates_on_frontpage',
         'show_date_to',
         'show_times',
         'show_products_outside_presale_period',
@@ -676,8 +708,7 @@ class EventSettingsSerializer(SettingsSerializer):
         'waiting_list_phones_asked',
         'waiting_list_phones_required',
         'waiting_list_phones_explanation_text',
-        'max_products_per_order',
-        'reservation_time',
+        'contact_form_enabled',
         'contact_mail',
         'show_variations_expanded',
         'hide_sold_out',
@@ -696,6 +727,8 @@ class EventSettingsSerializer(SettingsSerializer):
         'attendee_addresses_required',
         'attendee_company_asked',
         'attendee_company_required',
+        'attendee_job_title_asked',
+        'attendee_job_title_required',
         'attendee_data_explanation_text',
         'confirm_texts',
         'order_email_asked',
@@ -756,7 +789,6 @@ class EventSettingsSerializer(SettingsSerializer):
         'invoice_additional_text',
         'invoice_footer_text',
         'invoice_eu_currencies',
-        'invoice_logo_image',
         'cancel_allow_user',
         'cancel_allow_user_until',
         'cancel_allow_user_paid',
@@ -769,21 +801,30 @@ class EventSettingsSerializer(SettingsSerializer):
         'cancel_allow_user_paid_adjust_fees_step',
         'cancel_allow_user_paid_refund_as_giftcard',
         'cancel_allow_user_paid_require_approval',
-        'change_allow_user_variation',
         'change_allow_user_until',
         'change_allow_user_price',
+        'header_background_color',
+        'header_text_color',
+        'navigation_text_color',
+        'menu_text_scroll_over_color',
         'primary_color',
         'theme_color_success',
         'theme_color_danger',
         'theme_color_background',
         'theme_round_borders',
         'hover_button_color',
+        'video_navigation_background_color',
+        'video_sidebar_text_color',
+        'video_sidebar_hover_color',
         'primary_font',
         'logo_image',
         'logo_image_large',
         'event_logo_image',
+        'event_preview_image',
         'logo_show_title',
         'og_image',
+        'menu_label_tickets',
+        'menu_label_join_video',
     ]
 
     def __init__(self, *args, **kwargs):
@@ -795,9 +836,45 @@ class EventSettingsSerializer(SettingsSerializer):
                 field.required = False
                 self.fields[fname] = field
 
+    def flush_settings_cache(self):
+        self.instance.flush()
+        parent = self.instance._parent
+        if parent:
+            getattr(parent, self.instance._h.attribute_name).flush()
+
+    def delete_invalid_file_settings(self, instance):
+        for name, field in self.fields.items():
+            if not isinstance(field, UploadedFileOrURLField):
+                continue
+            current_file = get_file_url_path(instance.get(name, as_type=str, default=None))
+            if not current_file:
+                continue
+            try:
+                default_storage.path(current_file)
+            except SuspiciousFileOperation:
+                instance.delete(name)
+
+    def get_safe_settings_snapshot(self):
+        settings = {}
+        for name in self.fields:
+            try:
+                settings[name] = self.instance.get(name)
+            except SuspiciousFileOperation:
+                raw_value = self.instance.get(name, as_type=str, default=None)
+                settings[name] = None if get_file_url_path(raw_value) else raw_value
+        return settings
+
     def validate(self, data):
         data = super().validate(data)
-        settings_dict = self.instance.freeze()
+        self.flush_settings_cache()
+        try:
+            settings_dict = self.instance.freeze()
+        except SuspiciousFileOperation:
+            self.delete_invalid_file_settings(self.instance)
+            parent = self.instance._parent
+            if parent:
+                self.delete_invalid_file_settings(getattr(parent, self.instance._h.attribute_name))
+            settings_dict = self.get_safe_settings_snapshot()
         settings_dict.update(data)
         validate_event_settings(self.event, settings_dict)
         return data
@@ -821,7 +898,6 @@ class DeviceEventSettingsSerializer(EventSettingsSerializer):
         'locale',
         'last_order_modification_date',
         'show_quota_left',
-        'max_products_per_order',
         'attendee_names_asked',
         'attendee_names_required',
         'attendee_emails_asked',

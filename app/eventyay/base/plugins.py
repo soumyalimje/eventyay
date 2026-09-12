@@ -28,23 +28,57 @@ class PluginType(Enum):
     EXPORT = 4
 
 
-def get_all_plugins(event=None) -> List[type]:
+# Module names of plugins that are currently in beta.
+# For plugins whose source cannot be edited (e.g. external git packages), add
+# their Python module name here to have the beta badge shown automatically.
+BETA_PLUGINS: frozenset[str] = frozenset(
+    [
+        'exhibition',
+        'hubspot',
+        'interpretation',
+        'socialmedia',
+        'teamshifts',
+    ]
+)
+
+
+def get_all_plugins(event=None, include_inactive=False) -> List[type]:
     """
     Returns the EventyayPluginMeta classes of all plugins found in the installed Django apps.
     If an event is provided, only plugins active for that event are returned.
+
+    When include_inactive is False (default), plugins that have been globally
+    deactivated via GlobalPluginConfig are excluded. Pass include_inactive=True
+    when rendering the admin plugin management page itself.
     """
+    from eventyay.base.models.global_plugin_config import GlobalPluginConfig
+
     plugins = []
+
+    if not include_inactive:
+        globally_disabled = GlobalPluginConfig.get_disabled_modules()
+    else:
+        globally_disabled = frozenset()
+
     for app in apps.get_app_configs():
         if hasattr(app, 'EventyayPluginMeta'):
             meta = app.EventyayPluginMeta
             meta.module = app.name
             meta.app = app
-            if app.name in settings.PRETIX_PLUGINS_EXCLUDE:
+            if app.name in settings.EVENTYAY_PLUGINS_EXCLUDE:
+                continue
+
+            if app.name in globally_disabled:
                 continue
 
             if hasattr(app, 'is_available') and event:
                 if not app.is_available(event):
                     continue
+
+            # Annotate beta flag: the plugin's own meta may set beta=True,
+            # or it may be listed in BETA_PLUGINS for external packages.
+            if not getattr(meta, 'beta', False):
+                meta.beta = app.name in BETA_PLUGINS
 
             plugins.append(meta)
     return sorted(

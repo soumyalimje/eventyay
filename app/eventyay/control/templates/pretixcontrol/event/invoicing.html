@@ -2,14 +2,8 @@
 {% load i18n %}
 {% load bootstrap3 %}
 {% block inside %}
-    <nav id="event-nav" class="header-nav">
-        <div class="navigation">
-            <div class="navigation-title">
-                <h1>{% trans "Invoice settings" %}</h1>
-            </div>
-            {% include "pretixcontrol/event/component_link.html" %}
-        </div>
-    </nav>
+    {% trans "Invoice settings" as header_title %}
+    {% include "common/includes/header_nav.html" with header_title=header_title header_component_link="pretixcontrol/event/component_link.html" %}
     <form action="" method="post" class="form-horizontal" enctype="multipart/form-data">
         <div class="tabbed-form">
             {% csrf_token %}
@@ -58,12 +52,11 @@
                 {% bootstrap_field form.invoice_introductory_text layout="control" %}
                 {% bootstrap_field form.invoice_additional_text layout="control" %}
                 {% bootstrap_field form.invoice_footer_text layout="control" %}
-                {% bootstrap_field form.invoice_logo_image layout="control" %}
                 {% bootstrap_field form.invoice_eu_currencies layout="control" %}
             </fieldset>
         </div>
         <div class="form-group submit-group">
-            <button type="submit" class="btn btn-default btn-lg" name="preview" value="preview" formtarget="_blank">
+            <button type="submit" class="btn btn-default btn-lg" name="preview" value="preview" formtarget="preview-iframe" data-toggle="modal" data-target="#preview-modal">
                 {% trans "Save and show preview" %}
             </button>
             <button type="submit" class="btn btn-primary btn-save">
@@ -71,4 +64,5 @@
             </button>
         </div>
     </form>
+    {% include "pretixcontrol/includes/preview_modal.html" %}
 {% endblock %}

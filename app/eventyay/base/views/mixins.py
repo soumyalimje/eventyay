@@ -21,6 +21,11 @@ from eventyay.base.models import (
     QuestionAnswer,
     QuestionOption,
 )
+from eventyay.base.services.system_questions import (
+    get_enabled_system_question_fields,
+    get_system_question_base_states,
+    get_system_question_product_overrides,
+)
 from eventyay.presale.signals import contact_form_fields_overrides
 
 
@@ -53,6 +58,8 @@ class BaseQuestionsViewMixin:
         submitted at once.
         """
         formlist = []
+        base_states = get_system_question_base_states(self.request.event)
+        product_overrides = get_system_question_product_overrides(self.request.event)
         for cr in self._positions_for_questions:
             cartpos = cr if isinstance(cr, CartPosition) else None
             orderpos = cr if isinstance(cr, OrderPosition) else None
@@ -66,17 +73,28 @@ class BaseQuestionsViewMixin:
                 files=(self.request.FILES if self.request.method == 'POST' else None),
             )
             form.pos = cartpos or orderpos
-            form.show_copy_answers_to_addon_button = form.pos.addon_to and (
-                set(form.pos.addon_to.product.questions.all()) & set(form.pos.product.questions.all())
-                or (
-                    form.pos.addon_to.product.admission
-                    and form.pos.product.admission
-                    and (
-                        self.request.event.settings.attendee_names_asked
-                        or self.request.event.settings.attendee_emails_asked
-                        or self.request.event.settings.attendee_company_asked
-                        or self.request.event.settings.attendee_addresses_asked
-                    )
+
+            shared_system_fields = set()
+            if form.pos.addon_to and form.pos.addon_to.product.admission and form.pos.product.admission:
+                source_fields = get_enabled_system_question_fields(
+                    self.request.event,
+                    form.pos.addon_to.product,
+                    base_states=base_states,
+                    product_overrides=product_overrides,
+                )
+                target_fields = get_enabled_system_question_fields(
+                    self.request.event,
+                    form.pos.product,
+                    base_states=base_states,
+                    product_overrides=product_overrides,
+                )
+                shared_system_fields = source_fields & target_fields
+
+            form.show_copy_answers_to_addon_button = bool(
+                form.pos.addon_to
+                and (
+                    set(form.pos.addon_to.product.questions.all()) & set(form.pos.product.questions.all())
+                    or shared_system_fields
                 )
             )
 
@@ -96,6 +114,15 @@ class BaseQuestionsViewMixin:
                             if 'disabled' in overrides[question_name]:
                                 question_field.disabled = overrides[question_name]['disabled']
 
+            form.regular_fields = []
+            form.badge_option_fields = []
+            for field_name in form.fields:
+                bound_field = form[field_name]
+                if getattr(bound_field.field, 'badge_option', False):
+                    form.badge_option_fields.append(bound_field)
+                else:
+                    form.regular_fields.append(bound_field)
+
             if len(form.fields) > 0:
                 formlist.append(form)
         return formlist
@@ -113,6 +140,20 @@ class BaseQuestionsViewMixin:
                 if pos not in storage:
                     storage[pos] = []
                 storage[pos].append(f)
+
+        groups = list(storage.values())
+        if groups:
+            first_group = groups[0]
+            for i, group in enumerate(groups):
+                if i == 0:
+                    group[0].pos.show_copy_answers_main_button = False
+                    continue
+
+                group[0].pos.show_copy_answers_main_button = any(
+                    set(form.fields.keys()) & set(first_group[addonidx].fields.keys())
+                    for addonidx, form in enumerate(group) if addonidx < len(first_group)
+                )
+
         return storage
 
     def save(self):
@@ -132,6 +173,8 @@ class BaseQuestionsViewMixin:
                         form.pos.attendee_email = v if v != '' else None
                     elif k == 'company':
                         form.pos.company = v if v != '' else None
+                    elif k == 'job_title':
+                        form.pos.job_title = v if v != '' else None
                     elif k == 'street':
                         form.pos.street = v if v != '' else None
                     elif k == 'zipcode':
@@ -192,6 +235,13 @@ class BaseQuestionsViewMixin:
                                 del meta_info['question_form_data'][k]
                         else:
                             meta_info['question_form_data'][k] = v
+                        if k == 'badge_hidden_fields' and isinstance(form.pos, OrderPosition):
+                            from eventyay.plugins.badges.utils import (
+                                get_badge_config_position,
+                                invalidate_badge_cache_for_position,
+                            )
+
+                            invalidate_badge_cache_for_position(get_badge_config_position(form.pos))
 
             form.pos.meta_info = json.dumps(meta_info)
             form.pos.save()
@@ -235,7 +285,7 @@ class OrderQuestionsViewMixin(BaseQuestionsViewMixin):
     def positions(self):
         qqs = self.request.event.questions.all()
         if self.only_user_visible:
-            qqs = qqs.filter(ask_during_checkin=False, hidden=False)
+            qqs = qqs.filter(ask_during_checkin=False, hidden=False, active=True)
         return list(
             self.order.positions.select_related('product', 'variation').prefetch_related(
                 Prefetch(

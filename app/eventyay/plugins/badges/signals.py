@@ -1,6 +1,5 @@
 import copy
 import json
-from collections import defaultdict
 
 from django.dispatch import receiver
 from django.template.loader import get_template
@@ -11,6 +10,7 @@ from django.utils.translation import gettext_lazy as _
 from eventyay.base.models import Event, Order
 from eventyay.base.signals import (
     event_copy_data,
+    layout_text_variables,
     product_copy_data,
     logentry_display,
     logentry_object_link,
@@ -18,13 +18,21 @@ from eventyay.base.signals import (
     register_ticket_outputs,
 )
 from eventyay.control.signals import (
-    product_forms,
     nav_event,
     order_info,
     order_position_buttons,
 )
-from eventyay.plugins.badges.forms import BadgeProductForm
-from eventyay.plugins.badges.models import BadgeProduct, BadgeLayout
+from eventyay.presale.signals import question_form_fields
+
+from eventyay.plugins.badges.forms import BadgeOptionsField
+from eventyay.plugins.badges.models import BadgeProduct, BadgeLayout, BadgeVoucher
+from eventyay.plugins.badges.utils import (
+    BADGE_HIDDEN_FIELDS_KEY,
+    get_badge_bundle_option_choices,
+    get_badge_config_position,
+    get_badge_hidden_fields,
+    position_has_printable_badge,
+)
 
 
 @receiver(register_ticket_outputs)
@@ -58,18 +66,23 @@ def control_nav_import(sender, request=None, **kwargs):
     ]
 
 
-@receiver(product_forms, dispatch_uid='badges_product_forms')
-def control_product_forms(sender, request, product, **kwargs):
-    try:
-        inst = BadgeProduct.objects.get(product=product)
-    except BadgeProduct.DoesNotExist:
-        inst = BadgeProduct(product=product)
-    return BadgeProductForm(
-        instance=inst,
-        event=sender,
-        data=(request.POST if request.method == 'POST' else None),
-        prefix='badgeproduct',
-    )
+@receiver(layout_text_variables, dispatch_uid='badges_layout_text_variables_vouchers')
+def badges_layout_text_variables_vouchers(sender, **kwargs):
+    def voucher_value(field):
+        return lambda op, order, event: getattr(op.voucher, field, '') if op.voucher_id else ''
+
+    return {
+        'voucher_code': {
+            'label': _('Voucher code'),
+            'editor_sample': 'SAMPLE123',
+            'evaluate': voucher_value('code'),
+        },
+        'voucher_tag': {
+            'label': _('Voucher tag'),
+            'editor_sample': _('Sample tag'),
+            'evaluate': voucher_value('tag'),
+        },
+    }
 
 
 @receiver(product_copy_data, dispatch_uid='badges_product_copy')
@@ -82,7 +95,10 @@ def copy_product(sender, source, target, **kwargs):
 
 
 @receiver(signal=event_copy_data, dispatch_uid='badges_copy_data')
-def event_copy_data_receiver(sender, other, question_map, product_map, **kwargs):
+def event_copy_data_receiver(sender, other, question_map, product_map, voucher_map=None, **kwargs):
+    clone_options = kwargs.get('clone_options') or {}
+    if not clone_options.get('clone_ticketing_data', True):
+        return
     layout_map = {}
     for bl in other.badge_layouts.all():
         oldid = bl.pk
@@ -97,6 +113,26 @@ def event_copy_data_receiver(sender, other, question_map, product_map, **kwargs)
                     newq = question_map.get(int(o['content'][9:]))
                     if newq:
                         o['content'] = 'question_{}'.format(newq.pk)
+        ask_user_fields = []
+        for field in bl.ask_user_fields_data:
+            if field.startswith('question_'):
+                newq = question_map.get(int(field[9:]))
+                if newq:
+                    ask_user_fields.append('question_{}'.format(newq.pk))
+            else:
+                ask_user_fields.append(field)
+        bl.ask_user_fields_data = ask_user_fields
+        
+        required_badge_fields = []
+        for field in bl.required_badge_fields_data:
+            if field.startswith('question_'):
+                newq = question_map.get(int(field[9:]))
+                if newq:
+                    required_badge_fields.append('question_{}'.format(newq.pk))
+            else:
+                required_badge_fields.append(field)
+        bl.required_badge_fields_data = required_badge_fields
+        
         bl.save()
 
         if bl.background and bl.background.name:
@@ -107,6 +143,35 @@ def event_copy_data_receiver(sender, other, question_map, product_map, **kwargs)
     for bi in BadgeProduct.objects.filter(product__event=other):
         BadgeProduct.objects.create(product=product_map.get(bi.product_id), layout=layout_map.get(bi.layout_id))
 
+    if voucher_map:
+        for bv in BadgeVoucher.objects.filter(voucher__event=other):
+            mapped_voucher = voucher_map.get(bv.voucher_id)
+            if mapped_voucher:
+                BadgeVoucher.objects.create(voucher=mapped_voucher, layout=layout_map.get(bv.layout_id))
+
+
+@receiver(question_form_fields, dispatch_uid='badges_question_form_fields')
+def badge_question_form_fields(sender, position, **kwargs):
+    if get_badge_config_position(position) != position:
+        return {}
+
+    choices = get_badge_bundle_option_choices(sender, position)
+    if not choices:
+        return {}
+
+    from eventyay.plugins.badges.utils import get_badge_layout_for_position
+    layout = get_badge_layout_for_position(sender, position)
+    required_keys = layout.required_badge_fields_data if layout else []
+
+    return {
+        BADGE_HIDDEN_FIELDS_KEY: BadgeOptionsField(
+            label=_('Badge options'),
+            choices=choices,
+            hidden_initial=get_badge_hidden_fields(position),
+            required_keys=required_keys,
+        )
+    }
+
 
 @receiver(register_data_exporters, dispatch_uid='badges_export_all')
 def register_pdf(sender, **kwargs):
@@ -115,24 +180,9 @@ def register_pdf(sender, **kwargs):
     return BadgeExporter
 
 
-def _cached_rendermap(event):
-    if hasattr(event, '_cached_renderermap'):
-        return event._cached_renderermap
-    renderermap = {
-        bi.product_id: bi.layout_id for bi in BadgeProduct.objects.select_related('layout').filter(product__event=event)
-    }
-    try:
-        default_renderer = event.badge_layouts.get(default=True).pk
-    except BadgeLayout.DoesNotExist:
-        default_renderer = None
-    event._cached_renderermap = defaultdict(lambda: default_renderer)
-    event._cached_renderermap.update(renderermap)
-    return event._cached_renderermap
-
-
 @receiver(order_position_buttons, dispatch_uid='badges_control_order_buttons')
 def control_order_position_info(sender: Event, position, request, order: Order, **kwargs):
-    if _cached_rendermap(sender)[position.product_id] is None:
+    if not position_has_printable_badge(sender, position):
         return ''
     template = get_template('pretixplugins/badges/control_order_position_buttons.html')
     ctx = {'order': order, 'request': request, 'event': sender, 'position': position}
@@ -141,8 +191,7 @@ def control_order_position_info(sender: Event, position, request, order: Order, 
 
 @receiver(order_info, dispatch_uid='badges_control_order_info')
 def control_order_info(sender: Event, request, order: Order, **kwargs):
-    cm = _cached_rendermap(sender)
-    if all(cm[p.product_id] is None for p in order.positions.all()):
+    if not any(position_has_printable_badge(sender, p) for p in order.positions.all()):
         return ''
 
     template = get_template('pretixplugins/badges/control_order_info.html')

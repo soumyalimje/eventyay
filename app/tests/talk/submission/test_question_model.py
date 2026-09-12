@@ -1,0 +1,219 @@
+import pytest
+from django_countries.fields import Country
+from django_scopes import scope
+from eventyay.submission.forms import TalkQuestionsForm
+from eventyay.base.models import Answer, TalkQuestion as Question, TalkQuestionVariant as QuestionVariant
+
+from eventyay.helpers.countries import get_country_name
+
+
+@pytest.mark.parametrize("target", ("submission", "speaker", "reviewer"))
+@pytest.mark.django_db
+def test_missing_answers_submission_question(submission, target, question):
+    with scope(event=submission.event):
+        assert question.missing_answers() == 1
+        assert (
+            question.missing_answers(filter_talks=submission.event.submissions.all())
+            == 1
+        )
+        question.target = target
+        question.save()
+        if target == "submission":
+            Answer.objects.create(
+                answer="True", submission=submission, question=question
+            )
+        elif target == "speaker":
+            Answer.objects.create(
+                answer="True", person=submission.speakers.first(), question=question
+            )
+        assert question.missing_answers() == 0
+
+
+@pytest.mark.django_db
+def test_question_required_property_optional_questions(question):
+    assert question.required is False
+
+
+@pytest.mark.django_db
+def test_question_required_property_always_required_questions(question_required_always):
+    assert question_required_always.required is True
+
+
+@pytest.mark.django_db
+def test_question_required_property_required_after_option_before_deadline(
+    question_required_after_option_before_deadline,
+):
+    assert question_required_after_option_before_deadline.required is False
+
+
+@pytest.mark.django_db
+def test_question_required_property_required_after_option_after_deadline(
+    question_required_after_option_after_deadline,
+):
+    assert question_required_after_option_after_deadline.required is True
+
+
+@pytest.mark.django_db
+def test_question_required_property_freeze_after_option_before_deadline_question_required_optional(
+    question_freeze_after_option_before_deadline_question_required_optional,
+):
+    assert (
+        question_freeze_after_option_before_deadline_question_required_optional.required
+        is False
+    )
+
+
+@pytest.mark.django_db
+def test_question_required_property_freeze_after_option_after_deadline_question_required_optional(
+    question_freeze_after_option_after_deadline_question_required_optional,
+):
+    assert (
+        question_freeze_after_option_after_deadline_question_required_optional.required
+        is False
+    )
+
+
+@pytest.mark.django_db
+def test_question_required_property_freeze_after_option_after_deadline_question_required(
+    question_freeze_after_option_after_deadline_question_required_required,
+):
+    assert (
+        question_freeze_after_option_after_deadline_question_required_required.required
+        is False
+    )
+
+
+@pytest.mark.django_db
+def test_question_required_property_freeze_after_option_before_deadline_question_required(
+    question_freeze_after_option_before_deadline_question_required_required,
+):
+    assert (
+        question_freeze_after_option_before_deadline_question_required_required.required
+        is True
+    )
+
+
+@pytest.mark.django_db
+def test_question_property_freeze_after_option_after_deadline(
+    question_freeze_after_option_after_deadline,
+):
+    assert question_freeze_after_option_after_deadline.read_only is True
+
+
+@pytest.mark.django_db
+def test_question_property_freeze_after_option_before_deadline(
+    question_freeze_after_option_before_deadline,
+):
+    assert question_freeze_after_option_before_deadline.read_only is False
+
+
+@pytest.mark.django_db
+def test_question_base_properties(submission, question):
+    a = Answer.objects.create(answer="True", submission=submission, question=question)
+    assert a.event == question.event
+    assert str(a.question.question) in str(a.question)
+    assert str(a.question.question) in str(a)
+
+
+@pytest.mark.parametrize(
+    "variant,answer,expected",
+    (
+        ("number", "1", "1"),
+        ("string", "hm", "hm"),
+        ("text", "", ""),
+        ("boolean", "True", "Yes"),
+        ("boolean", "False", "No"),
+        ("boolean", "None", ""),
+        ("file", "answer", ""),
+        ("choices", "answer", ""),
+        ("select", "answer", ""),
+        ("url", "https://example.com", "https://example.com"),
+        ("video", "https://youtu.be/abc", "https://youtu.be/abc"),
+        ("country", "DE", get_country_name("DE") or "DE"),
+        ("lol", "lol", None),
+    ),
+)
+@pytest.mark.django_db
+def test_answer_string_property(event, variant, answer, expected):
+    with scope(event=event):
+        question = Question.objects.create(question="?", variant=variant, event=event)
+        answer = Answer.objects.create(question=question, answer=answer)
+        assert answer.answer_string == expected
+
+
+@pytest.mark.django_db
+def test_answer_string_property_select_with_option(event, submission):
+    """answer_string for select variant returns the selected option text."""
+    with scope(event=event):
+        question = Question.objects.create(
+            question="Which format?",
+            variant=QuestionVariant.SELECT,
+            event=event,
+            target="submission",
+        )
+        option = question.options.create(answer="In-person")
+        answer = Answer.objects.create(
+            question=question,
+            submission=submission,
+            answer=str(option.answer),
+        )
+        answer.options.add(option)
+        assert answer.answer_string == "In-person"
+
+
+@pytest.mark.django_db
+def test_country_answer_saved_and_round_trips(submission):
+    event = submission.event
+    with scope(event=event):
+        question = Question.objects.create(
+            question='Country?',
+            variant='country',
+            event=event,
+            target='submission',
+        )
+        form = TalkQuestionsForm(
+            event=event,
+            submission=submission,
+            data={f'question_{question.pk}': 'DE'},
+        )
+        assert form.is_valid()
+        cleaned = form.cleaned_data[f'question_{question.pk}']
+        assert isinstance(cleaned, Country)
+        assert cleaned.code == 'DE'
+        form.save()
+
+        answer = submission.answers.get(question=question)
+        assert answer.answer == 'DE'
+
+        round_trip_form = TalkQuestionsForm(event=event, submission=submission)
+        assert round_trip_form.fields[f'question_{question.pk}'].initial == 'DE'
+
+@pytest.mark.django_db
+def test_select_answer_saved_and_round_trips(submission):
+    event = submission.event
+    with scope(event=event):
+        question = Question.objects.create(
+            question='Select option?',
+            variant=QuestionVariant.SELECT,
+            event=event,
+            target='submission',
+        )
+        option1 = question.options.create(answer="Option 1")
+        option2 = question.options.create(answer="Option 2")
+        
+        form = TalkQuestionsForm(
+            event=event,
+            submission=submission,
+            data={f'question_{question.pk}': option2.pk},
+        )
+        assert form.is_valid()
+        form.save()
+
+        answer = submission.answers.get(question=question)
+        assert answer.answer == 'Option 2'
+        assert answer.options.count() == 1
+        assert answer.options.first() == option2
+
+        round_trip_form = TalkQuestionsForm(event=event, submission=submission)
+        # For ModelChoiceField, the initial value is usually the model instance or PK
+        assert round_trip_form.fields[f'question_{question.pk}'].initial == option2

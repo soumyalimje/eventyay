@@ -1,3 +1,5 @@
+import json
+
 from django import forms
 from django.db.models import Q
 from django.utils.functional import cached_property
@@ -5,10 +7,11 @@ from django.utils.functional import cached_property
 from eventyay.cfp.forms.cfp import CfPFormMixin
 from eventyay.common.forms.mixins import QuestionFieldsMixin
 from eventyay.base.models import TalkQuestion, TalkQuestionTarget, TalkQuestionVariant
+from eventyay.common.session_video import exclude_session_video_from_cfp_questions
 
 
 class TalkQuestionsForm(CfPFormMixin, QuestionFieldsMixin, forms.Form):
-    def __init__(self, *args, skip_limited_questions=False, **kwargs):
+    def __init__(self, *args, skip_limited_questions=False, include_session_video=False, **kwargs):
         self.event = kwargs.pop('event', None)
         self.submission = kwargs.pop('submission', None)
         self.speaker = kwargs.pop('speaker', None)
@@ -34,6 +37,9 @@ class TalkQuestionsForm(CfPFormMixin, QuestionFieldsMixin, forms.Form):
             self.queryset = self.queryset.filter(target=self.target_type)
         else:
             self.queryset = self.queryset.exclude(target=TalkQuestionTarget.REVIEWER).order_by('-target', 'position')
+        if not include_session_video:
+            # Organiser-managed session videos are edited on orga pages / list dialog only.
+            self.queryset = exclude_session_video_from_cfp_questions(self.queryset)
         if skip_limited_questions:
             self.queryset = self.queryset.filter(
                 tracks__isnull=True,
@@ -65,16 +71,34 @@ class TalkQuestionsForm(CfPFormMixin, QuestionFieldsMixin, forms.Form):
                 initial_object=initial_object,
                 readonly=readonly,
             )
+            if field is None:
+                continue
             field.question = question
             field.answer = initial_object
-            self.fields[f'question_{question.pk}'] = field
+            if question.dependency_question_id:
+                field.widget.attrs['data-question-dependency'] = question.dependency_question_id
+                field.widget.attrs['data-question-dependency-values'] = json.dumps(question.dependency_values)
+                field._required = field.required
+                if field._required and question.variant != TalkQuestionVariant.MULTIPLE:
+                    existing_classes = field.widget.attrs.get('class', '')
+                    classes = existing_classes.split() if existing_classes else []
+                    if 'required-hidden' not in classes:
+                        classes.append('required-hidden')
+                    field.widget.attrs['class'] = ' '.join(classes)
+                    field.widget.attrs['required'] = 'required'
+                else:
+                    field.widget.attrs.pop('required', None)
+                field.required = False
+            field_name = f'question_{question.pk}'
+            if field_name not in self.fields:
+                self.fields[field_name] = field
 
     @cached_property
     def speaker_fields(self):
         return [
             forms.BoundField(self, field, name)
             for name, field in self.fields.items()
-            if field.question.target == TalkQuestionTarget.SPEAKER
+            if name.startswith('question_') and field.question.target == TalkQuestionTarget.SPEAKER
         ]
 
     @cached_property
@@ -82,7 +106,7 @@ class TalkQuestionsForm(CfPFormMixin, QuestionFieldsMixin, forms.Form):
         return [
             forms.BoundField(self, field, name)
             for name, field in self.fields.items()
-            if field.question.target == TalkQuestionTarget.SUBMISSION
+            if name.startswith('question_') and field.question.target == TalkQuestionTarget.SUBMISSION
         ]
 
     def save(self):

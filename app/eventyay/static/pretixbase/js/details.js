@@ -2,13 +2,33 @@
 
 setup_collapsible_details = function (el) {
     var isOpera = Object.prototype.toString.call(window.opera) == '[object Opera]';
+    var updateVariationToggles = function ($details) {
+        var isOpen = $details.prop("open");
+        $details.find("a.variation-toggle[data-show-label][data-hide-label]").each(function () {
+            var $toggle = $(this);
+            var label = isOpen ? $toggle.attr("data-hide-label") : $toggle.attr("data-show-label");
+            var $label = $toggle.find(".variation-toggle-label");
+            if ($label.length) {
+                $label.text(label);
+            } else {
+                $toggle.text(label);
+            }
+            $toggle.attr("aria-expanded", isOpen ? "true" : "false");
+        });
+    };
+
     el.find("details summary, details summary a[data-toggle=variations]").click(function (e) {
         if (this.tagName !== "A" && $(e.target).closest("a").length > 0) {
             return true;
         }
         var $details = $(this).closest("details");
+        // Header/menu dropdowns use native <details> + common/js/dropdown.js.
+        if ($details.hasClass("dropdown")) {
+            return true;
+        }
         var isOpen = $details.prop("open");
         var $detailsNotSummary = $details.children(':not(summary)');
+
         if ($detailsNotSummary.is(':animated')) {
             e.preventDefault();
             return false;
@@ -17,12 +37,14 @@ setup_collapsible_details = function (el) {
             $details.removeClass("details-open");
             $detailsNotSummary.stop().show().slideUp(500, function () {
                 $details.prop("open", false);
+                updateVariationToggles($details);
             });
         } else {
             $detailsNotSummary.stop().hide();
             $details.prop("open", true);
             $details.addClass("details-open");
             $detailsNotSummary.slideDown();
+            updateVariationToggles($details);
         }
         e.preventDefault();
         return false;
@@ -39,6 +61,15 @@ setup_collapsible_details = function (el) {
         var $details = $(this),
             $detailsSummary = $('summary', $details).first(),
             $detailsNotSummary = $details.children(':not(summary)');
+        $detailsSummary.attr({
+            'role': 'button',
+            'aria-controls': $details.attr('id')
+        }).prop('tabIndex', 0).bind('selectstart dragstart mousedown', function () {
+            return false;
+        });
+        if ($details.hasClass("dropdown")) {
+            return;
+        }
         $details.prop('open', typeof $details.attr('open') == 'string');
         if (!$details.prop('open')) {
             if ($details.find(".has-error, .alert-danger").length) {
@@ -50,12 +81,7 @@ setup_collapsible_details = function (el) {
         } else {
             $details.addClass("details-open");
         }
-        $detailsSummary.attr({
-            'role': 'button',
-            'aria-controls': $details.attr('id')
-        }).prop('tabIndex', 0).bind('selectstart dragstart mousedown', function () {
-            return false;
-        });
+        updateVariationToggles($details);
     });
 };
 

@@ -2,7 +2,8 @@ from collections import OrderedDict
 from decimal import Decimal
 
 import dateutil
-import pytz
+import datetime
+from zoneinfo import ZoneInfo
 from django import forms
 from django.db.models import (
     Case,
@@ -14,12 +15,14 @@ from django.db.models import (
     Max,
     Min,
     OuterRef,
+    Value,
+    Prefetch,
     Q,
     Subquery,
     Sum,
     When,
 )
-from django.db.models.functions import Coalesce, TruncDate
+from django.db.models.functions import Coalesce, NullIf, TruncDate
 from django.dispatch import receiver
 from django.utils.functional import cached_property
 from django.utils.timezone import get_current_timezone, now
@@ -68,14 +71,38 @@ class OrderListExporter(MultiSheetListExporter):
 
     @property
     def additional_form_fields(self):
+        prefix = f'#id_{self.identifier}'
         d = [
             (
                 'paid_only',
-                forms.BooleanField(label=_('Only paid orders'), initial=True, required=False),
+                forms.BooleanField(
+                    label=_('Only paid orders'),
+                    initial=True,
+                    required=False,
+                    widget=forms.CheckboxInput(
+                        attrs={'data-inverse-dependency': f'{prefix}-approval_pending_only'}
+                    ),
+                ),
+            ),
+            (
+                'approval_pending_only',
+                forms.BooleanField(
+                    label=_('Only approval pending orders'),
+                    initial=False,
+                    required=False,
+                    widget=forms.CheckboxInput(attrs={'data-inverse-dependency': f'{prefix}-paid_only'}),
+                ),
             ),
             (
                 'include_payment_amounts',
-                forms.BooleanField(label=_('Include payment amounts'), initial=False, required=False),
+                forms.BooleanField(
+                    label=_('Include payment amounts'),
+                    initial=False,
+                    required=False,
+                    widget=forms.CheckboxInput(
+                        attrs={'data-inverse-dependency': f'{prefix}-approval_pending_only'}
+                    ),
+                ),
             ),
             (
                 'group_multiple_choice',
@@ -133,6 +160,38 @@ class OrderListExporter(MultiSheetListExporter):
             del d['event_date_from']
             del d['event_date_to']
         return d
+
+    def _approval_pending_only(self, form_data: dict) -> bool:
+        return bool(form_data.get('approval_pending_only', False))
+
+    def _include_payment_amounts(self, form_data: dict) -> bool:
+        return bool(form_data.get('include_payment_amounts') and not self._approval_pending_only(form_data))
+
+    def _filter_orders_by_state(self, qs, form_data: dict, prefix: str = ''):
+        if self._approval_pending_only(form_data):
+            return qs.filter(
+                **{
+                    f'{prefix}status': Order.STATUS_PENDING,
+                    f'{prefix}require_approval': True,
+                }
+            )
+        if form_data.get('paid_only', True):
+            return qs.filter(**{f'{prefix}status': Order.STATUS_PAID})
+        return qs
+
+    @staticmethod
+    def _first_filled(*values):
+        for value in values:
+            if value not in (None, ''):
+                return value
+        return ''
+
+    def _primary_order_position(self, order):
+        positions = getattr(order, 'export_positions', [])
+        for position in positions:
+            if not position.canceled:
+                return position
+        return positions[0] if positions else None
 
     def _get_all_payment_methods(self, qs):
         pps = dict(get_all_payment_providers())
@@ -280,9 +339,7 @@ class OrderListExporter(MultiSheetListExporter):
         )
 
         # Always load wikimedia_username (lightweight data)
-        wikimedia_query = User.objects.filter(
-            email=OuterRef('email')
-        ).values('wikimedia_username')[:1]
+        wikimedia_query = User.objects.filter(email=OuterRef('email')).values('wikimedia_username')[:1]
 
         qs = (
             Order.objects.filter(event__in=self.events)
@@ -294,12 +351,18 @@ class OrderListExporter(MultiSheetListExporter):
                 wikimedia_username=Subquery(wikimedia_query, output_field=CharField()),
             )
             .select_related('invoice_address')
+            .prefetch_related(
+                Prefetch(
+                    'positions',
+                    queryset=OrderPosition.objects.select_related('addon_to').order_by('positionid'),
+                    to_attr='export_positions',
+                )
+            )
         )
 
         qs = self._date_filter(qs, form_data, rel='')
 
-        if form_data.get('paid_only', True):
-            qs = qs.filter(status=Order.STATUS_PAID)
+        qs = self._filter_orders_by_state(qs, form_data)
         tax_rates = self._get_all_tax_rates(qs)
 
         # Check if we need to include wikimedia_username in the export
@@ -358,7 +421,8 @@ class OrderListExporter(MultiSheetListExporter):
         headers.append(_('Comment'))
         headers.append(_('Positions'))
         headers.append(_('Payment providers'))
-        if form_data.get('include_payment_amounts'):
+        payment_methods = []
+        if self._include_payment_amounts(form_data):
             payment_methods = self._get_all_payment_methods(qs)
             for id, vn in payment_methods:
                 headers.append(_('Paid by {method}').format(method=vn))
@@ -375,7 +439,7 @@ class OrderListExporter(MultiSheetListExporter):
             .order_by()
             .annotate(taxsum=Sum('tax_value'), grosssum=Sum('value'))
         }
-        if form_data.get('include_payment_amounts'):
+        if self._include_payment_amounts(form_data):
             payment_sum_cache = {
                 (o['order__id'], o['provider']): o['grosssum']
                 for o in OrderPayment.objects.values('provider', 'order__id')
@@ -408,101 +472,146 @@ class OrderListExporter(MultiSheetListExporter):
         }
 
         yield self.ProgressSetTotal(total=qs.count())
-        for order in qs.order_by('datetime').iterator():
-            tz = pytz.timezone(self.event_object_cache[order.event_id].settings.timezone)
-            row = [
-                self.event_object_cache[order.event_id].slug,
-                order.code,
-                order.total,
-                order.get_status_display(),
-                order.email,
-            ]
+        id_iterator = qs.order_by('datetime').values_list('pk', flat=True).iterator(chunk_size=1000)
+        for ids in chunked_iterable(id_iterator, 1000):
+            ids = list(ids)
+            orders_by_id = {order.pk: order for order in qs.filter(id__in=ids)}
+            for order_id in ids:
+                order = orders_by_id[order_id]
+                tz = ZoneInfo(self.event_object_cache[order.event_id].settings.timezone)
+                row = [
+                    self.event_object_cache[order.event_id].slug,
+                    order.code,
+                    order.total,
+                    order.get_status_display(),
+                    order.email,
+                ]
 
-            # Add wikimedia_username if setting is enabled (insert before phone number)
-            if should_include_wikimedia:
-                wikimedia_username = getattr(order, 'wikimedia_username', '') or ''
-                row.append(wikimedia_username)
+                # Add wikimedia_username if setting is enabled (insert before phone number)
+                if should_include_wikimedia:
+                    wikimedia_username = getattr(order, 'wikimedia_username', '') or ''
+                    row.append(wikimedia_username)
 
-            row += [
-                str(order.phone) if order.phone else '',
-                order.datetime.astimezone(tz).strftime('%Y-%m-%d'),
-                order.datetime.astimezone(tz).strftime('%H:%M:%S %Z'),
-            ]
-
-            try:
                 row += [
-                    order.invoice_address.company,
-                    order.invoice_address.name,
+                    str(order.phone) if order.phone else '',
+                    order.datetime.astimezone(tz).strftime('%Y-%m-%d'),
+                    order.datetime.astimezone(tz).strftime('%H:%M:%S %Z'),
+                ]
+
+                try:
+                    invoice_address = order.invoice_address
+                except InvoiceAddress.DoesNotExist:
+                    invoice_address = None
+
+                primary_position = self._primary_order_position(order)
+                position_name_parts = {}
+                if primary_position:
+                    position_name_parts = primary_position.attendee_name_parts or {}
+                    if not position_name_parts and primary_position.addon_to:
+                        position_name_parts = primary_position.addon_to.attendee_name_parts or {}
+
+                row += [
+                    self._first_filled(
+                        invoice_address.company if invoice_address else None,
+                        primary_position.company if primary_position else None,
+                        primary_position.addon_to.company if primary_position and primary_position.addon_to else None,
+                    ),
+                    self._first_filled(
+                        invoice_address.name if invoice_address else None,
+                        primary_position.attendee_name if primary_position else None,
+                        primary_position.addon_to.attendee_name
+                        if primary_position and primary_position.addon_to
+                        else None,
+                    ),
                 ]
                 if name_scheme and len(name_scheme['fields']) > 1:
                     for k, label, w in name_scheme['fields']:
-                        row.append(order.invoice_address.name_parts.get(k, ''))
+                        row.append(
+                            self._first_filled(
+                                invoice_address.name_parts.get(k, '') if invoice_address else '',
+                                position_name_parts.get(k, ''),
+                            )
+                        )
                 row += [
-                    order.invoice_address.street,
-                    order.invoice_address.zipcode,
-                    order.invoice_address.city,
-                    order.invoice_address.country
-                    if order.invoice_address.country
-                    else order.invoice_address.country_old,
-                    order.invoice_address.state,
-                    order.invoice_address.custom_field,
-                    order.invoice_address.vat_id,
-                ]
-            except InvoiceAddress.DoesNotExist:
-                row += [''] * (
-                    9 + (len(name_scheme['fields']) if name_scheme and len(name_scheme['fields']) > 1 else 0)
-                )
-
-            row += [
-                order.payment_date.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S %Z') if order.payment_date else '',
-                full_fee_sum_cache.get(order.id) or Decimal('0.00'),
-                order.locale,
-            ]
-
-            for tr in tax_rates:
-                taxrate_values = sum_cache.get(
-                    (order.id, tr),
-                    {'grosssum': Decimal('0.00'), 'taxsum': Decimal('0.00')},
-                )
-                fee_taxrate_values = fee_sum_cache.get(
-                    (order.id, tr),
-                    {'grosssum': Decimal('0.00'), 'taxsum': Decimal('0.00')},
-                )
-
-                row += [
-                    taxrate_values['grosssum'] + fee_taxrate_values['grosssum'],
-                    (
-                        taxrate_values['grosssum']
-                        - taxrate_values['taxsum']
-                        + fee_taxrate_values['grosssum']
-                        - fee_taxrate_values['taxsum']
+                    self._first_filled(
+                        invoice_address.street if invoice_address else None,
+                        primary_position.street if primary_position else None,
+                        primary_position.addon_to.street if primary_position and primary_position.addon_to else None,
                     ),
-                    taxrate_values['taxsum'] + fee_taxrate_values['taxsum'],
+                    self._first_filled(
+                        invoice_address.zipcode if invoice_address else None,
+                        primary_position.zipcode if primary_position else None,
+                        primary_position.addon_to.zipcode if primary_position and primary_position.addon_to else None,
+                    ),
+                    self._first_filled(
+                        invoice_address.city if invoice_address else None,
+                        primary_position.city if primary_position else None,
+                        primary_position.addon_to.city if primary_position and primary_position.addon_to else None,
+                    ),
+                    self._first_filled(
+                        invoice_address.country if invoice_address and invoice_address.country else None,
+                        invoice_address.country_old if invoice_address else None,
+                        primary_position.country if primary_position else None,
+                        primary_position.addon_to.country if primary_position and primary_position.addon_to else None,
+                    ),
+                    self._first_filled(
+                        invoice_address.state if invoice_address else None,
+                        primary_position.state if primary_position else None,
+                        primary_position.addon_to.state if primary_position and primary_position.addon_to else None,
+                    ),
+                    invoice_address.custom_field if invoice_address else '',
+                    invoice_address.vat_id if invoice_address else '',
                 ]
 
-            row.append(order.invoice_numbers)
-            row.append(order.sales_channel)
-            row.append(_('Yes') if order.checkin_attention else _('No'))
-            row.append(order.comment or '')
-            row.append(order.pcnt)
-            row.append(
-                ', '.join(
-                    [
-                        str(self.providers.get(p, p))
-                        for p in sorted(set((order.payment_providers or '').split(',')))
-                        if p and p != 'free'
-                    ]
-                )
-            )
+                row += [
+                    order.payment_date.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S %Z') if order.payment_date else '',
+                    full_fee_sum_cache.get(order.id) or Decimal('0.00'),
+                    order.locale,
+                ]
 
-            if form_data.get('include_payment_amounts'):
-                payment_methods = self._get_all_payment_methods(qs)
-                for id, vn in payment_methods:
-                    row.append(
-                        payment_sum_cache.get((order.id, id), Decimal('0.00'))
-                        - refund_sum_cache.get((order.id, id), Decimal('0.00'))
+                for tr in tax_rates:
+                    taxrate_values = sum_cache.get(
+                        (order.id, tr),
+                        {'grosssum': Decimal('0.00'), 'taxsum': Decimal('0.00')},
                     )
-            yield row
+                    fee_taxrate_values = fee_sum_cache.get(
+                        (order.id, tr),
+                        {'grosssum': Decimal('0.00'), 'taxsum': Decimal('0.00')},
+                    )
+
+                    row += [
+                        taxrate_values['grosssum'] + fee_taxrate_values['grosssum'],
+                        (
+                            taxrate_values['grosssum']
+                            - taxrate_values['taxsum']
+                            + fee_taxrate_values['grosssum']
+                            - fee_taxrate_values['taxsum']
+                        ),
+                        taxrate_values['taxsum'] + fee_taxrate_values['taxsum'],
+                    ]
+
+                row.append(order.invoice_numbers)
+                row.append(order.sales_channel)
+                row.append(_('Yes') if order.checkin_attention else _('No'))
+                row.append(order.comment or '')
+                row.append(order.pcnt)
+                row.append(
+                    ', '.join(
+                        [
+                            str(self.providers.get(p, p))
+                            for p in sorted(set((order.payment_providers or '').split(',')))
+                            if p and p != 'free'
+                        ]
+                    )
+                )
+
+                if self._include_payment_amounts(form_data):
+                    for id, vn in payment_methods:
+                        row.append(
+                            payment_sum_cache.get((order.id, id), Decimal('0.00'))
+                            - refund_sum_cache.get((order.id, id), Decimal('0.00'))
+                        )
+                yield row
 
     def iterate_fees(self, form_data: dict):
         p_providers = (
@@ -529,8 +638,7 @@ class OrderListExporter(MultiSheetListExporter):
             )
             .select_related('order', 'order__invoice_address', 'tax_rule')
         )
-        if form_data.get('paid_only', True):
-            qs = qs.filter(order__status=Order.STATUS_PAID)
+        qs = self._filter_orders_by_state(qs, form_data, prefix='order__')
 
         qs = self._date_filter(qs, form_data, rel='order__')
 
@@ -570,7 +678,7 @@ class OrderListExporter(MultiSheetListExporter):
         yield self.ProgressSetTotal(total=qs.count())
         for op in qs.order_by('order__datetime').iterator():
             order = op.order
-            tz = pytz.timezone(order.event.settings.timezone)
+            tz = ZoneInfo(order.event.settings.timezone)
             row = [
                 self.event_object_cache[order.event_id].slug,
                 order.code,
@@ -638,13 +746,22 @@ class OrderListExporter(MultiSheetListExporter):
         base_qs = OrderPosition.objects.filter(
             order__event__in=self.events,
         )
+        wikimedia_query = User.objects.filter(
+        email=Coalesce(
+            NullIf(OuterRef('attendee_email'), Value('')),
+            NullIf(OuterRef('addon_to__attendee_email'), Value('')),
+            NullIf(OuterRef('order__email'), Value('')),
+        )
+        ).values('wikimedia_username')[:1]
         qs = (
             base_qs.annotate(
                 payment_providers=Subquery(p_providers, output_field=CharField()),
+                wikimedia_username=Subquery(wikimedia_query, output_field=CharField()),
             )
             .select_related(
                 'order',
                 'order__invoice_address',
+                'addon_to',
                 'product',
                 'variation',
                 'voucher',
@@ -652,8 +769,7 @@ class OrderListExporter(MultiSheetListExporter):
             )
             .prefetch_related('answers', 'answers__question', 'answers__options')
         )
-        if form_data.get('paid_only', True):
-            qs = qs.filter(order__status=Order.STATUS_PAID)
+        qs = self._filter_orders_by_state(qs, form_data, prefix='order__')
 
         qs = self._date_filter(qs, form_data, rel='order__')
 
@@ -681,6 +797,7 @@ class OrderListExporter(MultiSheetListExporter):
             _('Tax rule'),
             _('Tax value'),
             _('Attendee name'),
+            _('SSO username'),
         ]
         name_scheme = PERSON_NAME_SCHEMES[self.event.settings.name_scheme] if not self.is_multievent else None
         if name_scheme and len(name_scheme['fields']) > 1:
@@ -689,6 +806,7 @@ class OrderListExporter(MultiSheetListExporter):
         headers += [
             _('Attendee email'),
             _('Company'),
+            _('Job Title'),
             _('Address'),
             _('ZIP code'),
             _('City'),
@@ -740,6 +858,13 @@ class OrderListExporter(MultiSheetListExporter):
             _('Payment providers'),
         ]
 
+        try:
+            from eventyay.plugins.badges.utils import get_badge_visible_field_values
+            badge_support = True
+            headers.append(_('Badge options'))
+        except ImportError:
+            badge_support = False
+
         yield headers
 
         all_ids = list(base_qs.order_by('order__datetime', 'positionid').values_list('pk', flat=True))
@@ -749,7 +874,16 @@ class OrderListExporter(MultiSheetListExporter):
 
             for op in ops:
                 order = op.order
-                tz = pytz.timezone(self.event_object_cache[order.event_id].settings.timezone)
+                tz = ZoneInfo(self.event_object_cache[order.event_id].settings.timezone)
+                try:
+                    invoice_address = order.invoice_address
+                except InvoiceAddress.DoesNotExist:
+                    invoice_address = None
+
+                person_source = op.attendee_name_parts or (op.addon_to.attendee_name_parts if op.addon_to else {})
+                if not person_source and invoice_address:
+                    person_source = invoice_address.name_parts
+
                 row = [
                     self.event_object_cache[order.event_id].slug,
                     order.code,
@@ -787,19 +921,35 @@ class OrderListExporter(MultiSheetListExporter):
                     op.tax_rate,
                     str(op.tax_rule) if op.tax_rule else '',
                     op.tax_value,
-                    op.attendee_name,
+                    op.attendee_name
+                    or (op.addon_to.attendee_name if op.addon_to else '')
+                    or (invoice_address.name if invoice_address else ''),
+                    op.wikimedia_username or '',
                 ]
                 if name_scheme and len(name_scheme['fields']) > 1:
                     for k, label, w in name_scheme['fields']:
-                        row.append(op.attendee_name_parts.get(k, ''))
+                        row.append(person_source.get(k, ''))
                 row += [
-                    op.attendee_email,
-                    op.company or '',
-                    op.street or '',
-                    op.zipcode or '',
-                    op.city or '',
-                    op.country if op.country else '',
-                    op.state or '',
+                    op.attendee_email or (op.addon_to.attendee_email if op.addon_to else '') or order.email or '',
+                    op.company
+                    or (op.addon_to.company if op.addon_to else '')
+                    or (invoice_address.company if invoice_address else ''),
+                    op.job_title or (op.addon_to.job_title if op.addon_to else ''),
+                    op.street
+                    or (op.addon_to.street if op.addon_to else '')
+                    or (invoice_address.street if invoice_address else ''),
+                    op.zipcode
+                    or (op.addon_to.zipcode if op.addon_to else '')
+                    or (invoice_address.zipcode if invoice_address else ''),
+                    op.city
+                    or (op.addon_to.city if op.addon_to else '')
+                    or (invoice_address.city if invoice_address else ''),
+                    op.country
+                    or (op.addon_to.country if op.addon_to else '')
+                    or (invoice_address.country if invoice_address else ''),
+                    op.state
+                    or (op.addon_to.state if op.addon_to else '')
+                    or (invoice_address.state if invoice_address else ''),
                     op.voucher.code if op.voucher else '',
                     op.pseudonymization_id,
                 ]
@@ -873,13 +1023,56 @@ class OrderListExporter(MultiSheetListExporter):
                         ]
                     )
                 )
+
+                if badge_support:
+                    badge_values = get_badge_visible_field_values(self.event_object_cache[order.event_id], op)
+                    row.append(', '.join(badge_values) if badge_values else '')
+
                 yield row
 
     def get_filename(self):
         if self.is_multievent:
-            return '{}_orders'.format(self.events.first().organizer.slug)
+            return f'{self.events.first().organizer.slug}_orders'
         else:
-            return '{}_orders'.format(self.event.slug)
+            return f'{self.event.slug}_orders'
+
+
+class OrderPositionListExporter(OrderListExporter):
+    identifier = 'orderpositionlist'
+    verbose_name = gettext_lazy('Order positions')
+
+    @property
+    def export_form_fields(self) -> dict:
+        ff = OrderedDict(
+            [
+                (
+                    '_format',
+                    forms.ChoiceField(
+                        label=_('Export format'),
+                        choices=(
+                            ('xlsx', _('Excel (.xlsx)')),
+                            ('default', _('CSV (with commas)')),
+                            ('csv-excel', _('CSV (Excel-style)')),
+                            ('semicolon', _('CSV (with semicolons)')),
+                        ),
+                    ),
+                ),
+            ]
+        )
+        ff.update(self.additional_form_fields)
+        return ff
+
+    def iterate_list(self, form_data):
+        yield from self.iterate_positions(form_data)
+
+    def get_filename(self):
+        if self.is_multievent:
+            return f'{self.events.first().organizer.slug}_orderpositions'
+        else:
+            return f'{self.event.slug}_orderpositions'
+
+    def render(self, form_data: dict, output_file=None):
+        return super(MultiSheetListExporter, self).render(form_data, output_file=output_file)
 
 
 class PaymentListExporter(ListExporter):
@@ -948,7 +1141,7 @@ class PaymentListExporter(ListExporter):
 
         yield self.ProgressSetTotal(total=len(objs))
         for obj in objs:
-            tz = pytz.timezone(obj.order.event.settings.timezone)
+            tz = ZoneInfo(obj.order.event.settings.timezone)
             if isinstance(obj, OrderPayment) and obj.payment_date:
                 d2 = obj.payment_date.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S %Z')
             elif isinstance(obj, OrderRefund) and obj.execution_date:
@@ -971,9 +1164,9 @@ class PaymentListExporter(ListExporter):
 
     def get_filename(self):
         if self.is_multievent:
-            return '{}_payments'.format(self.events.first().organizer.slug)
+            return f'{self.events.first().organizer.slug}_payments'
         else:
-            return '{}_payments'.format(self.event.slug)
+            return f'{self.event.slug}_payments'
 
 
 class QuotaListExporter(ListExporter):
@@ -1020,9 +1213,13 @@ class QuotaListExporter(ListExporter):
             if has_subevents:
                 if quota.subevent:
                     row.append(quota.subevent.name)
-                    row.append(quota.subevent.date_from.astimezone(self.event.timezone).strftime('%Y-%m-%d %H:%M:%S %Z'))
+                    row.append(
+                        quota.subevent.date_from.astimezone(self.event.timezone).strftime('%Y-%m-%d %H:%M:%S %Z')
+                    )
                     if quota.subevent.date_to:
-                        row.append(quota.subevent.date_to.astimezone(self.event.timezone).strftime('%Y-%m-%d %H:%M:%S %Z'))
+                        row.append(
+                            quota.subevent.date_to.astimezone(self.event.timezone).strftime('%Y-%m-%d %H:%M:%S %Z')
+                        )
                     else:
                         row.append('')
                 else:
@@ -1032,7 +1229,7 @@ class QuotaListExporter(ListExporter):
             yield row
 
     def get_filename(self):
-        return '{}_quotas'.format(self.event.slug)
+        return f'{self.event.slug}_quotas'
 
 
 class GiftcardRedemptionListExporter(ListExporter):
@@ -1068,7 +1265,7 @@ class GiftcardRedemptionListExporter(ListExporter):
         yield headers
 
         for obj in objs:
-            tz = pytz.timezone(obj.order.event.settings.timezone)
+            tz = ZoneInfo(obj.order.event.settings.timezone)
             gc = GiftCard.objects.get(pk=obj.info_data.get('gift_card'))
             row = [
                 obj.order.event.slug,
@@ -1083,9 +1280,9 @@ class GiftcardRedemptionListExporter(ListExporter):
 
     def get_filename(self):
         if self.is_multievent:
-            return '{}_giftcardredemptions'.format(self.events.first().organizer.slug)
+            return f'{self.events.first().organizer.slug}_giftcardredemptions'
         else:
-            return '{}_giftcardredemptions'.format(self.event.slug)
+            return f'{self.event.slug}_giftcardredemptions'
 
 
 def generate_GiftCardListExporter(organizer):  # hackhack
@@ -1211,7 +1408,7 @@ def generate_GiftCardListExporter(organizer):  # hackhack
                 yield row
 
         def get_filename(self):
-            return '{}_giftcards'.format(organizer.slug)
+            return f'{organizer.slug}_giftcards'
 
     return GiftcardListExporter
 
@@ -1224,6 +1421,16 @@ def register_orderlist_exporter(sender, **kwargs):
 @receiver(register_multievent_data_exporters, dispatch_uid='multiexporter_orderlist')
 def register_multievent_orderlist_exporter(sender, **kwargs):
     return OrderListExporter
+
+
+@receiver(register_data_exporters, dispatch_uid='exporter_orderpositionlist')
+def register_orderpositionlist_exporter(sender, **kwargs):
+    return OrderPositionListExporter
+
+
+@receiver(register_multievent_data_exporters, dispatch_uid='multiexporter_orderpositionlist')
+def register_multievent_orderpositionlist_exporter(sender, **kwargs):
+    return OrderPositionListExporter
 
 
 @receiver(register_data_exporters, dispatch_uid='exporter_paymentlist')

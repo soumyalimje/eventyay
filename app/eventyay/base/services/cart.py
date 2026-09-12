@@ -38,8 +38,9 @@ from eventyay.base.services.checkin import _save_answers
 from eventyay.base.services.locking import LockTimeoutException, NoLockManager
 from eventyay.base.services.pricing import get_price
 from eventyay.base.services.quotas import QuotaAvailability
+from eventyay.base.services.system_questions import get_system_question_asked_required
 from eventyay.base.services.tasks import ProfiledEventTask
-from eventyay.base.settings import PERSON_NAME_SCHEMES
+from eventyay.base.settings import PERSON_NAME_SCHEMES, GlobalSettingsObject
 from eventyay.base.signals import validate_cart_addons
 from eventyay.base.templatetags.rich_text import rich_text
 from eventyay.celery_app import app
@@ -89,7 +90,14 @@ error_messages = {
         'The presale period for one of the events in your cart has ended. The affected '
         'positions have been removed from your cart.'
     ),
-    'price_too_high': _('The entered price is to high.'),
+    'price_too_high': _('The entered price exceeds the permitted maximum.'),
+    'price_too_low': _(
+        'The entered price is below the permitted minimum. The price range is %(min)s to %(max)s %(currency)s.'
+    ),
+    'price_too_low_min_only': _('The entered price is below the permitted minimum. The minimum price is %s.'),
+    'price_too_high_max': _(
+        'The entered price exceeds the permitted maximum. The price range is %(min)s to %(max)s %(currency)s.'
+    ),
     'voucher_invalid': _('This voucher code is not known in our database.'),
     'voucher_redeemed': _('This voucher code has already been used the maximum number of times allowed.'),
     'voucher_redeemed_cart': _(
@@ -225,7 +233,7 @@ class CartManager:
         return self._seated_cache[product, subevent]
 
     def _calculate_expiry(self):
-        self._expiry = self.now_dt + timedelta(minutes=self.event.settings.get('reservation_time', as_type=int))
+        self._expiry = self.now_dt + timedelta(minutes=int(GlobalSettingsObject().settings.get('reservation_time', default=30) or 30))
 
     def _check_presale_dates(self):
         if self.event.presale_start and self.now_dt < self.event.presale_start:
@@ -320,11 +328,14 @@ class CartManager:
             cartsize -= len(
                 [1 for op in self._operations if isinstance(op, self.RemoveOperation) if not op.position.addon_to_id]
             )
-            if cartsize > int(self.event.settings.max_products_per_order):
+            max_products = int(GlobalSettingsObject().settings.get('max_products_per_order', default=0) or 0)
+            if max_products > 0 and cartsize > max_products:
                 # TODO: i18n plurals
-                raise CartError(_(error_messages['max_products']) % (self.event.settings.max_products_per_order,))
+                raise CartError(_(error_messages['max_products']) % (max_products,))
 
-    def _check_product_constraints(self, op, current_ops=[]):
+    def _check_product_constraints(self, op, current_ops=None):
+        if current_ops is None:
+            current_ops = []
         if isinstance(op, (self.AddOperation, self.ExtendOperation)):
             if not (
                 (isinstance(op, self.AddOperation) and op.addon_to == 'FAKE')
@@ -443,10 +454,24 @@ class CartManager:
         except TaxRule.SaleNotAllowed:
             raise CartError(error_messages['country_blocked'])
         except ValueError as e:
-            if str(e) == 'price_too_high':
+            code = e.args[0] if e.args else None
+            if code == 'price_too_high':
                 raise CartError(error_messages['price_too_high'])
+            elif code == 'price_too_low' and len(e.args) >= 2:
+                if len(e.args) >= 4:
+                    raise CartError(
+                        error_messages['price_too_low'],
+                        {'min': e.args[1], 'max': e.args[2], 'currency': e.args[3]},
+                    )
+                min_val = f'{e.args[1]} {e.args[2]}' if len(e.args) >= 3 else e.args[1]
+                raise CartError(error_messages['price_too_low_min_only'], min_val)
+            elif code == 'price_too_high_max' and len(e.args) >= 4:
+                raise CartError(
+                    error_messages['price_too_high_max'],
+                    {'min': e.args[1], 'max': e.args[2], 'currency': e.args[3]},
+                )
             else:
-                raise e
+                raise
 
     def extend_expired_positions(self):
         requires_seat = Exists(
@@ -1125,7 +1150,19 @@ class CartManager:
 
         # If we have an email, also check existing orders for flagged products
         email = None
-        if hasattr(self, 'invoice_address') and self.invoice_address and self.invoice_address.email:
+        
+        # Try to get email from widget data if present
+        if hasattr(self, '_widget_data') and self._widget_data and self._widget_data.get('email'):
+            email = self._widget_data.get('email')
+        # Try to get email from existing cart positions
+        elif self.positions:
+            for p in self.positions:
+                if p.attendee_email:
+                    email = p.attendee_email
+                    break
+
+        # Fallback to invoice_address.email if it somehow gets monkey-patched
+        if not email and hasattr(self, 'invoice_address') and self.invoice_address and getattr(self.invoice_address, 'email', None):
             email = self.invoice_address.email
 
         if email and flagged_product_ids:
@@ -1195,7 +1232,7 @@ class CartManager:
 
                 if voucher_available_count < 1:
                     if op.voucher in self._voucher_depend_on_cart:
-                        err = err or error_messages['voucher_redeemed_cart'] % self.event.settings.reservation_time
+                        err = err or error_messages['voucher_redeemed_cart'] % GlobalSettingsObject().settings.get('reservation_time', default='30')
                     else:
                         err = err or error_messages['voucher_redeemed']
                 elif voucher_available_count < requested_count:
@@ -1262,11 +1299,16 @@ class CartManager:
                             if op.price_before_voucher is not None
                             else None,
                         )
-                        if self.event.settings.attendee_names_asked:
+                        ask_name, _ = get_system_question_asked_required(self.event, 'attendee_name_parts', op.product)
+                        ask_email, _ = get_system_question_asked_required(self.event, 'attendee_email', op.product)
+
+                        if ask_name:
                             scheme = PERSON_NAME_SCHEMES.get(self.event.settings.name_scheme)
+                            if scheme is None:
+                                scheme = next(iter(PERSON_NAME_SCHEMES.values()), None)
                             if 'attendee-name' in self._widget_data:
                                 cp.attendee_name_parts = {'_legacy': self._widget_data['attendee-name']}
-                            if any(
+                            if scheme and any(
                                 'attendee-name-{}'.format(k.replace('_', '-')) in self._widget_data
                                 for k, l, w in scheme['fields']
                             ):
@@ -1277,7 +1319,7 @@ class CartManager:
                                     )
                                     for k, l, w in scheme['fields']
                                 }
-                        if self.event.settings.attendee_emails_asked and 'email' in self._widget_data:
+                        if ask_email and 'email' in self._widget_data:
                             cp.attendee_email = self._widget_data.get('email')
 
                         cp._answers = {}
@@ -1437,11 +1479,12 @@ def get_fees(event, request, total, invoice_address, provider, positions):
     total = total + sum(f.value for f in fees)
 
     cs = cart_session(request)
+    effective_testmode = event.testmode or event.private_testmode_tickets_enabled
     if cs.get('gift_cards'):
         gcs = cs['gift_cards']
         gc_qs = event.organizer.accepted_gift_cards.filter(pk__in=cs.get('gift_cards'), currency=event.currency)
         for gc in gc_qs:
-            if gc.testmode != event.testmode:
+            if gc.testmode != effective_testmode:
                 gcs.remove(gc.pk)
                 continue
             fval = Decimal(gc.value)  # TODO: don't require an extra query

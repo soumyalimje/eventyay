@@ -23,15 +23,43 @@ RUN wget -qO- https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git build-essential gettext make nodejs
 
-# We need to install pretix-venueless from this local directory
-COPY eventyay/plugins/eventyay-ticket-video eventyay/plugins/eventyay-ticket-video
+# Build mode: "production" (default) uses locked deps, "dev" refreshes plugins
+ARG BUILD_MODE=production
+# Cache buster for dev builds — pass a unique value (e.g. timestamp) to prevent
+# Docker from reusing stale dependency layers when BUILD_MODE=dev
+ARG CACHE_BUST=0
 
 # install python dependencies
 # Ref: https://docs.astral.sh/uv/guides/integration/docker/#non-editable-installs
+#
+# Production: use --locked to ensure reproducible builds from uv.lock.
+# Dev/staging: copy full project context and use --upgrade-package to fetch
+# the latest commit for each plugin from its configured branch.
+COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --locked --no-install-project --no-editable
+    if [ "$BUILD_MODE" = "dev" ]; then \
+      echo "=== Dev build: refreshing plugins (CACHE_BUST=$CACHE_BUST) ===" && \
+      sed -i 's/\.git@main/\.git@dev/g' pyproject.toml && \
+      uv sync --no-install-project --no-editable --refresh \
+        --upgrade-package eventyay-paypal \
+        --upgrade-package eventyay-stripe \
+        --upgrade-package eventyay-bitpay \
+        --upgrade-package eventyay-socialmedia \
+        --upgrade-package exhibition \
+        --upgrade-package eventyay-teamshifts \
+        --upgrade-package eventyay-interpretation \
+        --upgrade-package eventyay-hubspot \
+        --upgrade-package eventyay-business; \
+    else \
+      echo "=== Production build: using locked dependencies ===" && \
+      uv sync --locked --no-install-project --no-editable; \
+    fi
+
+# Log installed plugin versions for build traceability
+RUN echo "=== Installed plugin versions ===" && \
+    uv pip freeze 2>/dev/null \
+      | grep -iE 'eventyay-paypal|eventyay-stripe|eventyay-bitpay|eventyay-socialmedia|exhibition|eventyay-teamshifts|eventyay-interpretation|eventyay-hubspot' \
+    || echo "(no plugins found — check build output above)"
 
 COPY Makefile Makefile
 
@@ -62,29 +90,25 @@ RUN wget -qO- https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
 RUN apt-get update && apt-get install -y --no-install-recommends netcat-traditional nodejs gettext less
 
-# copy entrypoint.prod.sh
-COPY ./entrypoint.prod.sh .
-RUN sed -i 's/\r$//g'  $APP_HOME/entrypoint.prod.sh
-RUN chmod +x  $APP_HOME/entrypoint.prod.sh
-
 # copy project
 COPY . $APP_HOME
 
-# global-nav-menu
-COPY eventyay/frontend/global-nav-menu eventyay/frontend/global-nav-menu
-RUN npm ci --prefix=eventyay/frontend/global-nav-menu
-RUN OUT_DIR=/home/app/web/eventyay/data/compiled-frontend npm run build --prefix=eventyay/frontend/global-nav-menu
+# fix line endings for entrypoint.prod.sh
+RUN sed -i 's/\r$//g'  $APP_HOME/entrypoint.prod.sh
+RUN chmod +x  $APP_HOME/entrypoint.prod.sh
+
 # schedule editor
-COPY eventyay/frontend/schedule-editor eventyay/frontend/schedule-editor
-RUN npm ci --prefix=eventyay/frontend/schedule-editor
-RUN OUT_DIR=/home/app/web/eventyay/data/compiled-frontend npm run build --prefix=eventyay/frontend/schedule-editor
+COPY eventyay/webapp/schedule-editor eventyay/webapp/schedule-editor
+RUN npm ci --prefix=eventyay/webapp/schedule-editor
+RUN OUT_DIR=/home/app/web/eventyay/data/compiled-frontend npm run build --prefix=eventyay/webapp/schedule-editor
+# schedule widget
+COPY eventyay/webapp/schedule eventyay/webapp/schedule
+RUN npm ci --prefix=eventyay/webapp/schedule
+RUN OUT_DIR=/home/app/web/eventyay/data/compiled-frontend npm run build --prefix=eventyay/webapp/schedule
 # Video SPA app
-COPY eventyay/webapp eventyay/webapp
-RUN npm ci --prefix=eventyay/webapp
-RUN OUT_DIR=/home/app/web/eventyay/data/compiled-frontend npm run build --prefix=eventyay/webapp
-# rollup needed by Django-Compressor
-COPY eventyay/frontend/webcheckin-bundler eventyay/frontend/webcheckin-bundler
-RUN npm ci --prefix=eventyay/frontend/webcheckin-bundler
+COPY eventyay/webapp/video eventyay/webapp/video
+RUN npm ci --prefix=eventyay/webapp/video
+RUN OUT_DIR=/home/app/web/eventyay/data/compiled-frontend npm run build --prefix=eventyay/webapp/video
 # esbuild needed by Django-Compressor
 RUN npm install -g esbuild
 
@@ -104,8 +128,7 @@ ENV PATH="$APP_HOME/.venv/bin:$PATH"
 ENV EVY_RUNNING_ENVIRONMENT=production
 
 
-# Temporarily disable because the PO files are wrong.
-# RUN python manage.py compilemessages
+RUN python manage.py compilemessages -i .venv
 RUN python manage.py compilejsi18n
 RUN python manage.py collectstatic --noinput
 #RUN python manage.py compress
@@ -115,6 +138,8 @@ RUN python manage.py collectstatic --noinput
 RUN mkdir $APP_HOME/eventyay/static.dist.backup && \
     mv $APP_HOME/eventyay/static.dist/* $APP_HOME/eventyay/static.dist.backup
 
+# Create .secrets to suppress warnings about missing directory
+RUN mkdir -p $APP_HOME/.secrets
 
 # run entrypoint.prod.sh
 ENTRYPOINT ["/home/app/web/entrypoint.prod.sh"]

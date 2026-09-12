@@ -1,9 +1,13 @@
+import os
+import re
+import threading
+import zoneinfo
 from collections import OrderedDict
 from urllib.parse import urlsplit
 
-import pytz
+from django.apps import apps
 from django.conf import settings
-from django.http import Http404, HttpRequest, HttpResponse
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.middleware.common import CommonMiddleware
 from django.urls import get_script_prefix
 from django.utils import timezone, translation
@@ -17,13 +21,18 @@ from django.utils.translation.trans_real import (
 )
 
 from eventyay.base.i18n import get_language_without_region
+from eventyay.base.models import GlobalPluginConfig
 from eventyay.base.settings import global_settings_object
+from eventyay.common.urls import get_url_origin
 from eventyay.multidomain.urlreverse import (
     get_event_domain,
     get_organizer_domain,
 )
 
+
 _supported = None
+
+DEFAULT_LEAFLET_TILES = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
 
 
 class LocaleMiddleware(MiddlewareMixin):
@@ -33,27 +42,29 @@ class LocaleMiddleware(MiddlewareMixin):
     """
 
     def process_request(self, request: HttpRequest):
-        language = get_language_from_request(request)
+        ui_language = getattr(request, 'ui_language', None)
+        language = ui_language or get_language_from_request(request)
         # Normally, this middleware runs *before* the event is set. However, on event frontend pages it
         # might be run a second time by eventyay.presale.EventMiddleware and in this case the event is already
         # set and can be taken into account for the decision.
         if not request.path.startswith(get_script_prefix() + 'control'):
-            if hasattr(request, 'event'):
-                if language not in request.event.settings.locales:
-                    firstpart = language.split('-')[0]
-                    if firstpart in request.event.settings.locales:
-                        language = firstpart
-                    else:
-                        language = request.event.settings.locale
-                        for lang in request.event.settings.locales:
-                            if lang.startswith(firstpart + '-'):
-                                language = lang
-                                break
-                if '-' not in language and request.event.settings.region:
-                    language += '-' + request.event.settings.region
-            elif hasattr(request, 'organizer'):
-                if '-' not in language and request.organizer.settings.region:
-                    language += '-' + request.organizer.settings.region
+            if not ui_language:
+                if hasattr(request, 'event'):
+                    if language not in request.event.settings.locales:
+                        firstpart = language.split('-')[0]
+                        if firstpart in request.event.settings.locales:
+                            language = firstpart
+                        else:
+                            language = request.event.settings.locale
+                            for lang in request.event.settings.locales:
+                                if lang.startswith(firstpart + '-'):
+                                    language = lang
+                                    break
+                    if '-' not in language and request.event.settings.region:
+                        language += '-' + request.event.settings.region
+                elif hasattr(request, 'organizer'):
+                    if '-' not in language and request.organizer.settings.region:
+                        language += '-' + request.organizer.settings.region
         else:
             gs = global_settings_object(request)
             if '-' not in language and gs.settings.region:
@@ -71,10 +82,11 @@ class LocaleMiddleware(MiddlewareMixin):
             tzname = request.user.timezone
         if tzname:
             try:
-                timezone.activate(pytz.timezone(tzname))
+                timezone.activate(zoneinfo.ZoneInfo(tzname))
                 request.timezone = tzname
-            except pytz.UnknownTimeZoneError:
-                pass
+            except zoneinfo.ZoneInfoNotFoundError:
+                timezone.deactivate()
+                request.timezone = None
         else:
             timezone.deactivate()
 
@@ -183,8 +195,78 @@ def _merge_csp(a, b):
             a[k] = b[k]
 
 
+def is_event_settings_preview_request(request: HttpRequest) -> bool:
+    view_name = getattr(getattr(request, 'resolver_match', None), 'view_name', None) or ''
+    if view_name.endswith('event.update'):
+        return True
+
+    return '/event/' in request.path and request.path.endswith('/settings/')
+
+
+def get_startpage_events(request: HttpRequest):
+    view_name = getattr(getattr(request, 'resolver_match', None), 'view_name', None)
+    if view_name not in ('index', 'presale:index'):
+        return []
+
+    from django.db.models import Q
+    from django_scopes import scopes_disabled
+
+    from eventyay.base.models import Event
+
+    search_query = request.GET.get('q', '').strip()
+    with scopes_disabled():
+        qs = Event.objects.select_related('organizer').prefetch_related('_settings_objects').filter(live=True)
+        qs = qs.filter(Q(startpage_visible=True) | Q(startpage_featured=True))
+        if search_query:
+            qs = qs.filter(name__icontains=search_query)
+
+        return [event for event in qs.order_by('date_from') if not event.has_component_testmode]
+
+
+def get_external_image_csp_sources(request: HttpRequest) -> list[str]:
+    if is_event_settings_preview_request(request):
+        sources = ['https:']
+        if settings.SITE_URL.startswith('http://'):
+            sources.append('http:')
+        return sources
+
+    sources = []
+
+    event = getattr(request, 'event', None)
+    if event and event.pk:
+        for image_url in (event.visible_header_image_url, event.visible_logo_url):
+            origin = get_url_origin(image_url)
+            if origin:
+                sources.append(origin)
+
+    for event in get_startpage_events(request):
+        for image_url in (event.visible_header_image_url, event.visible_logo_url):
+            origin = get_url_origin(image_url)
+            if origin:
+                sources.append(origin)
+
+    sources.extend(getattr(request, '_external_image_csp_sources', []))
+
+    return list(OrderedDict.fromkeys(sources))
+
+
 class SecurityMiddleware(MiddlewareMixin):
     CSP_EXEMPT = ('/api/v1/docs/',)
+
+    @staticmethod
+    def _vite_dev_csp_entries():
+        """Return (http_origins, ws_origins) lists for all Vite dev servers."""
+        http_origins = []
+        ws_origins = []
+        for url in settings.VITE_DEV_SERVER_PORTS.values():
+            split = urlsplit(url)
+            if not split.scheme or not split.netloc:
+                continue
+
+            http_origins.append(f'{split.scheme}://{split.netloc}')
+            ws_scheme = 'wss' if split.scheme == 'https' else 'ws'
+            ws_origins.append(f'{ws_scheme}://{split.netloc}')
+        return http_origins, ws_origins
 
     def process_response(self, request, resp):
         if settings.DEBUG and resp.status_code >= 400:
@@ -203,22 +285,34 @@ class SecurityMiddleware(MiddlewareMixin):
         resp['Referrer-Policy'] = 'strict-origin-when-cross-origin'
 
         img_src = []
+        external_img_src = get_external_image_csp_sources(request)
         gs = global_settings_object(request)
-        if gs.settings.leaflet_tiles:
-            img_src.append(gs.settings.leaflet_tiles[: gs.settings.leaflet_tiles.index('/', 10)].replace('{s}', '*'))
+        leaflet_tiles = gs.settings.leaflet_tiles or DEFAULT_LEAFLET_TILES
+        try:
+            img_src.append(leaflet_tiles[: leaflet_tiles.index('/', 10)].replace('{s}', '*'))
+        except (ValueError, IndexError):
+            pass
+
+        vite_http = []
+        vite_ws = []
+        if settings.DEBUG or settings.VITE_DEV_MODE:
+            vite_http, vite_ws = self._vite_dev_csp_entries()
 
         h = {
             'default-src': ['{static}'],
             'script-src': [
                 '{static}',
+                'https://static.cloudflareinsights.com',
+                'https://challenges.cloudflare.com',
                 'https://checkout.stripe.com',
                 'https://js.stripe.com',
-                'http://localhost:8080',
+                *vite_http,
                 "'unsafe-eval'",  # Required for buntpapier and other libraries that use eval()
             ],
             'object-src': ["'none'"],
             'frame-src': [
                 '{static}',
+                'https://challenges.cloudflare.com',
                 'https://checkout.stripe.com',
                 'https://js.stripe.com',
                 'https://www.youtube.com',
@@ -230,11 +324,31 @@ class SecurityMiddleware(MiddlewareMixin):
                 '{media}',
                 "'unsafe-inline'",  # allow inline styles
             ],
-            'connect-src': ['{dynamic}', '{media}', 'https://checkout.stripe.com', 'https:', 'blob:'],
-            'img-src': ['{static}', '{media}', 'data:', 'https://*.stripe.com', 'https://twemoji.maxcdn.com'] + img_src,
+            'connect-src': [
+                '{dynamic}',
+                '{media}',
+                'https://challenges.cloudflare.com',
+                'https://checkout.stripe.com',
+                'https://static.cloudflareinsights.com',
+                'https:',
+                'blob:',
+            ],
+            'img-src': [
+                '{static}',
+                '{media}',
+                'data:',
+                'https://*.stripe.com',
+                'https://twemoji.maxcdn.com',
+                'https://www.gravatar.com',
+                'https://secure.gravatar.com',
+            ]
+            + external_img_src
+            + img_src,
             'font-src': [
                 '{static}',
+                'data:',
                 'https://fonts.gstatic.com',  # fix Google Fonts
+                *vite_http,
             ],
             'media-src': ['{static}', 'data:', 'https:', 'blob:'],
             # form-action is not only used to match on form actions, but also on URLs
@@ -252,8 +366,9 @@ class SecurityMiddleware(MiddlewareMixin):
                 "'unsafe-eval'",  # Required for Vue.js and buntpapier libraries
                 "'unsafe-inline'",  # Required for server-injected configuration scripts
             ]
-            if settings.DEBUG:
-                h['script-src-elem'].insert(1, 'http://localhost:8080')  # Development only
+            if settings.DEBUG or settings.VITE_DEV_MODE:
+                for origin in vite_http:
+                    h['script-src-elem'].insert(1, origin)
         if settings.LOG_CSP:
             base_path = settings.BASE_PATH
             h['report-uri'] = [f'{base_path}/csp_report/']
@@ -261,6 +376,23 @@ class SecurityMiddleware(MiddlewareMixin):
             _merge_csp(h, _parse_csp(resp['Content-Security-Policy']))
         if settings.CSP_ADDITIONAL_HEADER:
             _merge_csp(h, _parse_csp(settings.CSP_ADDITIONAL_HEADER))
+
+        csp_update = getattr(resp, '_csp_update', None)
+        if csp_update:
+            normalized = {}
+            for key, value in csp_update.items():
+                if value is None or value is False:
+                    continue
+                if isinstance(value, str):
+                    parts = [part for part in value.split() if part]
+                elif isinstance(value, (list, tuple, set)):
+                    parts = [str(part) for part in value if part]
+                else:
+                    parts = [str(value)]
+                if parts:
+                    normalized[key] = parts
+            if normalized:
+                _merge_csp(h, normalized)
 
         staticdomain = "'self'"
         dynamicdomain = "'self'"
@@ -285,13 +417,13 @@ class SecurityMiddleware(MiddlewareMixin):
             if domain:
                 siteurlsplit = urlsplit(settings.SITE_URL)
                 if siteurlsplit.port and siteurlsplit.port not in (80, 443):
-                    domain = '%s:%d' % (domain, siteurlsplit.port)
+                    domain = f'{domain}:{siteurlsplit.port}'
                 dynamicdomain += ' ' + domain
 
-        # Add DEBUG mode settings before rendering CSP
-        if settings.DEBUG:
-            h.setdefault('script-src', []).extend(["'unsafe-inline'", "http://localhost:8080"])
-            h.setdefault('connect-src', []).extend(["http://localhost:8080", "ws://localhost:8080"])
+        # Add development mode settings before rendering CSP
+        if settings.DEBUG or settings.VITE_DEV_MODE:
+            h.setdefault('script-src', []).extend(["'unsafe-inline'", *vite_http])
+            h.setdefault('connect-src', []).extend([*vite_http, *vite_ws])
 
         if request.path not in self.CSP_EXEMPT and not getattr(resp, '_csp_ignore', False):
             for k, v in h.items():
@@ -312,3 +444,101 @@ class CustomCommonMiddleware(CommonMiddleware):
         if request.method in ('POST', 'PUT', 'PATCH'):
             raise Http404('Please append a / at the end of the URL')
         return new_path
+
+
+class GloballyDisabledPluginMiddleware(MiddlewareMixin):
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        module = getattr(view_func, '__module__', None)
+        if not module:
+            return None
+
+        app_config = apps.get_containing_app_config(module)
+        if app_config is None or not hasattr(app_config, 'EventyayPluginMeta'):
+            return None
+
+        if app_config.name in GlobalPluginConfig.get_disabled_modules():
+            raise Http404
+        return None
+
+
+try:
+    MAX_CONCURRENT_REQUESTS = int(os.environ.get('MAX_CONCURRENT_REQUESTS', '4'))
+except ValueError:
+    MAX_CONCURRENT_REQUESTS = 4
+
+CHECKIN_EXEMPT_RE = re.compile(
+    r'/checkin/redeem/?(?:$|\?)|/checkinlists(?:/\d+)?(?:/|$|\?)'
+)
+
+
+def request_prefers_html(request):
+    accept = request.headers.get('Accept', '')
+    return 'text/html' in accept and 'application/json' not in accept
+
+
+def request_prefers_json_api(request):
+    path = request.path or ''
+    if path.startswith('/api/'):
+        return True
+    accept = request.headers.get('Accept', '')
+    return 'application/json' in accept and 'text/html' not in accept
+
+
+def is_load_shed_exempt(path):
+    if path.startswith('/healthcheck') or '/video/assets/' in path:
+        return True
+    return bool(CHECKIN_EXEMPT_RE.search(path))
+
+
+def should_skip_session_save(response, modified):
+    return response.status_code == 404 and not modified
+
+
+def overloaded_response(request: HttpRequest) -> HttpResponse:
+    if request_prefers_html(request) and not request.path.startswith('/api/'):
+        response = HttpResponse(
+            'Server is temporarily overloaded. Please try again shortly.',
+            status=503,
+            content_type='text/plain',
+        )
+    else:
+        response = JsonResponse(
+            {'detail': 'Server is temporarily overloaded. Please try again shortly.'},
+            status=503,
+        )
+    response['Retry-After'] = '10'
+    return response
+
+
+class LoadSheddingMiddleware:
+    """Per-process HTTP concurrency cap (not cluster-wide).
+
+    Default 4 concurrent requests per Gunicorn worker process, aligned with
+    ``gthread`` ``--threads 4`` in production compose. With ``workers=2`` the
+    effective container cap is roughly 8. Set ``MAX_CONCURRENT_REQUESTS=0`` to
+    disable. Overloaded responses include ``Retry-After`` and keep JSON for API
+    callers while returning a simple 503 page to browsers.
+    """
+
+    active_requests = 0
+    lock = threading.Lock()
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if MAX_CONCURRENT_REQUESTS <= 0:
+            return self.get_response(request)
+        if is_load_shed_exempt(request.path):
+            return self.get_response(request)
+
+        with LoadSheddingMiddleware.lock:
+            if LoadSheddingMiddleware.active_requests >= MAX_CONCURRENT_REQUESTS:
+                return overloaded_response(request)
+            LoadSheddingMiddleware.active_requests += 1
+
+        try:
+            return self.get_response(request)
+        finally:
+            with LoadSheddingMiddleware.lock:
+                LoadSheddingMiddleware.active_requests -= 1

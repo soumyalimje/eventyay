@@ -10,13 +10,18 @@ from eventyay.plugins.badges.api import (
 )
 
 from .views import (
+    BadgeCachedDownloadView,
+    BadgeSettingsView,
     LayoutCreate,
     LayoutDelete,
     LayoutEditorView,
+    LayoutGetDefault,
     LayoutListView,
     LayoutSetDefault,
+    LayoutSettingsView,
     OrderPrintDo,
 )
+
 
 urlpatterns = [
     path(
@@ -25,9 +30,19 @@ urlpatterns = [
         name='index',
     ),
     path(
+        'control/event/<orgslug:organizer>/<slug:event>/badges/settings',
+        BadgeSettingsView.as_view(),
+        name='event_settings',
+    ),
+    path(
         'control/event/<orgslug:organizer>/<slug:event>/badges/print',
         OrderPrintDo.as_view(),
         name='print',
+    ),
+    path(
+        'control/event/<orgslug:organizer>/<slug:event>/badges/getdefault',
+        LayoutGetDefault.as_view(),
+        name='getdefault',
     ),
     path(
         'control/event/<orgslug:organizer>/<slug:event>/badges/add',
@@ -45,6 +60,11 @@ urlpatterns = [
         name='delete',
     ),
     path(
+        'control/event/<orgslug:organizer>/<slug:event>/badges/<int:layout>/settings',
+        LayoutSettingsView.as_view(),
+        name='settings',
+    ),
+    path(
         'control/event/<orgslug:organizer>/<slug:event>/badges/<int:layout>/editor',
         LayoutEditorView.as_view(),
         name='edit',
@@ -59,7 +79,12 @@ urlpatterns = [
         BadgePreviewView.as_view(),
         name='badge-preview',
     ),
+    path(
+        'control/event/<orgslug:organizer>/<slug:event>/badges/download/<uuid:id>/',
+        BadgeCachedDownloadView.as_view(),
+        name='download',
+    ),
 ]
 
-event_router.register('badgelayouts', BadgeLayoutViewSet)
-event_router.register('badgeitems', BadgeProductViewSet)
+event_router.register('badgelayouts', BadgeLayoutViewSet, basename='badgelayout')
+event_router.register('badgeitems', BadgeProductViewSet, basename='badgeproduct')

@@ -1,60 +1,52 @@
-from pathlib import Path
+from datetime import timedelta
 
 from csp.decorators import csp_update
-from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import login
 from django.core.exceptions import ValidationError
-from django.core.files.storage import FileSystemStorage
-from django.db import transaction
+from django.db import models, transaction
 from django.forms.models import inlineformset_factory
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.utils.functional import cached_property
-from django.utils.safestring import mark_safe
 from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
-from django.utils.translation import ngettext_lazy
 from django.views.generic import FormView, ListView, TemplateView, UpdateView, View
 from django_context_decorator import context
-from django_scopes import scope, scopes_disabled
-from formtools.wizard.views import SessionWizardView
 
+from eventyay.agenda.views.utils import get_schedule_exporters
+from eventyay.base.models import Event, LogEntry, ReviewPhase, ReviewScoreCategory, TeamInvite, User
+from eventyay.base.models.base import CachedFile
 from eventyay.common.forms import I18nEventFormSet, I18nFormSet
-from eventyay.base.models import LogEntry
 from eventyay.common.text.phrases import phrases
 from eventyay.common.views.mixins import (
     ActionConfirmMixin,
     ActionFromUrl,
     EventPermissionRequired,
     PermissionRequired,
-    SensibleBackWizardMixin,
 )
-from eventyay.event.forms import (
-    EventWizardBasicsForm,
-    EventWizardCopyForm,
-    EventWizardDisplayForm,
-    EventWizardInitialForm,
-    EventWizardTimelineForm,
-)
-from eventyay.base.models import Event, Team, TeamInvite
 from eventyay.orga.forms import EventForm
 from eventyay.orga.forms.event import (
-    EventFooterLinkFormset,
-    EventHeaderLinkFormset,
     MailSettingsForm,
     ReviewPhaseForm,
     ReviewScoreCategoryForm,
     ReviewSettingsForm,
+    FeedbackSettingsForm,
+    ScheduleHtmlExportForm,
     WidgetGenerationForm,
     WidgetSettingsForm,
 )
-from eventyay.orga.signals import activate_event
+from eventyay.orga.forms.feedback import FeedbackExportForm
+from eventyay.orga.forms.importers import CSVImportForm
+from eventyay.orga.forms.review import ReviewExportForm
+from eventyay.orga.forms.schedule import ScheduleExportForm
+from eventyay.orga.forms.speaker import SpeakerExportForm
 from eventyay.person.forms import UserForm
-from eventyay.base.models import User
-from eventyay.base.models import ReviewPhase, ReviewScoreCategory
 from eventyay.submission.tasks import recalculate_all_review_scores
+
+from .speaker import SpeakerImportProcessView
+from .submission import SubmissionImportProcessView
 
 
 class EventSettingsPermission(EventPermissionRequired):
@@ -84,30 +76,9 @@ class EventDetail(EventSettingsPermission, ActionFromUrl, UpdateView):
         return response
 
     @context
-    @cached_property
-    def header_links_formset(self):
-        return EventHeaderLinkFormset(
-            self.request.POST if self.request.method == 'POST' else None,
-            event=self.object,
-            prefix='header-links',
-            instance=self.object,
-        )
-
-    @context
-    @cached_property
-    def footer_links_formset(self):
-        return EventFooterLinkFormset(
-            self.request.POST if self.request.method == 'POST' else None,
-            event=self.object,
-            prefix='footer-links',
-            instance=self.object,
-        )
-
-    @context
     def tablist(self):
         return {
-            'display': _('Display settings'),
-            'texts': _('Texts'),
+            'general': _('General settings'),
         }
 
     def get_success_url(self) -> str:
@@ -115,116 +86,28 @@ class EventDetail(EventSettingsPermission, ActionFromUrl, UpdateView):
 
     @transaction.atomic
     def form_valid(self, form):
-        if not self.footer_links_formset.is_valid() or not self.header_links_formset.is_valid():
-            messages.error(self.request, phrases.base.error_saving_changes)
-            return self.form_invalid(form)
-
         result = super().form_valid(form)
-        self.footer_links_formset.save()
-        self.header_links_formset.save()
 
         form.instance.log_action('eventyay.event.update', person=self.request.user, orga=True)
         messages.success(self.request, phrases.base.saved)
         return result
 
 
-class EventLive(EventSettingsPermission, TemplateView):
-    template_name = 'orga/event/live.html'
+class EventLive(View):
+    def _central_url(self, request):
+        return reverse(
+            'eventyay_common:event.live',
+            kwargs={
+                'organizer': request.event.organizer.slug,
+                'event': request.event.slug,
+            },
+        )
 
-    def get_context_data(self, **kwargs):
-        result = super().get_context_data(**kwargs)
-        warnings = []
-        suggestions = []
-        # TODO: move to signal
-        if not self.request.event.cfp.text or len(str(self.request.event.cfp.text)) < 50:
-            warnings.append(
-                {
-                    'text': _('The CfP doesn’t have a full text yet.'),
-                    'url': self.request.event.cfp.urls.text,
-                }
-            )
-        if not self.request.event.landing_page_text or len(str(self.request.event.landing_page_text)) < 50:
-            warnings.append(
-                {
-                    'text': _('The event doesn’t have a landing page text yet.'),
-                    'url': self.request.event.orga_urls.settings,
-                }
-            )
-        # TODO: test that mails can be sent
-        if (
-            self.request.event.get_feature_flag('use_tracks')
-            and self.request.event.cfp.request_track
-            and self.request.event.tracks.count() < 2
-        ):
-            suggestions.append(
-                {
-                    'text': _(
-                        'You want submitters to choose the tracks for their proposals, but you do not offer tracks for selection. Add at least one track!'
-                    ),
-                    'url': self.request.event.cfp.urls.tracks,
-                }
-            )
-        if self.request.event.submission_types.count() == 1:
-            suggestions.append(
-                {
-                    'text': _('You have configured only one session type so far.'),
-                    'url': self.request.event.cfp.urls.types,
-                }
-            )
-        if not self.request.event.talkquestions.exists():
-            suggestions.append(
-                {
-                    'text': _('You have configured no custom fields yet.'),
-                    'url': self.request.event.cfp.urls.new_question,
-                }
-            )
-        result['warnings'] = warnings
-        result['suggestions'] = suggestions
-        return result
+    def get(self, request, *args, **kwargs):
+        return redirect(self._central_url(request))
 
     def post(self, request, *args, **kwargs):
-        event = request.event
-        action = request.POST.get('action')
-        if action == 'activate':
-            if event.is_public:
-                messages.success(request, _('This event was already live.'))
-            else:
-                responses = activate_event.send_robust(event, request=request)
-                exceptions = [response[1] for response in responses if isinstance(response[1], Exception)]
-                if exceptions:
-                    from eventyay.base.templatetags.rich_text import render_markdown
-
-                    messages.error(
-                        request,
-                        mark_safe('\n'.join(render_markdown(e) for e in exceptions)),
-                    )
-                else:
-                    event.is_public = True
-                    event.save()
-                    event.log_action(
-                        'eventyay.event.activate',
-                        person=self.request.user,
-                        orga=True,
-                        data={},
-                    )
-                    messages.success(request, _('This event is now public.'))
-                    for response in responses:
-                        if isinstance(response[1], str):
-                            messages.success(request, response[1])
-        else:  # action == 'deactivate'
-            if not event.is_public:
-                messages.success(request, _('This event was already hidden.'))
-            else:
-                event.is_public = False
-                event.save()
-                event.log_action(
-                    'eventyay.event.deactivate',
-                    person=self.request.user,
-                    orga=True,
-                    data={},
-                )
-                messages.success(request, _('This event is now hidden.'))
-        return redirect(event.orga_urls.base)
+        return redirect(self._central_url(request))
 
 
 class EventHistory(EventSettingsPermission, ListView):
@@ -247,7 +130,7 @@ class EventReviewSettings(EventSettingsPermission, ActionFromUrl, FormView):
     @context
     def tablist(self):
         return {
-            'general': _('General information'),
+            'general': _('Review settings'),
             'scores': _('Review scoring'),
             'phases': _('Review phases'),
         }
@@ -268,6 +151,7 @@ class EventReviewSettings(EventSettingsPermission, ActionFromUrl, FormView):
             messages.error(self.request, e.message)
             return self.get(self.request, *self.args, **self.kwargs)
         if not phases or not scores:
+            messages.error(self.request, phrases.base.error_saving_changes)
             return self.get(self.request, *self.args, **self.kwargs)
         form.save()
         if self.scores_formset.has_changed():
@@ -275,6 +159,7 @@ class EventReviewSettings(EventSettingsPermission, ActionFromUrl, FormView):
                 kwargs={'event_id': self.request.event.pk},
                 ignore_result=True,
             )
+        messages.success(self.request, phrases.base.saved)
         return super().form_valid(form)
 
     @context
@@ -309,7 +194,7 @@ class EventReviewSettings(EventSettingsPermission, ActionFromUrl, FormView):
             extra_forms = [
                 form
                 for form in self.phases_formset.extra_forms
-                if form.has_changed and not self.phases_formset._should_delete_form(form)
+                if form.has_changed() and not self.phases_formset._should_delete_form(form)
             ]
             for form in extra_forms:
                 form.instance.event = self.request.event
@@ -362,7 +247,8 @@ class EventReviewSettings(EventSettingsPermission, ActionFromUrl, FormView):
             return False
         weights_changed = False
         for form in self.scores_formset.initial_forms:
-            # Deleting is handled elsewhere, so we skip it here
+            if self.scores_formset._should_delete_form(form):
+                continue
             if form.has_changed():
                 if 'weight' in form.changed_data:
                     weights_changed = True
@@ -372,7 +258,7 @@ class EventReviewSettings(EventSettingsPermission, ActionFromUrl, FormView):
         extra_forms = [
             form
             for form in self.scores_formset.extra_forms
-            if form.has_changed and not self.scores_formset._should_delete_form(form)
+            if form.has_changed() and not self.scores_formset._should_delete_form(form)
         ]
         for form in extra_forms:
             form.instance.event = self.request.event
@@ -388,6 +274,25 @@ class EventReviewSettings(EventSettingsPermission, ActionFromUrl, FormView):
         if weights_changed:
             ReviewScoreCategory.recalculate_scores(self.request.event)
         return True
+
+
+class FeedbackSettings(EventSettingsPermission, ActionFromUrl, FormView):
+    form_class = FeedbackSettingsForm
+    template_name = 'orga/settings/feedback.html'
+
+    def get_success_url(self) -> str:
+        return self.request.event.orga_urls.feedback_settings
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs['obj'] = self.request.event
+        return kwargs
+
+    @transaction.atomic
+    def form_valid(self, form):
+        form.save()
+        messages.success(self.request, phrases.base.saved)
+        return super().form_valid(form)
 
 
 class PhaseActivate(EventSettingsPermission, View):
@@ -416,37 +321,7 @@ class EventMailSettings(EventSettingsPermission, ActionFromUrl, FormView):
 
     def form_valid(self, form):
         form.save()
-
-        if self.request.POST.get('test', '0').strip() == '1':
-            backend = self.request.event.get_mail_backend(force_custom=True)
-            try:
-                backend.test(self.request.event.mail_settings['mail_from'])
-            except Exception as e:
-                messages.warning(
-                    self.request,
-                    _('An error occurred while contacting the SMTP server: %s') % str(e),
-                )
-            else:  # pragma: no cover
-                if form.cleaned_data.get('smtp_use_custom'):
-                    messages.success(
-                        self.request,
-                        _(
-                            'Yay, your changes have been saved and the connection attempt to '
-                            'your SMTP server was successful.'
-                        ),
-                    )
-                else:
-                    messages.success(
-                        self.request,
-                        _(
-                            'We’ve been able to contact the SMTP server you configured. '
-                            'Remember to check the “use custom SMTP server” checkbox, '
-                            'otherwise your SMTP server will not be used.'
-                        ),
-                    )
-        else:
-            messages.success(self.request, phrases.base.saved)
-
+        messages.success(self.request, phrases.base.saved)
         return super().form_valid(form)
 
 
@@ -466,7 +341,7 @@ class InvitationView(FormView):
     def post(self, *args, **kwargs):
         if not self.request.user.is_anonymous:
             self.accept_invite(self.request.user)
-            return redirect(reverse('orga:event.list'))
+            return redirect(reverse('eventyay_common:dashboard'))
         return super().post(*args, **kwargs)
 
     def form_valid(self, form):
@@ -481,7 +356,7 @@ class InvitationView(FormView):
 
         self.accept_invite(user)
         login(self.request, user, backend='django.contrib.auth.backends.ModelBackend')
-        return redirect(reverse('orga:event.list'))
+        return redirect(reverse('eventyay_common:dashboard'))
 
     @transaction.atomic()
     def accept_invite(self, user):
@@ -493,158 +368,73 @@ class InvitationView(FormView):
         invite.delete()
 
 
-def condition_copy(wizard):
-    return EventWizardCopyForm.copy_from_queryset(wizard.request.user).exists()
-
-
-class EventWizard(PermissionRequired, SensibleBackWizardMixin, SessionWizardView):
-    permission_required = 'base.create_event'
-    file_storage = FileSystemStorage(location=Path(settings.MEDIA_ROOT) / 'new_event')
-    form_list = [
-        ('initial', EventWizardInitialForm),
-        ('basics', EventWizardBasicsForm),
-        ('timeline', EventWizardTimelineForm),
-        ('display', EventWizardDisplayForm),
-        ('copy', EventWizardCopyForm),
-    ]
-    condition_dict = {'copy': condition_copy}
-
-    def get_template_names(self):
-        return [f'orga/event/wizard/{self.steps.current}.html']
-
-    @context
-    def organizer(self):
-        return self.get_cleaned_data_for_step('initial').get('organizer') if self.steps.current != 'initial' else None
-
-    def render(self, form=None, **kwargs):
-        if self.steps.current != 'initial' and self.get_cleaned_data_for_step('initial') is None:
-            return self.render_goto_step('initial')
-        if self.steps.current == 'timeline':
-            fdata = self.get_cleaned_data_for_step('basics')
-            year = now().year % 100
-            if fdata and str(year) not in fdata['slug'] and str(year + 1) not in fdata['slug']:
-                messages.warning(
-                    self.request,
-                    str(_('Please consider including your event’s year in the slug, e.g. myevent{number}.')).format(
-                        number=year
-                    ),
-                )
-        elif self.steps.current == 'display':
-            date_to = self.get_cleaned_data_for_step('timeline').get('date_to')
-            if date_to and date_to < now():
-                messages.warning(
-                    self.request,
-                    _('Did you really mean to make your event take place in the past?'),
-                )
-        return super().render(form, **kwargs)
-
-    def get_form_kwargs(self, step=None):
-        kwargs = {'user': self.request.user}
-        if step != 'initial':
-            fdata = self.get_cleaned_data_for_step('initial')
-            kwargs.update(fdata or {})
-        return kwargs
-
-    @transaction.atomic()
-    def done(self, form_list, *args, **kwargs):
-        steps = {}
-        for step in ('initial', 'basics', 'timeline', 'display', 'copy'):
-            try:
-                steps[step] = self.get_cleaned_data_for_step(step)
-            except KeyError:
-                steps[step] = {}
-
-        with scopes_disabled():
-            event = Event.objects.create(
-                organizer=steps['initial']['organizer'],
-                locale_array=','.join(steps['initial']['locales']),
-                content_locale_array=','.join(steps['initial']['locales']),
-                name=steps['basics']['name'],
-                slug=steps['basics']['slug'],
-                timezone=steps['basics']['timezone'],
-                email=steps['basics']['email'],
-                locale=steps['basics']['locale'],
-                date_from=steps['timeline']['date_from'],
-                date_to=steps['timeline']['date_to'],
-            )
-        with scope(event=event):
-            deadline = steps['timeline'].get('deadline')
-            if deadline:
-                event.cfp.deadline = deadline.replace(tzinfo=event.tz)
-                event.cfp.save()
-            for setting in ('display_header_data',):
-                value = steps['display'].get(setting)
-                if value:
-                    event.settings.set(setting, value)
-
-        has_control_rights = self.request.user.teams.filter(
-            organizer=event.organizer,
-            all_events=True,
-            can_change_event_settings=True,
-            can_change_submissions=True,
-        ).exists()
-        if not has_control_rights:
-            team = Team.objects.create(
-                organizer=event.organizer,
-                name=_(f'Team {event.name}'),
-                can_change_event_settings=True,
-                can_change_submissions=True,
-            )
-            team.members.add(self.request.user)
-            team.limit_events.add(event)
-
-        logdata = {}
-        for form in form_list:
-            logdata.update(form.cleaned_data)
-        with scope(event=event):
-            event.log_action(
-                'eventyay.event.create',
-                person=self.request.user,
-                data=logdata,
-                orga=True,
-            )
-
-            if steps['copy'] and steps['copy']['copy_from_event']:
-                event.copy_data_from(
-                    steps['copy']['copy_from_event'],
-                    skip_attributes=[
-                        'locale',
-                        'locales',
-                        'primary_color',
-                        'timezone',
-                        'email',
-                        'deadline',
-                    ],
-                )
-
-        return redirect(event.orga_urls.base + '?congratulations')
-
-
 class EventDelete(PermissionRequired, ActionConfirmMixin, TemplateView):
     permission_required = 'base.administrator_user'
     model = Event
     action_text = (
         _(
-            'ALL related data, such as proposals, and speaker profiles, and '
+            'ALL related data, such as proposals, speaker profiles, and '
             'uploads, will also be deleted and cannot be restored.'
         )
         + ' '
         + phrases.base.delete_warning
     )
+    template_name = 'orga/settings/delete_confirm.html'
 
     def get_object(self):
         return self.request.event
 
     def action_object_name(self):
-        return ngettext_lazy('Event', 'Events', 1) + f': {self.get_object().name}'
+        return _('Event') + f': {self.get_object().name}'
 
     @property
     def action_back_url(self):
         return self.get_object().orga_urls.settings
 
     def post(self, request, *args, **kwargs):
+        if request.POST.get('event_name_confirm') != str(self.get_object().name):
+            messages.error(self.request, _('The event name you entered was incorrect.'))
+            return redirect(self.request.path)
         self.get_object().shred(person=self.request.user)
-        return redirect(reverse('orga:event.list'))
+        messages.success(self.request, _('The event has been deleted.'))
+        return redirect(reverse('eventyay_common:dashboard'))
+
+
+class EventDeleteTalkData(PermissionRequired, ActionConfirmMixin, TemplateView):
+    permission_required = 'base.administrator_user'
+    model = Event
+    action_text = (
+        _(
+            'ALL related data, such as proposals, speaker profiles, and '
+            'uploads, will also be deleted and cannot be restored.'
+        )
+        + ' '
+        + phrases.base.delete_warning
+    )
+    template_name = 'orga/settings/delete_confirm.html'
+
+    def get_object(self):
+        return self.request.event
+
+    def action_object_name(self):
+        return _('Talk Data for') + f' {self.get_object().name}'
+
+    @property
+    def action_back_url(self):
+        return self.get_object().orga_urls.settings
+
+    def post(self, request, *args, **kwargs):
+        if request.POST.get('event_name_confirm') != str(self.get_object().name):
+            messages.error(self.request, _('The event name you entered was incorrect.'))
+            return redirect(self.request.path)
+        self.get_object().delete_talk_data()
+        self.get_object().log_action('eventyay.event.talk_data.deleted', person=self.request.user, orga=True)
+        messages.success(self.request, _('Talk data has been successfully deleted.'))
+        url = reverse(
+            'eventyay_common:event.update', 
+            kwargs={'organizer': self.request.organizer.slug, 'event': self.get_object().slug}
+        ) + '#danger-zone-tab'
+        return redirect(url)
 
 @method_decorator(csp_update({'SCRIPT_SRC': "'self' 'unsafe-eval'"}), name='dispatch')
 class WidgetSettings(EventSettingsPermission, FormView):
@@ -668,3 +458,222 @@ class WidgetSettings(EventSettingsPermission, FormView):
 
     def get_success_url(self) -> str:
         return self.request.event.orga_urls.widget_settings
+
+
+class TargetChoice(models.TextChoices):
+    SPEAKER = 'speaker', _('Speakers')
+    SCHEDULE = 'session', _('Schedule')
+
+    @classmethod
+    def import_target_items(cls):
+        return (
+            (
+                cls.SPEAKER,
+                {
+                    'filename': SpeakerImportProcessView.IMPORT_FILENAME,
+                    'process_url_name': f'orga:{SpeakerImportProcessView.import_process_url_name}',
+                },
+            ),
+            (
+                cls.SCHEDULE,
+                {
+                    'filename': SubmissionImportProcessView.IMPORT_FILENAME,
+                    'process_url_name': f'orga:{SubmissionImportProcessView.import_process_url_name}',
+                },
+            ),
+        )
+
+    @classmethod
+    def import_choices(cls):
+        return tuple((target, target.label) for target, _config in cls.import_target_items())
+
+    @classmethod
+    def import_targets(cls):
+        return {target: config for target, config in cls.import_target_items()}
+
+
+class ExportTargetChoice(models.TextChoices):
+    SPEAKER = 'speaker', _('Speakers')
+    SCHEDULE = 'session', _('Schedule')
+    REVIEW = 'review', _('Reviews')
+    FEEDBACK = 'feedback', _('Attendee feedback')
+
+    @classmethod
+    def export_choices(cls):
+        return tuple((target, target.label) for target in cls)
+
+
+class ImportExportSettings(EventSettingsPermission, TemplateView):
+    template_name = 'orga/settings/import_export.html'
+    import_choices = TargetChoice.import_choices()
+    import_targets = TargetChoice.import_targets()
+    export_choices = ExportTargetChoice.export_choices()
+
+    def get_context_data(self, **kwargs):
+        result = super().get_context_data(**kwargs)
+        result['event'] = self.request.event
+        result['tablist'] = {
+            'import': _('Import'),
+            'export': _('Export'),
+            'schedule_html_export': _('Schedule HTML export'),
+        }
+        result['active_tab'] = kwargs.get('active_tab')
+        result['import_choices'] = self.import_choices
+        result['export_choices'] = self.export_choices
+        result['import_target'] = kwargs.get('import_target') or self.request.GET.get('import_target') or TargetChoice.SPEAKER
+        result['export_target'] = kwargs.get('export_target') or self.request.GET.get('export_target') or ExportTargetChoice.SPEAKER
+        result['import_form'] = kwargs.get('import_form') or CSVImportForm()
+        result['speaker_export_form'] = kwargs.get('speaker_export_form') or SpeakerExportForm(
+            event=self.request.event,
+            prefix='speaker',
+        )
+        result['session_export_form'] = kwargs.get('session_export_form') or ScheduleExportForm(
+            event=self.request.event,
+            prefix='session',
+        )
+        result['review_export_form'] = kwargs.get('review_export_form') or ReviewExportForm(
+            event=self.request.event,
+            user=self.request.user,
+            prefix='review',
+        )
+        result['feedback_export_form'] = kwargs.get('feedback_export_form') or FeedbackExportForm(
+            event=self.request.event,
+            prefix='feedback',
+        )
+        result['schedule_html_export_form'] = kwargs.get('schedule_html_export_form') or ScheduleHtmlExportForm(
+            obj=self.request.event,
+        )
+        all_exporters = get_schedule_exporters(self.request)
+        result['speaker_exporters'] = [e for e in all_exporters if e.group == 'speaker']
+        result['session_exporters'] = [e for e in all_exporters if e.group != 'speaker']
+        return result
+
+    def post(self, request, *args, **kwargs):
+        action = request.POST.get('action')
+
+        # Support for legacy schedule export payloads without prefix
+        if not action and 'export_format' in request.POST:
+            mutable_post = request.POST.copy()
+            mutable_post['action'] = 'export'
+            mutable_post['export_target'] = TargetChoice.SCHEDULE.value
+            for key, value in request.POST.lists():
+                mutable_post.setlist(f'session-{key}', value)
+            request.POST = mutable_post
+            action = 'export'
+
+        if action == 'import':
+            return self.handle_import()
+        if action == 'export':
+            return self.handle_export()
+        if action == 'save_schedule_html_export':
+            return self.handle_save_schedule_html_export()
+        messages.error(request, _('Unknown action. Please try again.'))
+        return redirect(request.path)
+
+    def handle_import(self):
+        import_target = self.request.POST.get('import_target', TargetChoice.SPEAKER)
+        import_form = CSVImportForm(self.request.POST, self.request.FILES)
+
+        try:
+            target = TargetChoice(import_target)
+        except ValueError:
+            messages.error(self.request, _('Please choose whether to import speakers or schedule.'))
+            context = self.get_context_data(import_form=import_form, import_target=import_target)
+            return self.render_to_response(context, status=400)
+
+        if not import_form.is_valid():
+            context = self.get_context_data(import_form=import_form, import_target=target)
+            return self.render_to_response(context, status=400)
+
+        session = self.request.session
+        if not session.session_key:
+            session.save()
+        if not session.session_key:
+            messages.error(self.request, _('Could not establish a session for file upload. Please try again.'))
+            return redirect(f'{self.request.path}#tab-import')
+
+        target_config = self.import_targets[target]
+        import_filename = target_config['filename']
+        cached_file = CachedFile.objects.create(
+            expires=now() + timedelta(days=1),
+            date=now(),
+            filename=import_filename,
+            type='text/csv',
+            web_download=False,
+            session_key=session.session_key,
+        )
+        cached_file.file.save(import_filename, import_form.cleaned_data['file'])
+        process_url = reverse(
+            target_config['process_url_name'],
+            kwargs={'organizer': self.request.event.organizer.slug, 'event': self.request.event.slug, 'file': cached_file.id},
+        )
+        return redirect(process_url)
+
+    def handle_export(self):
+        export_target = self.request.POST.get('export_target', ExportTargetChoice.SPEAKER)
+
+        try:
+            target = ExportTargetChoice(export_target)
+        except ValueError:
+            messages.error(self.request, _('Please choose a valid export target.'))
+            context = self.get_context_data(export_target=ExportTargetChoice.SPEAKER, active_tab='export')
+            return self.render_to_response(context, status=400)
+
+        speaker_kwargs = {'event': self.request.event, 'prefix': 'speaker'}
+        session_kwargs = {'event': self.request.event, 'prefix': 'session'}
+        review_kwargs = {'event': self.request.event, 'user': self.request.user, 'prefix': 'review'}
+        feedback_kwargs = {'event': self.request.event, 'prefix': 'feedback'}
+
+        if target == ExportTargetChoice.SPEAKER:
+            speaker_kwargs['data'] = self.request.POST
+        elif target == ExportTargetChoice.SCHEDULE:
+            session_kwargs['data'] = self.request.POST
+        elif target == ExportTargetChoice.FEEDBACK:
+            feedback_kwargs['data'] = self.request.POST
+        else:  # ExportTargetChoice.REVIEW
+            review_kwargs['data'] = self.request.POST
+
+        speaker_export_form = SpeakerExportForm(**speaker_kwargs)
+        session_export_form = ScheduleExportForm(**session_kwargs)
+        review_export_form = ReviewExportForm(**review_kwargs)
+        feedback_export_form = FeedbackExportForm(**feedback_kwargs)
+
+        active_form = {
+            ExportTargetChoice.SPEAKER: speaker_export_form,
+            ExportTargetChoice.SCHEDULE: session_export_form,
+            ExportTargetChoice.REVIEW: review_export_form,
+            ExportTargetChoice.FEEDBACK: feedback_export_form,
+        }[target]
+
+        if not active_form.is_valid():
+            context = self.get_context_data(
+                export_target=target,
+                speaker_export_form=speaker_export_form,
+                session_export_form=session_export_form,
+                review_export_form=review_export_form,
+                feedback_export_form=feedback_export_form,
+                active_tab='export',
+            )
+            return self.render_to_response(context, status=400)
+
+        result = active_form.export_data()
+
+        if not result:
+            messages.warning(self.request, _('No data to be exported'))
+            return redirect(f'{self.request.path}?export_target={target.value}#tab-export')
+        return result
+
+    def handle_save_schedule_html_export(self):
+        form = ScheduleHtmlExportForm(self.request.POST, obj=self.request.event)
+        if form.is_valid():
+            form.save()
+            self.request.event.log_action(
+                'eventyay.event.update', person=self.request.user, orga=True
+            )
+            messages.success(self.request, phrases.base.saved)
+            return redirect(f'{self.request.path}#tab-schedule_html_export')
+        context = self.get_context_data(
+            schedule_html_export_form=form,
+            active_tab='schedule_html_export',
+        )
+        return self.render_to_response(context, status=400)

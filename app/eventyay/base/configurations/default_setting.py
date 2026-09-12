@@ -2,6 +2,7 @@ import json
 from collections import OrderedDict
 from datetime import datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 from django import forms
 from django.conf import settings
@@ -15,19 +16,19 @@ from django.utils.text import format_lazy
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import gettext_noop, pgettext, pgettext_lazy
 from i18nfield.forms import I18nFormField, I18nTextarea, I18nTextInput
-from eventyay.base.forms import I18nAutoExpandingTextarea
 from i18nfield.strings import LazyI18nString
 from rest_framework import serializers
 
 from eventyay.api.serializers.fields import (
     ListMultipleChoiceField,
     UploadedFileField,
+    UploadedFileNoNewURLField,
 )
 from eventyay.api.serializers.i18n import I18nField, I18nURLField
 from eventyay.base.configurations.lazy_i18n_string_list_base import (
     LazyI18nStringList,
 )
-from eventyay.base.forms import I18nURLFormField
+from eventyay.base.forms import I18nAutoExpandingTextarea, I18nURLFormField
 from eventyay.base.models.tax import TaxRule
 from eventyay.base.reldate import (
     RelativeDateField,
@@ -36,6 +37,7 @@ from eventyay.base.reldate import (
     SerializerRelativeDateField,
     SerializerRelativeDateTimeField,
 )
+from eventyay.consts import SizeKey
 from eventyay.control.forms import (
     ExtFileField,
     FontSelect,
@@ -52,12 +54,35 @@ def country_choice_kwargs():
 
 
 def primary_font_kwargs():
-    from eventyay.presale.style import get_fonts
+    from eventyay.presale.style import SYSTEM_FONT_CHOICES, get_fonts
 
-    choices = [('Open Sans', 'Open Sans')]
-    choices += [(a, {'title': a, 'data': v}) for a, v in get_fonts().items()]
+    choices = list(SYSTEM_FONT_CHOICES)
+    # Label must not be a plain dict/Mapping: Django mistakes it for an optgroup
+    choices += [(a, SimpleNamespace(title=a, data=v)) for a, v in get_fonts().items()]
     return {
         'choices': choices,
+    }
+
+
+def hex_color_field_config(label, default='', help_text=None, widget_class='colorpickerfield'):
+    validator = RegexValidator(
+        regex='^#[0-9a-fA-F]{6}$',
+        message=_('Please enter the hexadecimal code of a color, e.g. #990000.'),
+    )
+    form_kwargs = dict(
+        label=label,
+        validators=[validator],
+        widget=forms.TextInput(attrs={'class': widget_class}),
+    )
+    if help_text:
+        form_kwargs['help_text'] = help_text
+    return {
+        'default': default,
+        'type': str,
+        'form_class': forms.CharField,
+        'serializer_class': serializers.CharField,
+        'serializer_kwargs': dict(validators=[validator]),
+        'form_kwargs': form_kwargs,
     }
 
 
@@ -87,6 +112,10 @@ DEFAULT_SETTINGS = {
         ),
     },
     'system_question_order': {
+        'default': {},
+        'type': dict,
+    },
+    'system_question_product_overrides': {
         'default': {},
         'type': dict,
     },
@@ -162,6 +191,25 @@ DEFAULT_SETTINGS = {
             widget=forms.CheckboxInput(attrs={'data-checkbox-dependency': '#id_settings-attendee_company_asked'}),
         ),
     },
+    'attendee_job_title_asked': {
+        'default': 'False',
+        'type': bool,
+        'form_class': forms.BooleanField,
+        'serializer_class': serializers.BooleanField,
+        'form_kwargs': dict(
+            label=_('Ask for job title per ticket'),
+        ),
+    },
+    'attendee_job_title_required': {
+        'default': 'False',
+        'type': bool,
+        'form_class': forms.BooleanField,
+        'serializer_class': serializers.BooleanField,
+        'form_kwargs': dict(
+            label=_('Require job title per ticket'),
+            widget=forms.CheckboxInput(attrs={'data-checkbox-dependency': '#id_settings-attendee_job_title_asked'}),
+        ),
+    },
     'attendee_addresses_asked': {
         'default': 'False',
         'type': bool,
@@ -189,7 +237,9 @@ DEFAULT_SETTINGS = {
         'serializer_class': serializers.BooleanField,
         'form_kwargs': dict(
             label=_('E-mail'),
-            help_text=_('Ask for an email address per order. The order confirmation will be sent to this email address.'),
+            help_text=_(
+                'Ask for an email address per order. The order confirmation will be sent to this email address.'
+            ),
         ),
     },
     'order_email_required': {
@@ -468,7 +518,7 @@ DEFAULT_SETTINGS = {
         ),
     },
     'redirect_to_checkout_directly': {
-        'default': 'False',
+        'default': 'True',
         'type': bool,
         'serializer_class': serializers.BooleanField,
         'form_class': forms.BooleanField,
@@ -874,9 +924,9 @@ DEFAULT_SETTINGS = {
             choices=settings.LANGUAGES,
             widget=MultipleLanguagesWidget,
             required=True,
-            label=_('Active languages'),
+            label=_('Event languages'),
             help_text=_(
-                "Users will be able to use eventyay in these languages, and you will be able to provide all texts in "
+                'Users will be able to use eventyay in these languages, and you will be able to provide all texts in '
                 "these languages. If you don't provide a text in the language a user selects, it will be shown in your "
                 "event's default language instead."
             ),
@@ -929,19 +979,6 @@ DEFAULT_SETTINGS = {
                 'is therefore mostly relevant for languages used in different regions globally (like English).'
             ),
             **country_choice_kwargs(),
-        ),
-    },
-    'show_dates_on_frontpage': {
-        'default': 'True',
-        'type': bool,
-        'serializer_class': serializers.BooleanField,
-        'form_class': forms.BooleanField,
-        'form_kwargs': dict(
-            label=_('Show event times and dates on the ticket shop'),
-            help_text=_(
-                "If disabled, no date or time will be shown on the ticket shop's front page. This settings "
-                'does however not affect the display in other locations.'
-            ),
         ),
     },
     'show_date_to': {
@@ -1103,7 +1140,7 @@ DEFAULT_SETTINGS = {
         ),
     },
     'ticket_download': {
-        'default': 'False',
+        'default': 'True',
         'type': bool,
         'serializer_class': serializers.BooleanField,
         'form_class': forms.BooleanField,
@@ -1111,6 +1148,12 @@ DEFAULT_SETTINGS = {
             label=_('Allow users to download tickets'),
             help_text=_('If this is off, nobody can download a ticket.'),
         ),
+    },
+    # PDF tickets are a core output (not an optional plugin). Default enabled so
+    # existing events get download/{download_tickets_pdf} without recreating data.
+    'ticketoutput_pdf__enabled': {
+        'default': 'True',
+        'type': bool,
     },
     'ticket_download_date': {
         'default': None,
@@ -1205,7 +1248,7 @@ DEFAULT_SETTINGS = {
             help_text=_(
                 'If this option is turned on, users must be logged in before completing an order. '
                 'When a user clicks "Checkout" without being logged in, they will be redirected to the login page. '
-                "The 'Continue as a Guest' option will not be available for attendees."
+                'The "Continue as a Guest" option will not be available for attendees in this event.'
             ),
         ),
     },
@@ -1271,13 +1314,13 @@ DEFAULT_SETTINGS = {
             )
         ),
         'form_kwargs': dict(
-            label=_("Allow customers to modify their information"),
+            label=_('Allow customers to modify their information'),
             widget=forms.RadioSelect,
             choices=(
                 ('no', _('No modifications after order was submitted')),
                 ('order', _('Only the person who ordered can make changes')),
                 ('attendee', _('Both the attendee and the person who ordered can make changes')),
-            )
+            ),
         ),
     },
     'allow_modifications_after_checkin': {
@@ -1287,8 +1330,10 @@ DEFAULT_SETTINGS = {
         'serializer_class': serializers.BooleanField,
         'form_kwargs': dict(
             label=_('Allow attendees to modify their information after they checked in.'),
-            help_text=_('By default, no more modifications are possible for an order as soon as '
-                   'one of the tickets in the order has been checked in.')
+            help_text=_(
+                'By default, no more modifications are possible for an order as soon as '
+                'one of the tickets in the order has been checked in.'
+            ),
         ),
     },
     'last_order_modification_date': {
@@ -1303,15 +1348,6 @@ DEFAULT_SETTINGS = {
                 'answers to questions. If you use the event series feature and an order contains tickets for '
                 'multiple event dates, the earliest date will be used.'
             ),
-        ),
-    },
-    'change_allow_user_variation': {
-        'default': 'False',
-        'type': bool,
-        'form_class': forms.BooleanField,
-        'serializer_class': serializers.BooleanField,
-        'form_kwargs': dict(
-            label=_('Customers can change the variation of the products they purchased'),
         ),
     },
     'change_allow_user_price': {
@@ -1426,9 +1462,10 @@ DEFAULT_SETTINGS = {
         'type': Decimal,
         'form_class': forms.DecimalField,
         'serializer_class': serializers.DecimalField,
-        'serializer_kwargs': dict(max_digits=10, decimal_places=2),
+        'serializer_kwargs': dict(max_digits=10, decimal_places=2, validators=[MinValueValidator(0), MaxValueValidator(100)]),
         'form_kwargs': dict(
             label=_('Keep a percentual cancellation fee'),
+            validators=[MinValueValidator(0), MaxValueValidator(100)],
         ),
     },
     'cancel_allow_user_paid_adjust_fees': {
@@ -1528,14 +1565,28 @@ DEFAULT_SETTINGS = {
             label=_('Do not allow cancellations after'),
         ),
     },
+    'contact_form_enabled': {
+        'default': False,
+        'type': bool,
+        'form_class': forms.BooleanField,
+        'serializer_class': serializers.BooleanField,
+        'form_kwargs': dict(
+            label=_('Contact form'),
+            required=False,
+        ),
+    },
     'contact_mail': {
         'default': None,
         'type': str,
         'serializer_class': serializers.EmailField,
         'form_class': forms.EmailField,
         'form_kwargs': dict(
-            label=_('Contact address'),
-            help_text=_("We'll show this publicly to allow attendees to contact you."),
+            label=_('Organizer email address'),
+            help_text=_(
+                'You need to provide an email address so attendees can reach you through a contact form. '
+                'Messages will be sent to this address. Your email address remains hidden from attendees.'
+            ),
+            required=False,
         ),
     },
     'imprint_url': {
@@ -1595,13 +1646,23 @@ DEFAULT_SETTINGS = {
     },
     'mail_bcc': {'default': None, 'type': str},
     'mail_from': {
-        'default': settings.MAIL_FROM,
+        'default': settings.DEFAULT_FROM_EMAIL,
         'type': str,
         'form_class': forms.EmailField,
         'serializer_class': serializers.EmailField,
         'form_kwargs': dict(
             label=_('Sender address'),
-            help_text=_('Sender address for outgoing emails'),
+            help_text=_('Sender address for outgoing emails. When using a custom sender, replies go to this address unless a Reply-To is set.'),
+        ),
+    },
+    'mail_reply_to': {
+        'default': None,
+        'type': str,
+        'form_class': forms.EmailField,
+        'serializer_class': serializers.EmailField,
+        'form_kwargs': dict(
+            label=_('Reply-to address'),
+            help_text=_('User replies will be sent to this address.'),
         ),
     },
     'mail_from_name': {
@@ -1693,6 +1754,47 @@ Your {event} team"""
         ),
     },
     'mail_send_order_free_attendee': {'type': bool, 'default': 'False'},
+    'mail_text_meetup_registration_attendee': {
+        'type': LazyI18nString,
+        'default': LazyI18nString.from_gettext(
+            gettext_noop(
+                """Hello {attendee_name},
+
+thank you for registering for {event}.
+
+You are successfully registered for the meetup. Here are the details of your registration:
+Event: {event}
+Organizer: {organizer}
+
+You can view the details and status of your registration here:
+{event_url}
+
+Best regards,
+Your {event} team"""
+            )
+        ),
+    },
+    'mail_text_meetup_registration': {
+        'type': LazyI18nString,
+        'default': LazyI18nString.from_gettext(
+            gettext_noop(
+                """Hello,
+
+thank you for registering for {event}.
+
+You are successfully registered for the meetup. Here are the details of your registration:
+Event: {event}
+Organizer: {organizer}
+
+You can view the details and status of your registration at:
+{event_url}
+
+Best regards,
+Your {event} team"""
+            )
+        ),
+    },
+    'mail_send_meetup_registration_attendee': {'type': bool, 'default': 'False'},
     'mail_text_order_placed_require_approval': {
         'type': LazyI18nString,
         'default': LazyI18nString.from_gettext(
@@ -1971,128 +2073,48 @@ Your {event} team"""
     'smtp_password': {'default': '', 'type': str},
     'smtp_use_tls': {'default': 'True', 'type': bool},
     'smtp_use_ssl': {'default': 'False', 'type': bool},
-    'primary_color': {
-        'default': settings.EVENTYAY_PRIMARY_COLOR,
-        'type': str,
-        'form_class': forms.CharField,
-        'serializer_class': serializers.CharField,
-        'serializer_kwargs': dict(
-            validators=[
-                RegexValidator(
-                    regex='^#[0-9a-fA-F]{6}$',
-                    message=_('Please enter the hexadecimal code of a color, e.g. #990000.'),
-                ),
-            ],
-        ),
-        'form_kwargs': dict(
-            label=_('Primary color'),
-            validators=[
-                RegexValidator(
-                    regex='^#[0-9a-fA-F]{6}$',
-                    message=_('Please enter the hexadecimal code of a color, e.g. #990000.'),
-                ),
-            ],
-            widget=forms.TextInput(attrs={'class': 'colorpickerfield'}),
-        ),
-    },
-    'theme_color_success': {
-        'default': '#50a167',
-        'type': str,
-        'form_class': forms.CharField,
-        'serializer_class': serializers.CharField,
-        'serializer_kwargs': dict(
-            validators=[
-                RegexValidator(
-                    regex='^#[0-9a-fA-F]{6}$',
-                    message=_('Please enter the hexadecimal code of a color, e.g. #990000.'),
-                ),
-            ],
-        ),
-        'form_kwargs': dict(
-            label=_('Accent color for success'),
-            help_text=_('We strongly suggest to use a shade of green.'),
-            validators=[
-                RegexValidator(
-                    regex='^#[0-9a-fA-F]{6}$',
-                    message=_('Please enter the hexadecimal code of a color, e.g. #990000.'),
-                ),
-            ],
-            widget=forms.TextInput(attrs={'class': 'colorpickerfield'}),
-        ),
-    },
-    'theme_color_danger': {
-        'default': '#c44f4f',
-        'type': str,
-        'form_class': forms.CharField,
-        'serializer_class': serializers.CharField,
-        'serializer_kwargs': dict(
-            validators=[
-                RegexValidator(
-                    regex='^#[0-9a-fA-F]{6}$',
-                    message=_('Please enter the hexadecimal code of a color, e.g. #990000.'),
-                ),
-            ],
-        ),
-        'form_kwargs': dict(
-            label=_('Accent color for errors'),
-            help_text=_('We strongly suggest to use a shade of red.'),
-            validators=[
-                RegexValidator(
-                    regex='^#[0-9a-fA-F]{6}$',
-                    message=_('Please enter the hexadecimal code of a color, e.g. #990000.'),
-                ),
-            ],
-            widget=forms.TextInput(attrs={'class': 'colorpickerfield'}),
-        ),
-    },
-    'theme_color_background': {
-        'default': '#f5f5f5',
-        'type': str,
-        'form_class': forms.CharField,
-        'serializer_class': serializers.CharField,
-        'serializer_kwargs': dict(
-            validators=[
-                RegexValidator(
-                    regex='^#[0-9a-fA-F]{6}$',
-                    message=_('Please enter the hexadecimal code of a color, e.g. #990000.'),
-                ),
-            ],
-        ),
-        'form_kwargs': dict(
-            label=_('Page background color'),
-            validators=[
-                RegexValidator(
-                    regex='^#[0-9a-fA-F]{6}$',
-                    message=_('Please enter the hexadecimal code of a color, e.g. #990000.'),
-                ),
-            ],
-            widget=forms.TextInput(attrs={'class': 'colorpickerfield no-contrast'}),
-        ),
-    },
-    'hover_button_color': {
-        'default': '#2185d0',
-        'type': str,
-        'form_class': forms.CharField,
-        'serializer_class': serializers.CharField,
-        'serializer_kwargs': dict(
-            validators=[
-                RegexValidator(
-                    regex='^#[0-9a-fA-F]{6}$',
-                    message=_('Please enter the hexadecimal code of a color, e.g. #990000.'),
-                ),
-            ],
-        ),
-        'form_kwargs': dict(
-            label=_('Scroll-over color'),
-            validators=[
-                RegexValidator(
-                    regex='^#[0-9a-fA-F]{6}$',
-                    message=_('Please enter the hexadecimal code of a color, e.g. #990000.'),
-                ),
-            ],
-            widget=forms.TextInput(attrs={'class': 'colorpickerfield no-contrast'}),
-        ),
-    },
+    'primary_color': hex_color_field_config(
+        _('Primary color'),
+        default=settings.EVENTYAY_PRIMARY_COLOR,
+    ),
+    'header_background_color': hex_color_field_config(_('Header background color')),
+    'header_text_color': hex_color_field_config(_('Header text color')),
+    'navigation_text_color': hex_color_field_config(_('Menu text color')),
+    'menu_text_scroll_over_color': hex_color_field_config(_('Menu text hover color')),
+    'theme_color_success': hex_color_field_config(
+        _('Accent color for success'),
+        default='#50a167',
+        help_text=_('We strongly suggest to use a shade of green.'),
+    ),
+    'theme_color_danger': hex_color_field_config(
+        _('Accent color for errors'),
+        default='#c44f4f',
+        help_text=_('We strongly suggest to use a shade of red.'),
+    ),
+    'theme_color_background': hex_color_field_config(
+        _('Page background color'),
+        default='#f5f5f5',
+        widget_class='colorpickerfield no-contrast',
+    ),
+    'hover_button_color': hex_color_field_config(
+        _('Scroll-over color'),
+        default='#2185d0',
+        widget_class='colorpickerfield no-contrast',
+    ),
+    'video_navigation_background_color': hex_color_field_config(
+        _('Video navigation background color'),
+        default='',
+        widget_class='colorpickerfield no-contrast',
+    ),
+    'video_sidebar_text_color': hex_color_field_config(
+        _('Video sidebar text color'),
+        default='#000000',
+    ),
+    'video_sidebar_hover_color': hex_color_field_config(
+        _('Video sidebar scroll-over color'),
+        default='#2185d0',
+        widget_class='colorpickerfield no-contrast',
+    ),
     'theme_round_borders': {
         'default': 'True',
         'type': bool,
@@ -2125,18 +2147,40 @@ Your {event} team"""
         'form_class': ExtFileField,
         'form_kwargs': dict(
             label=_('Header image'),
-            ext_whitelist=('.png', '.jpg', '.gif', '.jpeg'),
-            max_size=10 * 1024 * 1024,
+            ext_whitelist=('.png', '.jpg', '.gif', '.jpeg', '.webp'),
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
             help_text=_(
-                'This image appears at the top of all event pages, replacing the default color or pattern. '
-                'It is center-aligned and not stretched, ensuring the middle part remains visible on smaller screens. '
-                'We recommend an image at least 1170 px wide and 120 px in height for best results.'
+                'Upload a banner image shown at the top of all event pages. '
+                'The banner is cropped to a 320 px tall strip by default. Keep important content (title, logo, key visual) in the center of the image — the sides are cropped on narrow screens. '
+                'Recommended size: 1920 × 640 px (the center 1920 × 320 px will always be visible). Images will be automatically optimized to max 1920 px wide on save.'
+            ),
+        ),
+        'serializer_class': UploadedFileNoNewURLField,
+        'serializer_kwargs': dict(
+            allowed_types=['image/png', 'image/jpeg', 'image/gif', 'image/webp'],
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
+        ),
+    },
+    'event_preview_image': {
+        'default': None,
+        'type': File,
+        'form_class': ExtFileField,
+        'form_kwargs': dict(
+            label=_('Event preview image'),
+            ext_whitelist=('.png', '.jpg', '.gif', '.jpeg', '.webp'),
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
+            help_text=_(
+                'This image is used specifically for the platform start page event cards and other event listings. '
+                'If unset, the platform falls back to displaying the event header image, then the event logo, '
+                'and finally a default calendar placeholder icon. '
+                'It should be optimized for a rectangular card. '
+                'We recommend an aspect ratio of 16:9, and at least 800 x 450 px for best display results.'
             ),
         ),
         'serializer_class': UploadedFileField,
         'serializer_kwargs': dict(
-            allowed_types=['image/png', 'image/jpeg', 'image/gif'],
-            max_size=10 * 1024 * 1024,
+            allowed_types=['image/png', 'image/jpeg', 'image/gif', 'image/webp'],
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
         ),
     },
     'event_logo_image': {
@@ -2145,18 +2189,18 @@ Your {event} team"""
         'form_class': ExtFileField,
         'form_kwargs': dict(
             label=_('Logo'),
-            ext_whitelist=('.png', '.jpg', '.gif', '.jpeg', '.svg'),
-            max_size=10 * 1024 * 1024,
+            ext_whitelist=('.png', '.jpg', '.gif', '.jpeg', '.svg', '.webp'),
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
             help_text=_(
-                'When you upload a logo, the event name and date will not appear in the header. '
-                'The logo scales to 140 px in height while maintaining aspect ratio. '
-                'We recommend not using small details as it will be resized on smaller screens.'
+                'Upload your event logo. '
+                'The logo is displayed at up to 160 px tall (max-height), width proportional. We recommend a minimum of 320 px in height for crisp display on retina screens. '
+                'The logo will be automatically optimized on save (max 1000 px wide), except for SVG and animated images which remain unmodified.'
             ),
         ),
-        'serializer_class': UploadedFileField,
+        'serializer_class': UploadedFileNoNewURLField,
         'serializer_kwargs': dict(
-            allowed_types=['image/png', 'image/jpeg', 'image/gif', 'image/svg+xml'],
-            max_size=10 * 1024 * 1024,
+            allowed_types=['image/png', 'image/jpeg', 'image/gif', 'image/svg+xml', 'image/webp'],
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
         ),
     },
     'logo_image_large': {
@@ -2184,22 +2228,43 @@ Your {event} team"""
         'type': File,
         'form_class': ExtFileField,
         'form_kwargs': dict(
-            label=_('Header image'),
-            ext_whitelist=('.png', '.jpg', '.gif', '.jpeg'),
-            max_size=10 * 1024 * 1024,
+            label=_('Logo'),
+            ext_whitelist=('.png', '.jpg', '.gif', '.jpeg', '.svg', '.webp'),
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
             help_text=_(
-                'This image appears at the top of all organizer pages, replacing the default color or pattern. '
-                'It is center-aligned and not stretched, ensuring the middle part remains visible on smaller screens. '
-                'We recommend an image 1140 px wide and 120 px in height (can be increased with the setting below).'
+                'Upload your organizer logo. The logo is displayed at up to 160 px tall (max-height), width proportional. '
+                'We recommend a minimum of 320 px in height for crisp display on retina screens. '
+                'The logo will be automatically optimized on save (max 1000 px wide), except for SVG and animated images which remain unmodified.'
             ),
         ),
         'serializer_class': UploadedFileField,
         'serializer_kwargs': dict(
-            allowed_types=['image/png', 'image/jpeg', 'image/gif'],
-            max_size=10 * 1024 * 1024,
+            allowed_types=['image/png', 'image/jpeg', 'image/gif', 'image/svg+xml', 'image/webp'],
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
         ),
     },
-    'organizer_logo_image_large': {
+
+    'organizer_header_image': {
+        'default': None,
+        'type': File,
+        'form_class': ExtFileField,
+        'form_kwargs': dict(
+            label=_('Header image'),
+            ext_whitelist=('.png', '.jpg', '.gif', '.jpeg', '.webp'),
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
+            help_text=_(
+                'This image appears at the top of all organizer pages, replacing the default color or pattern. '
+                'We recommend an image 1920 px wide and 640 px in height (the center 1920 × 320 px will always be visible). '
+                'Images will be automatically optimized to max 1920 px wide on save.'
+            ),
+        ),
+        'serializer_class': UploadedFileField,
+        'serializer_kwargs': dict(
+            allowed_types=['image/png', 'image/jpeg', 'image/gif', 'image/webp'],
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
+        ),
+    },
+    'organizer_header_image_large': {
         'default': 'False',
         'type': bool,
         'form_class': forms.BooleanField,
@@ -2216,7 +2281,7 @@ Your {event} team"""
         'form_kwargs': dict(
             label=_('Social media image'),
             ext_whitelist=('.png', '.jpg', '.gif', '.jpeg'),
-            max_size=10 * 1024 * 1024,
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
             help_text=_(
                 'This image is used as a preview when sharing your event link on social media. '
                 'Facebook recommends a size of 1200 × 630 px, but some platforms such as WhatsApp and Reddit '
@@ -2227,7 +2292,7 @@ Your {event} team"""
         'serializer_class': UploadedFileField,
         'serializer_kwargs': dict(
             allowed_types=['image/png', 'image/jpeg', 'image/gif'],
-            max_size=10 * 1024 * 1024,
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
         ),
     },
     'invoice_logo_image': {
@@ -2238,13 +2303,13 @@ Your {event} team"""
             label=_('Logo image'),
             ext_whitelist=('.png', '.jpg', '.gif', '.jpeg'),
             required=False,
-            max_size=10 * 1024 * 1024,
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
             help_text=_('We will show your logo with a maximal height and width of 2.5 cm.'),
         ),
         'serializer_class': UploadedFileField,
         'serializer_kwargs': dict(
             allowed_types=['image/png', 'image/jpeg', 'image/gif'],
-            max_size=10 * 1024 * 1024,
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
         ),
     },
     'frontpage_text': {
@@ -2324,8 +2389,7 @@ Your {event} team"""
             widget_kwargs={'attrs': {'rows': '2'}},
             help_text=_(
                 'This text will be shown above the questions asked for every admission product. You can use it e.g. '
-                'to explain'
-                'why you need information from them.'
+                'to explain why you need information from them.'
             ),
         ),
     },
@@ -2373,6 +2437,8 @@ Your {event} team"""
         ),
     },
     'order_import_settings': {'default': '{}', 'type': dict},
+    'speaker_import_settings': {'default': '{}', 'type': dict},
+    'submission_import_settings': {'default': '{}', 'type': dict},
     'organizer_info_text': {
         'default': '',
         'type': LazyI18nString,
@@ -2409,11 +2475,14 @@ Your {event} team"""
     'update_check_last': {'default': None, 'type': datetime},
     'update_check_id': {'default': None, 'type': str},
     'banner_message': {'default': '', 'type': LazyI18nString},
+    'banner_message_enabled': {'default': 'True', 'type': bool},
     'banner_message_detail': {'default': '', 'type': LazyI18nString},
+    'page_locales': {'default': ['en'], 'type': list},
     'opencagedata_apikey': {'default': None, 'type': str},
     'mapquest_apikey': {'default': None, 'type': str},
-    'leaflet_tiles': {'default': None, 'type': str},
-    'leaflet_tiles_attribution': {'default': None, 'type': str},
+    'nominatim_geocoding_enabled': {'default': False, 'type': bool},
+    'leaflet_tiles': {'default': 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', 'type': str},
+    'leaflet_tiles_attribution': {'default': '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors', 'type': str},
     'frontpage_subevent_ordering': {
         'default': 'date_ascending',
         'type': str,
@@ -2458,6 +2527,30 @@ Your {event} team"""
             help_text=_('This will be displayed on the organizer homepage.'),
         ),
     },
+    'community_follow_enabled': {
+        'default': 'True',
+        'type': bool,
+        'form_class': forms.BooleanField,
+        'serializer_class': serializers.BooleanField,
+        'form_kwargs': dict(
+            label=_('Allow users to follow this organizer'),
+            help_text=_(
+                'When enabled, logged-in users can follow your organizer profile and receive '
+                'notifications when you publish new public events.'
+            ),
+        ),
+    },
+    'community_show_follower_count': {
+        'default': 'True',
+        'type': bool,
+        'form_class': forms.BooleanField,
+        'serializer_class': serializers.BooleanField,
+        'form_kwargs': dict(
+            label=_('Show follower count publicly'),
+            help_text=_('Display the number of followers on the public organizer profile page.'),
+        ),
+    },
+
     'name_scheme': {'default': 'full', 'type': str},
     'giftcard_length': {
         'default': settings.ENTROPY['giftcard_secret'],
@@ -2470,6 +2563,7 @@ Your {event} team"""
                 'The system generates by default {}-character long gift card codes. However, if a different length '
                 'is required, it can be set here.'.format(settings.ENTROPY['giftcard_secret'])
             ),
+            min_value=4,
         ),
     },
     'giftcard_expiry_years': {
@@ -2481,9 +2575,12 @@ Your {event} team"""
             label=_('Validity of gift card codes in years'),
             help_text=_(
                 'If you set a number here, gift cards will by default expire at the end of the year after this '
-                'many years. If you keep it empty, gift cards do not have an explicit expiry date.'
+                'many years. For example, 1 means expiry at the end of next year, 2 means end of the year after, etc. '
+                'If you keep it empty, gift cards do not have an explicit expiry date.'
             ),
+            min_value=1,
         ),
+        'serializer_kwargs': dict(validators=[MinValueValidator(0)]),
     },
     'privacy_policy': {
         'default': None,
@@ -2516,25 +2613,245 @@ Your {event} team"""
     'seating_minimal_distance': {'default': '0', 'type': float},
     'seating_allow_blocked_seats_for_channel': {'default': [], 'type': list},
     'seating_distance_within_row': {'default': 'False', 'type': bool},
-    'checkout_show_copy_answers_button': {
-        'default': 'True',
-        'type': bool,
-        'form_class': forms.BooleanField,
-        'serializer_class': serializers.BooleanField,
+    'startpage_header_image': {
+        'default': None,
+        'type': File,
+        'form_class': ExtFileField,
         'form_kwargs': dict(
-            label=_('Show button to copy user input from other products'),
+            label=_('Start page header background image'),
+            ext_whitelist=('.png', '.jpg', '.gif', '.jpeg'),
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
+            help_text=_('Displayed as the background image on the public start page.'),
         ),
+        'serializer_class': UploadedFileField,
+        'serializer_kwargs': dict(
+            allowed_types=['image/png', 'image/jpeg', 'image/gif'],
+            max_size=settings.MAX_SIZE_CONFIG[SizeKey.UPLOAD_SIZE_IMAGE],
+        ),
+    },
+    'startpage_header_text': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(
+            label=_('Start page header text'),
+            widget=I18nTextInput,
+            help_text=_('Short text displayed on the public start page banner.'),
+        ),
+    },
+    'startpage_show_hero': {
+        'default': 'False',
+        'type': bool,
+    },
+    'startpage_hero_title': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(
+            label=_('Hero Title'),
+            widget=I18nTextInput,
+            help_text=_('e.g. {sample}').format(sample='Eventyay – Open Source Event Management Platform'),
+        ),
+    },
+    'startpage_hero_text': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(
+            label=_('Hero Text'),
+            widget=I18nTextarea,
+            help_text=_('e.g. {sample}').format(sample='The comprehensive platform for all your event needs. Ticketing, Call for Speakers, Scheduling, Check-in, and more.'),
+        ),
+    },
+    'startpage_show_features': {
+        'default': 'False',
+        'type': bool,
+    },
+    'startpage_feature_1_title': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(label=_('Feature 1 Title'), widget=I18nTextInput),
+    },
+    'startpage_feature_1_text': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(label=_('Feature 1 Text'), widget=I18nTextarea),
+    },
+    'startpage_feature_2_title': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(label=_('Feature 2 Title'), widget=I18nTextInput),
+    },
+    'startpage_feature_2_text': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(label=_('Feature 2 Text'), widget=I18nTextarea),
+    },
+    'startpage_feature_3_title': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(label=_('Feature 3 Title'), widget=I18nTextInput),
+    },
+    'startpage_feature_3_text': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(label=_('Feature 3 Text'), widget=I18nTextarea),
+    },
+    'startpage_feature_4_title': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(label=_('Feature 4 Title'), widget=I18nTextInput),
+    },
+    'startpage_feature_4_text': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(label=_('Feature 4 Text'), widget=I18nTextarea),
+    },
+    'menu_label_tickets': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(
+            label=_('Tickets'),
+            widget=I18nTextInput,
+            help_text=_(
+                'Custom label for the "Tickets" menu item. Leave empty to use the default label or '
+                'locale-specific translation.'
+            ),
+            widget_kwargs={'attrs': {'placeholder': _('Register')}},
+            required=False,
+        ),
+    },
+    'menu_label_join_video': {
+        'default': '',
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(
+            label=_('Join Live Event'),
+            widget=I18nTextInput,
+            help_text=_(
+                'Custom label for the "Join online video" menu item. Leave empty to use the default label or '
+                'locale-specific translation.'
+            ),
+            widget_kwargs={'attrs': {'placeholder': _('Live Video')}},
+            required=False,
+        ),
+    },
+    'seo_homepage_title': {
+        'default': '',
+        'type': str,
+        'form_class': forms.CharField,
+        'form_kwargs': dict(
+            label=_('Homepage title'),
+            help_text=_('e.g. {sample}').format(sample='Eventyay – Open Source Event Management Platform'),
+            required=False,
+        ),
+    },
+    'seo_homepage_description': {
+        'default': '',
+        'type': str,
+        'form_class': forms.CharField,
+        'form_kwargs': dict(
+            label=_('Homepage description'),
+            help_text=_('e.g. {sample}').format(sample='The comprehensive platform for all your event needs.'),
+            widget=forms.Textarea(attrs={'rows': 2}),
+            required=False,
+        ),
+    },
+    'seo_og_title': {
+        'default': '',
+        'type': str,
+        'form_class': forms.CharField,
+        'form_kwargs': dict(
+            label=_('Open Graph title'),
+            help_text=_('e.g. {sample}').format(sample='Eventyay - Social Share Title'),
+            required=False,
+        ),
+    },
+    'seo_og_description': {
+        'default': '',
+        'type': str,
+        'form_class': forms.CharField,
+        'form_kwargs': dict(
+            label=_('Open Graph description'),
+            help_text=_('e.g. {sample}').format(sample='Description used when sharing on Facebook/LinkedIn.'),
+            widget=forms.Textarea(attrs={'rows': 2}),
+            required=False,
+        ),
+    },
+    'seo_twitter_title': {
+        'default': '',
+        'type': str,
+        'form_class': forms.CharField,
+        'form_kwargs': dict(
+            label=_('Twitter title'),
+            help_text=_('e.g. {sample}').format(sample='Eventyay - Twitter Title'),
+            required=False,
+        ),
+    },
+    'seo_twitter_description': {
+        'default': '',
+        'type': str,
+        'form_class': forms.CharField,
+        'form_kwargs': dict(
+            label=_('Twitter description'),
+            help_text=_('e.g. {sample}').format(sample='Description used when sharing on Twitter.'),
+            widget=forms.Textarea(attrs={'rows': 2}),
+            required=False,
+        ),
+    },
+    'seo_fallback_text': {
+        'default': '',
+        'type': str,
+        'form_class': forms.CharField,
+        'form_kwargs': dict(
+            label=_('Fallback SEO text'),
+            help_text=_('e.g. {sample}').format(sample='General fallback text for social sharing.'),
+            required=False,
+        ),
+    },
+    'seo_social_image': {
+        'default': None,
+        'type': File,
     },
 }
 
 CSS_SETTINGS = {
     'primary_color',
+    'header_background_color',
+    'header_text_color',
+    'navigation_text_color',
+    'menu_text_scroll_over_color',
     'theme_color_success',
     'theme_color_danger',
     'primary_font',
     'theme_color_background',
     'theme_round_borders',
     'hover_button_color',
+    'video_navigation_background_color',
+    'video_sidebar_text_color',
+    'video_sidebar_hover_color',
 }
 
 TITLE_GROUP = OrderedDict(
@@ -2740,7 +3057,7 @@ NAME_SCHEMES = OrderedDict(
                 ),
                 'concatenation': lambda d: (
                     str(d.get('family_name', ''))
-                    + str((', ' if d.get('family_name') and d.get('given_name') else ''))
+                    + str(', ' if d.get('family_name') and d.get('given_name') else '')
                     + str(d.get('given_name', ''))
                 ),
                 'sample': {
@@ -2843,7 +3160,7 @@ NAME_SCHEMES = OrderedDict(
                 ),
                 'concatenation': lambda d: (
                     ' '.join(str(p) for p in (d.get(key, '') for key in ['title', 'given_name', 'family_name']) if p)
-                    + str((', ' if d.get('degree') else ''))
+                    + str(', ' if d.get('degree') else '')
                     + str(d.get('degree', ''))
                 ),
                 'sample': {

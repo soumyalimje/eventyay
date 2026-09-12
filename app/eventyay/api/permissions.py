@@ -10,14 +10,6 @@ MODEL_PERMISSION_MAP = {
     "destroy": "delete",
 }
 
-MODEL_PERMISSION_MAP = {
-    "list": "list",
-    "retrieve": "view",
-    "update": "update",
-    "partial_update": "update",
-    "destroy": "delete",
-}
-
 
 class ApiPermission(BasePermission):
 
@@ -44,14 +36,11 @@ class ApiPermission(BasePermission):
                 if event not in request.auth.events.all():
                     return False
                 if is_only_reviewer(request.user, request.event):
-                    # Reviewers can only access the API if there is an active review
-                    # phase AND no anonymisation is active, as otherwise, we can’t fully
-                    # guarantee that we’d accidentally expose speaker names or other
-                    # non-anonymised information through ?expand= lookups.
-                    if (
-                        not event.active_review_phase
-                        or not event.active_review_phase.can_see_speaker_names
-                    ):
+                    if not event.active_review_phase:
+                        return False
+                    # Block API when the review phase anonymises proposals globally.
+                    # Team-level force_hide is handled in serializers instead.
+                    if not event.active_review_phase.can_see_speaker_names:
                         return False
             endpoint = getattr(view, "endpoint", None)
             if not request.auth.has_endpoint_permission(endpoint, view.action):
@@ -80,12 +69,12 @@ class PluginPermission(ApiPermission):  # pragma: no cover
     """
 
     def has_permission(self, request, view):
-        return self._has_permission(view, request)
+        return self._has_permission(view, None, request)
 
     def has_object_permission(self, request, view, obj):
-        return self._has_permission(view, request)
+        return self._has_permission(view, obj, request)
 
-    def _has_permission(self, view, request):
+    def _has_permission(self, view, obj, request):
         event = getattr(request, "event", None)
         if not event:
             # Only events can have plugins

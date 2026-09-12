@@ -2,6 +2,7 @@
 {% load i18n %}
 {% load bootstrap3 %}
 {% load rich_text %}
+{% load presale_locale %}
 {% block title %}{% trans "Modify order" %}{% endblock %}
 {% block content %}
     <h2>
@@ -40,7 +41,7 @@
                         <div class="panel-body">
                             {% if event.settings.invoice_address_explanation_text %}
                                 <div>
-                                    {{ event.settings.invoice_address_explanation_text|rich_text }}
+                                    {{ event.settings.invoice_address_explanation_text|event_localize|rich_text }}
                                 </div>
                             {% endif %}
                             {% bootstrap_form invoice_form layout="horizontal" %}
@@ -52,23 +53,48 @@
                 <details class="panel panel-default" open>
                     <summary class="panel-heading">
                         <h4 class="panel-title">
-                            <strong>{{ pos.product.name }}{% if pos.variation %}
-                                – {{ pos.variation }}
+                            <strong>{{ pos.product.name|event_localize }}{% if pos.variation %}
+                                – {{ pos.variation.value|event_localize }}
                             {% endif %}</strong>
                             <i class="fa fa-angle-down collapse-indicator" aria-hidden="true"></i>
                         </h4>
                     </summary>
-                    <div id="cp{{ pos.id }}">
-                        <div class="panel-body questions-form">
-                            {% for form in forms %}
-                                {% if form.pos.product != pos.product %}
-                                    {# Add-Ons #}
-                                    <legend>+ {{ form.pos.product }}</legend>
-                                {% endif %}
-                                {% bootstrap_form form layout="checkout" %}
-                            {% endfor %}
+                        <div id="cp{{ pos.id }}">
+                            <div class="panel-body questions-form">
+                                {% for form in forms %}
+                                    {% if form.pos.product != pos.product %}
+                                        {# Add-Ons #}
+                                        <legend>+ {{ form.pos.product.name|event_localize }}</legend>
+                                    {% endif %}
+                                    {% for field in form.regular_fields %}
+                                        {% bootstrap_field field layout="checkout" %}
+                                    {% endfor %}
+
+                                    {% if form.badge_option_fields %}
+                                        <div class="panel panel-default badge-options-panel">
+                                            <div class="panel-heading">
+                                                <h5 class="panel-title"><strong>{% trans "Badge Options" %}</strong></h5>
+                                            </div>
+                                            <div class="panel-body">
+                                                <p>{% trans "Please select all fields you'd like to appear on your event badge." %}</p>
+                                                {% for field in form.badge_option_fields %}
+                                                    {% if field.errors %}
+                                                        {% for error in field.errors %}
+                                                            <p class="help-block text-danger">{{ error }}</p>
+                                                        {% endfor %}
+                                                    {% endif %}
+                                                    {% for checkbox in field %}
+                                                        <div class="checkbox">
+                                                            <label>{{ checkbox.tag }} {{ checkbox.choice_label }}</label>
+                                                        </div>
+                                                    {% endfor %}
+                                                {% endfor %}
+                                            </div>
+                                        </div>
+                                    {% endif %}
+                                {% endfor %}
+                            </div>
                         </div>
-                    </div>
                 </details>
             {% endfor %}
         </div>

@@ -8,6 +8,7 @@ from typing import Set
 
 from django import forms
 from django.contrib import messages
+from django.core.paginator import Paginator
 from django.db import transaction
 from django.db.models import Count, Q, QuerySet
 from django.db.models.functions import Concat
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 class ActionView(View):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
     def _discard(self, trans):
         trans.state = BankTransaction.STATE_DISCARDED
@@ -272,7 +273,7 @@ class ActionView(View):
 
 class JobDetailView(DetailView):
     template_name = 'pretixplugins/banktransfer/job_detail.html'
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
     context_objectname = 'job'
 
     def redirect_form(self):
@@ -373,15 +374,27 @@ class BankTransactionFilterForm(forms.Form):
 
 class ImportView(ListView):
     template_name = 'pretixplugins/banktransfer/import_form.html'
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
     context_object_name = 'transactions_unhandled'
     paginate_by = 30
 
-    def get_queryset(self):
-        if 'event' in self.kwargs:
-            qs = BankTransaction.objects.filter(Q(event=self.request.event))
+    @classmethod
+    def get_running_job(cls, organizer, event=None):
+        if event:
+            qs = BankImportJob.objects.filter(Q(event=event) | Q(organizer=organizer))
         else:
-            qs = BankTransaction.objects.filter(Q(organizer=self.request.organizer))
+            qs = BankImportJob.objects.filter(Q(organizer=organizer))
+        return qs.filter(
+            state=BankImportJob.STATE_RUNNING,
+            created__lte=now() - timedelta(minutes=30),  # safety timeout
+        ).first()
+
+    @classmethod
+    def get_unhandled_transactions(cls, organizer, event=None, filter_form=None):
+        if event:
+            qs = BankTransaction.objects.filter(Q(event=event))
+        else:
+            qs = BankTransaction.objects.filter(Q(organizer=organizer))
         qs = qs.select_related('order').filter(
             state__in=[
                 BankTransaction.STATE_INVALID,
@@ -391,11 +404,18 @@ class ImportView(ListView):
             ]
         )
 
-        filter_form = BankTransactionFilterForm(self.request.GET or None)
-        if filter_form.is_valid():
+        if filter_form and filter_form.is_valid():
             qs = filter_form.filter(qs)
 
         return qs.order_by('-import_job__created')
+
+    def get_queryset(self):
+        filter_form = BankTransactionFilterForm(self.request.GET or None)
+        return self.get_unhandled_transactions(
+            self.request.organizer,
+            getattr(self.request, 'event', None),
+            filter_form
+        )
 
     def discard_all(self):
         self.get_queryset().update(payer='', reference='', state=BankTransaction.STATE_DISCARDED)
@@ -527,14 +547,10 @@ class ImportView(ListView):
 
     @cached_property
     def job_running(self):
-        if 'event' in self.kwargs:
-            qs = BankImportJob.objects.filter(Q(event=self.request.event) | Q(organizer=self.request.organizer))
-        else:
-            qs = BankImportJob.objects.filter(Q(organizer=self.request.organizer))
-        return qs.filter(
-            state=BankImportJob.STATE_RUNNING,
-            created__lte=now() - timedelta(minutes=30),  # safety timeout
-        ).first()
+        return self.get_running_job(
+            self.request.organizer,
+            getattr(self.request, 'event', None)
+        )
 
     def redirect_back(self):
         kwargs = {'organizer': self.request.organizer.slug}
@@ -630,7 +646,39 @@ class OrganizerBanktransferView:
 
 
 class EventImportView(EventPermissionRequiredMixin, ImportView):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
+
+    def get(self, request, *args, **kwargs):
+        return redirect(reverse('control:event.orders.import_export', kwargs={
+            'event': self.request.event.slug,
+            'organizer': self.request.organizer.slug,
+        }) + '?tab=import&import_type=banktransfer')
+
+
+def get_event_banktransfer_context(request):
+    filter_form = BankTransactionFilterForm(request.GET or None)
+    ctx = {
+        'banktransfer_active': True,
+        'job_running': ImportView.get_running_job(request.organizer, request.event),
+        'no_more_payments': False,
+        'filter_form': filter_form,
+    }
+    if not request.event.has_subevents and request.event.settings.get('payment_term_last'):
+        if now() > request.event.payment_term_last:
+            ctx['no_more_payments'] = True
+
+    qs = ImportView.get_unhandled_transactions(request.organizer, request.event, filter_form)
+    page = request.GET.get('page', 1)
+    paginator = Paginator(qs, ImportView.paginate_by)
+    try:
+        page_obj = paginator.page(page)
+    except Exception:
+        page_obj = paginator.page(1)
+
+    ctx['transactions_unhandled'] = page_obj.object_list
+    ctx['page_obj'] = page_obj
+    ctx['is_paginated'] = page_obj.has_other_pages()
+    return ctx
 
 
 class OrganizerImportView(
@@ -639,11 +687,11 @@ class OrganizerImportView(
     OrganizerDetailViewMixin,
     ImportView,
 ):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
 
 class EventJobDetailView(EventPermissionRequiredMixin, JobDetailView):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
 
 class OrganizerJobDetailView(
@@ -652,11 +700,11 @@ class OrganizerJobDetailView(
     OrganizerDetailViewMixin,
     JobDetailView,
 ):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
 
 class EventActionView(EventPermissionRequiredMixin, ActionView):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
 
 class OrganizerActionView(
@@ -665,23 +713,21 @@ class OrganizerActionView(
     OrganizerDetailViewMixin,
     ActionView,
 ):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
     def order_qs(self):
-        all = self.request.user.teams.filter(
+        all_teams = self.request.user.teams.filter(
             organizer=self.request.organizer,
-            can_change_orders=True,
-            can_view_orders=True,
+            can_manage_bank_transfers=True,
             all_events=True,
         ).exists()
-        if self.request.user.has_active_staff_session(self.request.session.session_key) or all:
+        if self.request.user.has_active_staff_session(self.request.session.session_key) or all_teams:
             return Order.objects.filter(event__organizer=self.request.organizer)
         else:
             return Order.objects.filter(
                 event_id__in=self.request.user.teams.filter(
                     organizer=self.request.organizer,
-                    can_change_orders=True,
-                    can_view_orders=True,
+                    can_manage_bank_transfers=True,
                 ).values_list('limit_events__id', flat=True)
             )
 
@@ -766,9 +812,12 @@ class RefundExportListView(ListView):
 
             rows_data = json.dumps(transaction_rows, cls=CustomJSONEncoder)
             if hasattr(request, 'event'):
+                effective_testmode = (
+                    self.request.event.testmode or self.request.event.private_testmode_tickets_enabled
+                )
                 RefundExport.objects.create(
                     event=self.request.event,
-                    testmode=self.request.event.testmode,
+                    testmode=effective_testmode,
                     rows=rows_data,
                 )
             else:
@@ -781,7 +830,7 @@ class RefundExportListView(ListView):
 
 
 class EventRefundExportListView(EventPermissionRequiredMixin, RefundExportListView):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
     def get_success_url(self):
         return reverse(
@@ -800,12 +849,12 @@ class EventRefundExportListView(EventPermissionRequiredMixin, RefundExportListVi
             order__event=self.request.event,
             provider__in=['banktransfer', 'sepadebit'],
             state=OrderRefund.REFUND_STATE_CREATED,
-            order__testmode=self.request.event.testmode,
+            order__testmode=self.request.event.testmode or self.request.event.private_testmode_tickets_enabled,
         )
 
 
 class OrganizerRefundExportListView(OrganizerPermissionRequiredMixin, RefundExportListView):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
     def dispatch(self, request, *args, **kwargs):
         if len(request.organizer.events.order_by('currency').values_list('currency', flat=True).distinct()) > 1:
@@ -850,7 +899,7 @@ class DownloadRefundExportView(DetailView):
 
 
 class EventDownloadRefundExportView(EventPermissionRequiredMixin, DownloadRefundExportView):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
     def get_object(self, *args, **kwargs):
         return get_object_or_404(RefundExport, event=self.request.event, pk=self.kwargs.get('id'))
@@ -859,7 +908,7 @@ class EventDownloadRefundExportView(EventPermissionRequiredMixin, DownloadRefund
 class OrganizerDownloadRefundExportView(
     OrganizerPermissionRequiredMixin, OrganizerDetailViewMixin, DownloadRefundExportView
 ):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
     def get_object(self, *args, **kwargs):
         return get_object_or_404(RefundExport, organizer=self.request.organizer, pk=self.kwargs.get('id'))
@@ -902,7 +951,7 @@ class SepaXMLExportView(SingleObjectMixin, FormView):
 
 
 class EventSepaXMLExportView(EventPermissionRequiredMixin, SepaXMLExportView):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
     def get_object(self, *args, **kwargs):
         return get_object_or_404(RefundExport, event=self.request.event, pk=self.kwargs.get('id'))
@@ -914,7 +963,7 @@ class EventSepaXMLExportView(EventPermissionRequiredMixin, SepaXMLExportView):
 
 
 class OrganizerSepaXMLExportView(OrganizerPermissionRequiredMixin, OrganizerDetailViewMixin, SepaXMLExportView):
-    permission = 'can_change_orders'
+    permission = 'can_manage_bank_transfers'
 
     def get_object(self, *args, **kwargs):
         return get_object_or_404(RefundExport, organizer=self.request.organizer, pk=self.kwargs.get('id'))

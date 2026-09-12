@@ -10,7 +10,6 @@ from eventyay.orga.views import (
     mails,
     organizer,
     person,
-    plugins,
     review,
     schedule,
     speaker,
@@ -18,9 +17,10 @@ from eventyay.orga.views import (
     typeahead,
 )
 
+
 app_name = 'orga'
 urlpatterns = [
-    path("", RedirectView.as_view(url="event", permanent=False), name="base"),
+    path('', RedirectView.as_view(pattern_name='eventyay_common:dashboard', permanent=False), name='base'),
     path("reset/", auth.ResetView.as_view(), name="auth.reset"),
     path("reset/<token>", auth.RecoverView.as_view(), name="auth.recover"),
     path('me', person.UserSettings.as_view(), name='user.view'),  # Change this to common/account/general.
@@ -31,7 +31,7 @@ urlpatterns = [
         name='invitation.view',
     ),
     path('nav/typeahead/', typeahead.nav_typeahead, name='nav.typeahead'),
-        path(
+    path(
         "organizer/",
         dashboard.DashboardOrganizerListView.as_view(),
         name="organizer.list",
@@ -57,47 +57,23 @@ urlpatterns = [
                     name="organizer.delete",
                 ),
                 path("api/users", organizer.speaker_search, name="organizer.user_list"),
-                *organizer.TeamView.get_urls(
-                    url_base="teams",
-                    url_name="organizer.teams",
-                    namespace="orga",
-                ),
-                path(
-                    "teams/<int:team_pk>/members/<int:user_pk>/delete/",
-                    organizer.TeamMemberDelete.as_view(),
-                    name="organizer.teams.members.delete",
-                ),
-                path(
-                    "teams/<int:team_pk>/members/<int:user_pk>/reset/",
-                    organizer.TeamResetPassword.as_view(),
-                    name="organizer.teams.members.reset",
-                ),
-                path(
-                    "teams/<int:pk>/invites/<int:invite_pk>/uninvite/",
-                    organizer.TeamUninvite.as_view(),
-                    name="organizer.teams.invites.uninvite",
-                ),
-                path(
-                    "teams/<int:pk>/invites/<int:invite_pk>/resend/",
-                    organizer.TeamResend.as_view(),
-                    name="organizer.teams.invites.resend",
-                ),
                 path(
                     "speakers/",
                     organizer.OrganizerSpeakerList.as_view(),
                     name="organizer.speakers",
                 ),
+
             ]
         ),
     ),
-    path("event/new/", event.EventWizard.as_view(), name="event.create"),
-    path("event/", dashboard.DashboardEventListView.as_view(), name="event.list"),
+    path('event/<slug:event>/', dashboard.legacy_orga_event_redirect, name='event.legacy'),
+    path('event/', dashboard.DashboardEventListView.as_view(), name='event.list'),
     path(
-        'event/<slug:event>/',
+        'event/<orgslug:organizer>/<slug:event>/',
         include(
             [
-                path("login/", auth.LoginView.as_view(), name="event.login"),
                 path("delete", event.EventDelete.as_view(), name="event.delete"),
+                path("delete_talk_data", event.EventDeleteTalkData.as_view(), name="event.delete_talk_data"),
                 path("reset/", auth.ResetView.as_view(), name="event.auth.reset"),
                 path(
                     "reset/<token>",
@@ -116,6 +92,11 @@ urlpatterns = [
                     'settings/review/',
                     event.EventReviewSettings.as_view(),
                     name='settings.review',
+                ),
+                path(
+                    'settings/feedback/',
+                    event.FeedbackSettings.as_view(),
+                    name='settings.feedback',
                 ),
                 path(
                     'settings/review/phase/<int:pk>/',
@@ -140,9 +121,29 @@ urlpatterns = [
                     name='settings.widget',
                 ),
                 path(
-                    'settings/plugins',
-                    plugins.EventPluginsView.as_view(),
-                    name='settings.plugins.select',
+                    'settings/import-export/',
+                    event.ImportExportSettings.as_view(),
+                    name='settings.import_export',
+                ),
+                path(
+                    'settings/import-export/speakers/import/<uuid:file>/',
+                    speaker.SpeakerImportProcessView.as_view(),
+                    name='settings.import_export.speakers_import_process',
+                ),
+                path(
+                    'settings/import-export/submissions/import/<uuid:file>/',
+                    submission.SubmissionImportProcessView.as_view(),
+                    name='settings.import_export.submissions_import_process',
+                ),
+                path(
+                    'settings/import-export/schedule/export/trigger',
+                    schedule.ScheduleExportTriggerView.as_view(),
+                    name='settings.import_export.schedule_export_trigger',
+                ),
+                path(
+                    'settings/import-export/schedule/export/download',
+                    schedule.ScheduleExportDownloadView.as_view(),
+                    name='settings.import_export.schedule_export_download',
                 ),
                 path(
                     'cfp/',
@@ -151,11 +152,7 @@ urlpatterns = [
                 ),
                 path('cfp/text/', cfp.CfPTextDetail.as_view(), name='cfp.text.view'),
                 path('cfp/flow/', cfp.CfPFlowEditor.as_view(), name='cfp.flow'),
-                *cfp.QuestionView.get_urls(
-                    url_base='cfp/questions',
-                    url_name='cfp.questions',
-                    namespace='orga',
-                ),
+                path('cfp/questions/', cfp.CfPForms.as_view(), name='cfp.questions.view'),
                 path(
                     'cfp/questions/remind/',
                     cfp.CfPQuestionRemind.as_view(),
@@ -165,6 +162,16 @@ urlpatterns = [
                     'cfp/questions/<int:pk>/toggle/',
                     cfp.CfPQuestionToggle.as_view(),
                     name='cfp.question.toggle',
+                ),
+                path(
+                    'cfp/questions/<int:question>/options/',
+                    cfp.QuestionOptionsAjax.as_view(),
+                    name='cfp.questions.options',
+                ),
+                *cfp.QuestionView.get_urls(
+                    url_base='cfp/questions',
+                    url_name='cfp.questions',
+                    namespace='orga',
                 ),
                 *cfp.TrackView.get_urls(
                     url_base='cfp/tracks',
@@ -217,14 +224,19 @@ urlpatterns = [
                     name='submissions.apply_pending.bulk',
                 ),
                 path(
-                    'submissions/statistics/',
-                    submission.SubmissionStats.as_view(),
-                    name='submissions.statistics',
-                ),
-                path(
                     'submissions/feedback/',
                     submission.AllFeedbacksList.as_view(),
                     name='submissions.feedback',
+                ),
+                path(
+                    'submissions/feedback/bulk/',
+                    submission.FeedbackBulkAction.as_view(),
+                    name='submissions.feedback.bulk',
+                ),
+                path(
+                    'submissions/feedback/<int:pk>/action/',
+                    submission.FeedbackUpdateStatus.as_view(),
+                    name='submissions.feedback.action',
                 ),
                 *submission.TagView.get_urls(
                     url_base='submissions/tags',
@@ -237,8 +249,13 @@ urlpatterns = [
                         [
                             path(
                                 '',
-                                submission.SubmissionContent.as_view(),
-                                name='submissions.content.view',
+                                submission.SubmissionContentView.as_view(),  # Read-only view
+                                name="submissions.content",
+                            ),
+                            path(
+                                'edit',
+                                submission.SubmissionContent.as_view(),  # Edit view
+                                name="submissions.content.edit",
                             ),
                             path(
                                 'submit',
@@ -286,6 +303,11 @@ urlpatterns = [
                                 name='submissions.speakers.delete',
                             ),
                             path(
+                                'etherpad/generate',
+                                submission.SubmissionEtherpadGenerate.as_view(),
+                                name='submissions.etherpad.generate',
+                            ),
+                            path(
                                 'reviews/',
                                 review.ReviewSubmission.as_view(),
                                 name='submissions.reviews',
@@ -304,6 +326,11 @@ urlpatterns = [
                                 'toggle_featured',
                                 submission.ToggleFeatured.as_view(),
                                 name='submissions.toggle_featured',
+                            ),
+                            path(
+                                'video',
+                                submission.SubmissionVideoLink.as_view(),
+                                name='submissions.video',
                             ),
                             path(
                                 'apply_pending',
@@ -335,11 +362,6 @@ urlpatterns = [
                 ),
                 path('speakers/', speaker.SpeakerList.as_view(), name='speakers.list'),
                 path(
-                    'speakers/export/',
-                    speaker.SpeakerExport.as_view(),
-                    name='speakers.export',
-                ),
-                path(
                     'speakers/<code>/',
                     include(
                         [
@@ -357,6 +379,11 @@ urlpatterns = [
                                 'toggle-arrived',
                                 speaker.SpeakerToggleArrived.as_view(),
                                 name='speakers.arrived',
+                            ),
+                            path(
+                                'toggle-featured',
+                                speaker.SpeakerToggleFeatured.as_view(),
+                                name='speakers.featured',
                             ),
                         ]
                     ),
@@ -391,27 +418,7 @@ urlpatterns = [
                     review.ReviewAssignment.as_view(),
                     name='reviews.assign',
                 ),
-                path(
-                    'reviews/export/',
-                    review.ReviewExport.as_view(),
-                    name='reviews.export',
-                ),
                 path('schedule/', schedule.ScheduleView.as_view(), name='schedule.main'),
-                path(
-                    'schedule/export/',
-                    schedule.ScheduleExportView.as_view(),
-                    name='schedule.export',
-                ),
-                path(
-                    'schedule/export/trigger',
-                    schedule.ScheduleExportTriggerView.as_view(),
-                    name='schedule.export.trigger',
-                ),
-                path(
-                    'schedule/export/download',
-                    schedule.ScheduleExportDownloadView.as_view(),
-                    name='schedule.export.download',
-                ),
                 path(
                     'schedule/release',
                     schedule.ScheduleReleaseView.as_view(),
@@ -510,6 +517,11 @@ urlpatterns = [
                     name='mails.compose.choose',
                 ),
                 path(
+                    'mails/compose/preview',
+                    mails.ComposeMailPreview.as_view(),
+                    name='mails.compose.preview',
+                ),
+                path(
                     'mails/compose/teams/',
                     mails.ComposeTeamsMail.as_view(),
                     name='mails.compose.teams',
@@ -518,6 +530,17 @@ urlpatterns = [
                     'mails/compose/sessions/',
                     mails.ComposeSessionMail.as_view(),
                     name='mails.compose.sessions',
+                ),
+                path(
+                    'mails/compose/sessions/recipients',
+                    mails.ComposeSessionMailRecipients.as_view(),
+                    name='mails.compose.sessions.recipients',
+                ),
+                path('mails/drafts/', mails.DraftList.as_view(), name='mails.drafts'),
+                path(
+                    'mails/<int:pk>/to-outbox',
+                    mails.DraftToOutbox.as_view(),
+                    name='mails.draft.to_outbox',
                 ),
                 path('mails/sent', mails.SentMail.as_view(), name='mails.sent'),
                 path(

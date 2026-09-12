@@ -8,14 +8,14 @@
 //Loads the correct sidebar on window load,
 //collapses the sidebar on window resize.
 // Sets the min-height of #page-wrapper to window size
+// mobile-view: collapse on outside click or link click
 $(function () {
     'use strict';
 
     const $body = $('body');
     const $sidebar = $('.sidebar');
- toggleSidebar();    const $navbar = $('.navbar');
-    const $pageWrapper = $('#page-wrapper');
-    
+    const $navbar = $('.navbar');
+
     function getNavbarHeight() {
         return $navbar.outerHeight() || 50;
     }
@@ -41,6 +41,33 @@ $(function () {
         }
     }
 
+    const SIDEBAR_SCROLL_KEY = 'pretixcontrol_sidebar_scroll';
+
+    function saveSidebarScroll() {
+        if ($sidebar.length) {
+            try {
+                sessionStorage.setItem(SIDEBAR_SCROLL_KEY, $sidebar.scrollTop());
+            } catch (e) {}
+        }
+    }
+
+    function restoreSidebarScroll() {
+        if ($sidebar.length) {
+            try {
+                const savedScroll = sessionStorage.getItem(SIDEBAR_SCROLL_KEY);
+                if (savedScroll !== null) {
+                    const scrollTop = parseInt(savedScroll, 10);
+                    if (!isNaN(scrollTop)) {
+                        $sidebar.scrollTop(scrollTop);
+                        setTimeout(function () {
+                            $sidebar.scrollTop(scrollTop);
+                        }, 50);
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+
     function initializeSidebar() {
         $('#side-menu').metisMenu({
             toggle: false
@@ -61,6 +88,9 @@ $(function () {
                 $body.removeClass('sidebar-minimized');
             }
         }
+
+        $('ul.nav ul.nav-second-level a.active').parent().parent().addClass('in').parent().addClass('active');
+        restoreSidebarScroll();
     }
 
     updateCSSVariables();
@@ -71,6 +101,32 @@ $(function () {
         e.stopPropagation();
         toggleSidebar();
     });
+
+    if ($sidebar.length) {
+        let sidebarScrollRaf = null;
+        $sidebar.on('scroll', function () {
+            if (sidebarScrollRaf !== null) return;
+            sidebarScrollRaf = window.requestAnimationFrame(function () {
+                sidebarScrollRaf = null;
+                saveSidebarScroll();
+            });
+        });
+        $(document).on('click', function (e) {
+            if (!isMobileView() || $body.hasClass('sidebar-minimized')) return;
+            if ($(e.target).closest('.sidebar, #sidebar-toggle').length) return;
+            $body.addClass('sidebar-minimized');
+        });
+        $sidebar.on('click', 'a[href]', function () {
+            saveSidebarScroll();
+            if (!isMobileView()) return;
+            var href = ($(this).attr('href') || '').trim();
+            if (!href || href.charAt(0) === '#') return;
+            $body.addClass('sidebar-minimized');
+        });
+        $(window).on('beforeunload', function () {
+            saveSidebarScroll();
+        });
+    }
 
     let resizeTimeout;
     $(window).on('resize', function () {
@@ -91,17 +147,13 @@ $(function () {
         }
     });
 
-    $('ul.nav ul.nav-second-level a.active').parent().parent().addClass('in').parent().addClass('active');
-
     var supportsOverscrollContain = (window.CSS && CSS.supports && CSS.supports('overscroll-behavior: contain'))
         || ('overscrollBehavior' in document.documentElement.style);
     if (!supportsOverscrollContain) {
         function stopPropagationHandler(e) {
             e.stopPropagation();
         }
-        [$sidebar, $pageWrapper].forEach(function($el) {
-            $el.on('wheel', stopPropagationHandler);
-            $el.on('touchmove', stopPropagationHandler);
-        });
+        $sidebar.on('wheel', stopPropagationHandler);
+        $sidebar.on('touchmove', stopPropagationHandler);
     }
 });

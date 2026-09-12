@@ -1,11 +1,11 @@
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from functools import wraps
 from itertools import groupby
 
 from django.conf import settings
-from django.db.models import Exists, OuterRef, Prefetch, Sum
+from django.db.models import Count, Exists, OuterRef, Prefetch, Sum, Value
 from django.utils.functional import cached_property
 from django.utils.timezone import now
 from django_scopes import scopes_disabled
@@ -14,6 +14,8 @@ from eventyay.base.i18n import language
 from eventyay.base.models import (
     CartPosition,
     InvoiceAddress,
+    Organizer,
+    OrganizerFollower,
     ProductAddOn,
     OrderPosition,
     Question,
@@ -21,9 +23,15 @@ from eventyay.base.models import (
     QuestionOption,
 )
 from eventyay.base.services.cart import get_fees
+from eventyay.base.services.system_questions import (
+    get_enabled_system_question_fields,
+    get_system_question_base_states,
+    get_system_question_product_overrides,
+)
 from eventyay.helpers.cookies import set_cookie_without_samesite
 from eventyay.multidomain.urlreverse import eventreverse
-from eventyay.presale.signals import question_form_fields
+from eventyay.presale.organizer_exports import build_organizer_calendar_exporters
+from eventyay.presale.utils import build_position_additional_fields
 
 
 def cached_invoice_address(request):
@@ -109,17 +117,21 @@ class CartMixin:
         pos_additional_fields = defaultdict(list)
         for cp in lcp:
             cp.product.event = self.request.event  # will save some SQL queries
-            responses = question_form_fields.send(sender=self.request.event, position=cp)
-            data = cp.meta_info_data
-            for r, response in sorted(responses, key=lambda r: str(r[0])):
-                if response:
-                    for key, value in response.items():
-                        pos_additional_fields[cp.pk].append(
-                            {
-                                'answer': data.get('question_form_data', {}).get(key),
-                                'question': value.label,
-                            }
-                        )
+            pos_additional_fields[cp.pk] = build_position_additional_fields(self.request.event, cp)
+
+        base_states = get_system_question_base_states(self.request.event)
+        product_overrides = get_system_question_product_overrides(self.request.event)
+        enabled_system_fields_by_product_id: dict[int, set[str]] = {}
+
+        def get_enabled_system_fields_for_product(product) -> set[str]:
+            if product.pk not in enabled_system_fields_by_product_id:
+                enabled_system_fields_by_product_id[product.pk] = get_enabled_system_question_fields(
+                    self.request.event,
+                    product,
+                    base_states=base_states,
+                    product_overrides=product_overrides,
+                )
+            return enabled_system_fields_by_product_id[product.pk]
 
         # Group products of the same variation
         # We do this by list manipulations instead of a GROUP BY query, as
@@ -136,11 +148,8 @@ class CartMixin:
                 else:
                     i = pos.pk
 
-            has_attendee_data = pos.product.admission and (
-                self.request.event.settings.attendee_names_asked
-                or self.request.event.settings.attendee_emails_asked
-                or pos_additional_fields.get(pos.pk)
-            )
+            enabled_system_fields = get_enabled_system_fields_for_product(pos.product)
+            has_attendee_data = pos.product.admission and (enabled_system_fields or pos_additional_fields.get(pos.pk))
 
             addon_penalty = 1 if pos.addon_to_id else 0
 
@@ -194,6 +203,13 @@ class CartMixin:
             group.has_questions = answers and k[0] != ''
             if not hasattr(group, 'tax_rule'):
                 group.tax_rule = group.product.tax_rule
+
+            enabled_system_fields = get_enabled_system_fields_for_product(group.product)
+            group.ask_attendee_name_parts = 'attendee_name_parts' in enabled_system_fields
+            group.ask_attendee_email = 'attendee_email' in enabled_system_fields
+            group.ask_attendee_company = 'company' in enabled_system_fields
+            group.ask_attendee_job_title = 'job_title' in enabled_system_fields
+            group.ask_attendee_address = 'street' in enabled_system_fields
 
             group.bundle_sum = group.price + sum(a.price for a in has_addons[group.pk])
             group.bundle_sum_net = group.net_price + sum(a.net_price for a in has_addons[group.pk])
@@ -264,7 +280,7 @@ def get_cart(request):
     from eventyay.presale.views.cart import get_or_create_cart_id
 
     qqs = request.event.questions.all()
-    qqs = qqs.filter(ask_during_checkin=False, hidden=False)
+    qqs = qqs.filter(ask_during_checkin=False, hidden=False, active=True)
 
     if not hasattr(request, '_cart_cache'):
         cart_id = get_or_create_cart_id(request, create=False)
@@ -386,6 +402,31 @@ class OrganizerViewMixin:
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         context['organizer'] = self.request.organizer
+        style = self.request.GET.get('style')
+        if not style:
+            style = self.request.organizer.settings.event_list_type or 'list'
+        if style not in ('list', 'week', 'calendar'):
+            style = 'list'
+        context['organizer_view_style'] = style
+        context['organizer_calendar_exporters'] = build_organizer_calendar_exporters(self.request)
+
+        organizer = self.request.organizer
+        context['follow_enabled'] = organizer.settings.get('community_follow_enabled', as_type=bool, default=True)
+        context['show_follower_count'] = organizer.settings.get('community_show_follower_count', as_type=bool, default=True)
+
+        qs = Organizer.objects.filter(pk=organizer.pk).annotate(
+            follower_count=Count('followers')
+        )
+        if self.request.user.is_authenticated:
+            qs = qs.annotate(
+                is_following=Exists(OrganizerFollower.objects.filter(organizer=OuterRef('pk'), user=self.request.user))
+            )
+        else:
+            qs = qs.annotate(is_following=Value(False))
+        org_data = qs.values('follower_count', 'is_following').first()
+        context['follower_count'] = org_data['follower_count'] if org_data else 0
+        context['is_following'] = org_data['is_following'] if org_data else False
+
         return context
 
 
@@ -438,7 +479,7 @@ def iframe_entry_view_wrapper(view_func):
                 settings.LANGUAGE_COOKIE_NAME,
                 locale,
                 max_age=max_age,
-                expires=(datetime.utcnow() + timedelta(seconds=max_age)).strftime('%a, %d-%b-%Y %H:%M:%S GMT'),
+                expires=(datetime.now(timezone.utc) + timedelta(seconds=max_age)).strftime('%a, %d-%b-%Y %H:%M:%S GMT'),
                 domain=settings.SESSION_COOKIE_DOMAIN,
             )
             return resp
